@@ -1,0 +1,1407 @@
+From 6f4a1e7c454312ef1ab7ce91a1c086896cc57eaa Mon Sep 17 00:00:00 2001
+From: LY <51789698+Young-Lord@users.noreply.github.com>
+Date: Wed, 11 Feb 2026 01:08:26 +0800
+Subject: [PATCH] go (core wasm C changes)
+
+---
+
+diff --git a/PLAY/src/libassuan/src/assuan-buffer.c b/PLAY/src/libassuan/src/assuan-buffer.c
+index 987ba45..2ad2185 100644
+--- a/PLAY/src/libassuan/src/assuan-buffer.c
++++ b/PLAY/src/libassuan/src/assuan-buffer.c
+@@ -69,12 +69,15 @@ readline (assuan_context_t ctx, char *buf, size_t buflen,
+ {
+   size_t nleft = buflen;
+   char *p;
+ 
+   *r_eof = 0;
+   *r_nread = 0;
+   while (nleft > 0)
+     {
+-      ssize_t n = ctx->engine.readfnc (ctx, buf, nleft);
++      ssize_t n;
++      n = ctx->engine.readfnc (ctx, buf, nleft);
+ 
+       if (n < 0)
+         {
+@@ -286,7 +289,7 @@ _assuan_write_line (assuan_context_t ctx, const char *prefix,
+                                    NULL, 0, NULL, 0);
+       if (prefixlen > 5)
+         prefixlen = 5;
+-      if (len > ASSUAN_LINELENGTH - prefixlen - 2)
++      if (len > ASSUAN_LINELENGTH - prefixlen - 2 - 1)
+         len = ASSUAN_LINELENGTH - prefixlen - 2 - 1;
+     }
+ 
+diff --git a/PLAY/src/libassuan/src/assuan-handler.c b/PLAY/src/libassuan/src/assuan-handler.c
+index a04ab4e..134ca31 100644
+--- a/PLAY/src/libassuan/src/assuan-handler.c
++++ b/PLAY/src/libassuan/src/assuan-handler.c
+@@ -907,9 +907,11 @@ gpg_error_t
+ assuan_process (assuan_context_t ctx)
+ {
+   gpg_error_t rc;
+ 
+   ctx->flags.process_complete = 0;
+   do {
+     rc = process_request (ctx);
+   } while (!rc && !ctx->flags.process_complete);
+ 
+diff --git a/PLAY/src/libassuan/src/client.c b/PLAY/src/libassuan/src/client.c
+index 410f940..9174c33 100644
+--- a/PLAY/src/libassuan/src/client.c
++++ b/PLAY/src/libassuan/src/client.c
+@@ -24,6 +24,10 @@
+ #endif
+ 
+ #include <stdlib.h>
++#ifdef __EMSCRIPTEN__
++#include <stdio.h>
++#include <string.h>
++#endif
+ 
+ #include "assuan-defs.h"
+ #include "debug.h"
+diff --git a/PLAY/src/libassuan/src/system.c b/PLAY/src/libassuan/src/system.c
+index 9807d9d..8dcfc16 100644
+--- a/PLAY/src/libassuan/src/system.c
++++ b/PLAY/src/libassuan/src/system.c
+@@ -34,6 +34,11 @@
+ #include <fcntl.h>
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++#include <stdio.h>
++#include <string.h>
++#endif
++
+ #include "assuan-defs.h"
+ #include "debug.h"
+ 
+@@ -251,7 +256,7 @@ _assuan_read (assuan_context_t ctx, assuan_fd_t fd, void *buffer, size_t size)
+ }
+ 
+ 
+-
+
++
+ ssize_t
+ _assuan_write (assuan_context_t ctx, assuan_fd_t fd, const void *buffer,
+ 	       size_t size)
+diff --git a/PLAY/src/libgcrypt/random/rndoldlinux.c b/PLAY/src/libgcrypt/random/rndoldlinux.c
+index c0bb9a3..1ce2ccf 100644
+--- a/PLAY/src/libgcrypt/random/rndoldlinux.c
++++ b/PLAY/src/libgcrypt/random/rndoldlinux.c
+@@ -85,7 +85,12 @@ open_device (const char *name, int retry)
+   if (fd == -1 && retry)
+     {
+       _gcry_random_progress ("wait_dev_random", 'X', 0, 5);
++      /* Avoid poll() under Emscripten — see comment in gather_random. */
++#ifdef __EMSCRIPTEN__
++      usleep (100000);  /* 100 ms */
++#else
+       poll (NULL, 0, 5000);
++#endif
+       goto again;
+     }
+   if (fd == -1)
+@@ -301,6 +306,15 @@ _gcry_rndoldlinux_gather_random (void (*add)(const void*, size_t,
+           any_need_entropy = 1;
+         }
+ 
++#ifdef __EMSCRIPTEN__
++      /* Emscripten's /dev/urandom is backed by crypto.getRandomValues()
++         and is always immediately readable.  Calling poll() here would
++         trigger an Asyncify unwind through the deep gcry_pk_genkey call
++         stack, which Emscripten's automatic Asyncify analysis does not
++         fully instrument — causing callMain to return prematurely and
++         killing the agent mid-keygen.  Skip poll entirely.  */
++      rc = 1;
++#else
+       pfd.fd = fd;
+       pfd.events = POLLIN;
+ 
+@@ -321,6 +335,7 @@ _gcry_rndoldlinux_gather_random (void (*add)(const void*, size_t,
+                              we have ever blocked.  */
+           continue;
+         }
++#endif
+ 
+       do
+         {
+diff --git a/agent/call-daemon.c b/agent/call-daemon.c
+index f7ea0dd..8209860 100644
+--- a/agent/call-daemon.c
++++ b/agent/call-daemon.c
+@@ -208,6 +208,86 @@ atfork_cb (void *opaque, int where)
+ }
+ 
+ 
++/* Try to connect CTX to scdaemon via a pre-opened fd from
++ * GNUPG_WASM_SCDAEMON_FD.
++ * Returns 0 on success.
++ * Returns GPG_ERR_NOT_FOUND if no fd env var is set.
++ * Sets R_HAVE_ENV to true if env var existed (even if invalid).  */
++static gpg_error_t
++wasm_connect_preopened_scdaemon (assuan_context_t ctx, int *r_have_env)
++{
++  const char *envname = "GNUPG_WASM_SCDAEMON_FD";
++  const char *value;
++  char *endp;
++  long fdno;
++  unsigned int connect_flags = ASSUAN_SOCKET_CONNECT_FDPASSING;
++  gpg_error_t err;
++
++  *r_have_env = 0;
++
++  value = getenv (envname);
++  if (!value || !*value)
++    {
++      return gpg_error (GPG_ERR_NOT_FOUND);
++    }
++
++  *r_have_env = 1;
++
++  errno = 0;
++  fdno = strtol (value, &endp, 10);
++  if (errno || !endp || *endp || fdno < 0)
++    {
++      log_error ("invalid value for %s: '%s'\n", envname, value);
++      return gpg_error (GPG_ERR_INV_VALUE);
++    }
++
++  /* There is no fd passing in this transport mode.  */
++  connect_flags &= ~ASSUAN_SOCKET_CONNECT_FDPASSING;
++
++  err = assuan_socket_connect_fd (ctx,
++                                  assuan_fd_from_posix_fd ((int)fdno),
++                                  connect_flags);
++  if (err)
++    log_error ("can't connect to scdaemon via %s: %s\n",
++               envname, gpg_strerror (err));
++  return err;
++}
++#endif /*__EMSCRIPTEN__*/
++
++
+ /* Fork off the daemon if this has not already been done.  Lock the
+  * daemon and make sure that a proper context has been setup in CTRL.
+  * This function might also lock the daemon, which means that the
+@@ -234,8 +314,26 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
+   if (opt.disable_daemon[type])
+     return gpg_error (GPG_ERR_NOT_SUPPORTED);
+ 
++
+   if (ctrl->d_local[type] && ctrl->d_local[type]->ctx)
+     {
+       ctrl->d_local[type]->in_use = 1;
+       return 0; /* Okay, the context is fine.  */
+     }
+@@ -256,6 +354,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
+       return gpg_error (GPG_ERR_INTERNAL);
+     }
+ 
++
+   /* If this is the first call for this session, setup the local data
+      structure. */
+   if (!ctrl->d_local[type])
+@@ -283,6 +386,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
+     {
+       ctx = g->primary_ctx;
+       g->primary_ctx_reusable = 0;
+       if (opt.verbose)
+         log_info ("new connection to %s daemon established (reusing)\n",
+ 		  name);
+@@ -297,8 +405,52 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
+       goto leave;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++  if (type == DAEMON_SCD)
++    {
++      int have_wasm_scd_env = 0;
++
++      rc = wasm_connect_preopened_scdaemon (ctx, &have_wasm_scd_env);
++      if (!rc)
++        {
++          if (opt.verbose)
++            log_info ("new connection to %s daemon established"
++                      " (wasm pre-opened fd)\n", name);
++          goto leave;
++        }
++
++      if (have_wasm_scd_env)
++        {
++          err = gpg_error (GPG_ERR_NO_SCDAEMON);
++          goto leave;
++        }
++    }
++#endif
++
+   if (g->socket_name)
+     {
+       rc = assuan_socket_connect (ctx, g->socket_name, 0, 0);
+       if (rc)
+         {
+@@ -316,6 +468,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
+ 
+   if (g->primary_ctx)
+     {
+       log_info ("%s daemon is running but won't accept further connections\n",
+ 		name);
+       err = gpg_error (GPG_ERR_NO_SCDAEMON);
+@@ -469,6 +626,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
+   }
+ 
+  leave:
+   xfree (abs_homedir);
+   abs_homedir = NULL;
+   if (err)
+diff --git a/agent/call-scd.c b/agent/call-scd.c
+index f47deb8..e92226c 100644
+--- a/agent/call-scd.c
++++ b/agent/call-scd.c
+@@ -111,6 +111,15 @@ daemon_ctx (ctrl_t ctrl)
+   return daemon_type_ctx (DAEMON_SCD, ctrl);
+ }
+ 
++
+ 
+ 
+
+ /* This handler is a helper for pincache_put_cb but may also be called
+@@ -279,7 +288,17 @@ agent_card_learn (ctrl_t ctrl,
+   struct learn_parm_s parm;
+   char line[ASSUAN_LINELENGTH];
+ 
++
+   rc = start_scd (ctrl);
+   if (rc)
+     return rc;
+ 
+@@ -296,9 +315,18 @@ agent_card_learn (ctrl_t ctrl,
+   else
+     snprintf (line, sizeof line, "LEARN --force");
+ 
++
+   rc = assuan_transact (daemon_ctx (ctrl), line,
+                         NULL, NULL, NULL, NULL,
+                         learn_status_cb, &parm);
+   if (rc)
+     return unlock_scd (ctrl, rc);
+ 
+@@ -1284,15 +1312,34 @@ agent_card_scd (ctrl_t ctrl, const char *cmdline,
+   struct inq_needpin_parm_s inqparm;
+   int saveflag;
+ 
++
+   /* This is a layer violation, but it's needed that because DEVINFO
+      --watch is so special.  */
+   if (!strcmp (cmdline, DEVINFO_WATCH_COMMAND))
+     return agent_card_devinfo (ctrl, assuan_context);
+ 
+   rc = start_scd (ctrl);
+   if (rc)
+     return rc;
+ 
++
+   inqparm.ctx = daemon_ctx (ctrl);
+   inqparm.getpin_cb = getpin_cb;
+   inqparm.getpin_cb_arg = getpin_cb_arg;
+@@ -1303,11 +1350,22 @@ agent_card_scd (ctrl_t ctrl, const char *cmdline,
+ 
+   saveflag = assuan_get_flag (daemon_ctx (ctrl), ASSUAN_CONVEY_COMMENTS);
+   assuan_set_flag (daemon_ctx (ctrl), ASSUAN_CONVEY_COMMENTS, 1);
+   rc = assuan_transact (daemon_ctx (ctrl), cmdline,
+                         pass_data_thru, assuan_context,
+                         inq_needpin, &inqparm,
+                         pass_status_thru, assuan_context);
+ 
++
+   assuan_set_flag (daemon_ctx (ctrl), ASSUAN_CONVEY_COMMENTS, saveflag);
+   if (rc)
+     {
+diff --git a/agent/command.c b/agent/command.c
+index 21c9520..a45a40e 100644
+--- a/agent/command.c
++++ b/agent/command.c
+@@ -38,6 +38,7 @@
+ #include <assuan.h>
+ #include "../common/i18n.h"
+ #include "cvt-openpgp.h"
++
+ #include "../common/ssh-utils.h"
+ #include "../common/asshelp.h"
+ #include "../common/server-help.h"
+@@ -58,6 +59,15 @@
+    text string.  */
+ #define set_error(e,t) assuan_set_error (ctx, gpg_error (e), (t))
+ 
++
+ /* Check that the maximum digest length we support has at least the
+    length of the keygrip.  */
+ #if MAX_DIGEST_LEN < 20
+@@ -2709,6 +2719,11 @@ cmd_scd (assuan_context_t ctx, char *line)
+ #ifdef BUILD_WITH_SCDAEMON
+   ctrl_t ctrl = assuan_get_pointer (ctx);
+ 
++
+   if (ctrl->restricted)
+     {
+       const char *argv[5];
+@@ -2744,6 +2759,11 @@ cmd_scd (assuan_context_t ctx, char *line)
+   eventcounter.maybe_key_change++;
+ 
+   rc = divert_generic_cmd (ctrl, line, ctx);
++
+ #else
+   (void)ctx; (void)line;
+   rc = gpg_error (GPG_ERR_NOT_SUPPORTED);
+@@ -4552,7 +4572,6 @@ start_command_handler (ctrl_t ctrl, gnupg_fd_t listen_fd, gnupg_fd_t fd)
+         }
+       else if (rc)
+         {
+-          log_info ("Assuan accept problem: %s\n", gpg_strerror (rc));
+           break;
+         }
+ 
+@@ -4588,7 +4607,6 @@ start_command_handler (ctrl_t ctrl, gnupg_fd_t listen_fd, gnupg_fd_t fd)
+       rc = assuan_process (ctx);
+       if (rc)
+         {
+-          log_info ("Assuan processing failed: %s\n", gpg_strerror (rc));
+           continue;
+         }
+     }
+diff --git a/agent/genkey.c b/agent/genkey.c
+index b1b692d..a6b55e9 100644
+--- a/agent/genkey.c
++++ b/agent/genkey.c
+@@ -24,11 +24,14 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <ctype.h>
++#include <unistd.h>
+ 
+ #include "agent.h"
+ #include "../common/i18n.h"
+ #include "../common/sysutils.h"
+ 
++/* Unbuffered trace macro - bypasses estream to avoid lost output on exit */
++
+ 
+ void
+ clear_ephemeral_keys (ctrl_t ctrl)
+@@ -575,6 +578,15 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
+     }
+ 
+   rc = gcry_pk_genkey (&s_key, s_keyparam );
++#ifdef __EMSCRIPTEN__
++  if (gpg_err_code (rc) == GPG_ERR_EOF)
++    {
++      /* Browser/WASM builds occasionally surface EOF here via the
++       * random backend path; force quick-random and retry once.  */
++      gcry_control (GCRYCTL_ENABLE_QUICK_RANDOM, 0);
++      rc = gcry_pk_genkey (&s_key, s_keyparam );
++    }
++#endif
+   gcry_sexp_release (s_keyparam);
+   if (rc)
+     {
+@@ -604,14 +616,9 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
+   gcry_sexp_release (s_key); s_key = NULL;
+ 
+   /* store the secret key */
+-  if (opt.verbose)
+-    log_info ("storing %sprivate key\n",
+-               ctrl->ephemeral_mode?"ephemeral ":"");
+   rc = store_key (ctrl, s_private, passphrase, 0, ctrl->s2k_count, timestamp);
+   if (!rc && !ctrl->ephemeral_mode)
+     {
+-      /* FIXME: or does it make sense to also cache passphrases in
+-       * ephemeral mode using a dedicated cache?  */
+       if (!cache_nonce)
+         {
+           char tmpbuf[12];
+@@ -622,7 +629,9 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
+           && !(flags & GENKEY_FLAG_NO_PROTECTION)
+           && !agent_put_cache (ctrl, cache_nonce, CACHE_MODE_NONCE,
+                                passphrase, ctrl->cache_ttl_opt_preset))
+-        agent_write_status (ctrl, "CACHE_NONCE", cache_nonce, NULL);
++        {
++          agent_write_status (ctrl, "CACHE_NONCE", cache_nonce, NULL);
++        }
+       if ((flags & GENKEY_FLAG_PRESET)
+           && !(flags & GENKEY_FLAG_NO_PROTECTION))
+         {
+@@ -648,8 +657,6 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
+     }
+ 
+   /* return the public key */
+-  if (DBG_CRYPTO)
+-    log_debug ("returning public key\n");
+   len = gcry_sexp_sprint (s_public, GCRYSEXP_FMT_CANON, NULL, 0);
+   log_assert (len);
+   buf = xtrymalloc (len);
+diff --git a/agent/gpg-agent.c b/agent/gpg-agent.c
+index 85bca9b..60fb1ae 100644
+--- a/agent/gpg-agent.c
++++ b/agent/gpg-agent.c
+@@ -536,7 +536,28 @@ static int check_for_running_agent (int silent);
+ static void *check_own_socket_thread (void *arg);
+ #endif
+ static void *check_others_thread (void *arg);
+-
+
++
++#ifdef __EMSCRIPTEN__
++static int wasm_initial_option_reset_done;
++static int wasm_secmem_initialized_once;
++
++static int
++wasm_persistent_agent_env_enabled (void)
++{
++  static int initialized;
++  static int enabled;
++
++  if (!initialized)
++    {
++      const char *s = getenv ("GNUPG_WASM_PERSISTENT_AGENT");
++      enabled = (s && *s && strcmp (s, "0"));
++      initialized = 1;
++    }
++
++  return enabled;
++}
++#endif /* __EMSCRIPTEN__ */
++ 
+
+ /*
+    Functions.
+  */
+@@ -875,6 +896,11 @@ parse_rereadable_options (gpgrt_argparse_t *pargs, int reread)
+ 
+   if (!pargs)
+     { /* reset mode */
++#ifdef __EMSCRIPTEN__
++      if (!reread && wasm_persistent_agent_env_enabled ()
++          && wasm_initial_option_reset_done)
++        return 1;
++#endif
+       opt.quiet = 0;
+       opt.verbose = 0;
+       opt.debug = 0;
+@@ -911,6 +937,10 @@ parse_rereadable_options (gpgrt_argparse_t *pargs, int reread)
+       opt.ssh_fingerprint_digest = GCRY_MD_SHA256;
+       opt.s2k_count = 0;
+       set_s2k_calibration_time (0);  /* Set to default.  */
++#ifdef __EMSCRIPTEN__
++      if (!reread && wasm_persistent_agent_env_enabled ())
++        wasm_initial_option_reset_done = 1;
++#endif
+       return 1;
+     }
+ 
+@@ -1213,7 +1243,15 @@ main (int argc, char **argv)
+   pargs.flags &= ~(ARGPARSE_FLAG_KEEP | ARGPARSE_FLAG_NOVERSION);
+ 
+   /* Initialize the secure memory. */
++#ifdef __EMSCRIPTEN__
++  if (!wasm_persistent_agent_env_enabled () || !wasm_secmem_initialized_once)
++    {
++      gcry_control (GCRYCTL_INIT_SECMEM, SECMEM_BUFFER_SIZE, 0);
++      wasm_secmem_initialized_once = 1;
++    }
++#else
+   gcry_control (GCRYCTL_INIT_SECMEM, SECMEM_BUFFER_SIZE, 0);
++#endif
+   maybe_setuid = 0;
+ 
+   /*
+diff --git a/agent/protect.c b/agent/protect.c
+index 665bce3..d461170 100644
+--- a/agent/protect.c
++++ b/agent/protect.c
+@@ -28,6 +28,9 @@
+ #include <assert.h>
+ #include <unistd.h>
+ #include <sys/stat.h>
++#ifdef __EMSCRIPTEN__
++# include <emscripten/emscripten.h>
++#endif
+ #ifdef HAVE_W32_SYSTEM
+ # ifdef HAVE_WINSOCK2_H
+ #  include <winsock2.h>
+@@ -82,7 +85,9 @@ static unsigned long s2k_calibrated_count;
+ /* A helper object for time measurement.  */
+ struct calibrate_time_s
+ {
+-#ifdef HAVE_W32_SYSTEM
++#ifdef __EMSCRIPTEN__
++  double milliseconds;
++#elif defined(HAVE_W32_SYSTEM)
+   FILETIME creation_time, exit_time, kernel_time, user_time;
+ #else
+   clock_t ticks;
+@@ -124,7 +129,9 @@ hash_passphrase (const char *passphrase, int hashalgo,
+ static void
+ calibrate_get_time (struct calibrate_time_s *data)
+ {
+-#ifdef HAVE_W32_SYSTEM
++#ifdef __EMSCRIPTEN__
++  data->milliseconds = emscripten_get_now ();
++#elif defined(HAVE_W32_SYSTEM)
+   GetProcessTimes (GetCurrentProcess (),
+                    &data->creation_time, &data->exit_time,
+                    &data->kernel_time, &data->user_time);
+@@ -146,7 +153,14 @@ calibrate_elapsed_time (struct calibrate_time_s *starttime)
+   struct calibrate_time_s stoptime;
+ 
+   calibrate_get_time (&stoptime);
+-#ifdef HAVE_W32_SYSTEM
++#ifdef __EMSCRIPTEN__
++  {
++    double elapsed = stoptime.milliseconds - starttime->milliseconds;
++    if (elapsed < 0)
++      elapsed = 0;
++    return (unsigned long)(elapsed + 0.5);
++  }
++#elif defined(HAVE_W32_SYSTEM)
+   {
+     unsigned long long t1, t2;
+ 
+@@ -202,11 +216,16 @@ calibrate_s2k_count (void)
+         break;
+     }
+ 
+-  count = (unsigned long)(((double)count / ms) * s2k_calibration_time);
+-  count /= 1024;
+-  count *= 1024;
+-  if (count < 65536)
++  if (!count || !ms)
+     count = 65536;
++  else
++    {
++      count = (unsigned long)(((double)count / ms) * s2k_calibration_time);
++      count /= 1024;
++      count *= 1024;
++      if (count < 65536)
++        count = 65536;
++    }
+ 
+   if (opt.verbose)
+     {
+@@ -227,6 +246,10 @@ set_s2k_calibration_time (unsigned int milliseconds)
+     milliseconds = AGENT_S2K_CALIBRATION;
+   else if (milliseconds > 60 * 1000)
+     milliseconds = 60 * 1000;  /* Cap at 60 seconds.  */
++
++  if (milliseconds == s2k_calibration_time && s2k_calibrated_count)
++    return;
++
+   s2k_calibration_time = milliseconds;
+   s2k_calibrated_count = 0;  /* Force re-calibration.  */
+ }
+@@ -252,6 +275,9 @@ get_standard_s2k_count (void)
+   if (opt.s2k_count)
+     return opt.s2k_count < 65536 ? 65536 : opt.s2k_count;
+ 
++  if (s2k_calibrated_count)
++    return s2k_calibrated_count < 65536 ? 65536 : s2k_calibrated_count;
++
+   return get_calibrated_s2k_count ();
+ }
+ 
+@@ -394,6 +420,7 @@ do_encryption (const unsigned char *hashbegin, size_t hashlen,
+   char *outbuf = NULL;
+   char *p;
+   int saltpos, ivpos, encpos;
++  unsigned long effective_s2k_count;
+ 
+   s2ksalt = iv;  /* Silence compiler warning.  */
+ 
+@@ -401,6 +428,7 @@ do_encryption (const unsigned char *hashbegin, size_t hashlen,
+   *result = NULL;
+ 
+   modestr = "openpgp-s2k3-ocb-aes";
++  effective_s2k_count = s2k_count ? s2k_count : get_standard_s2k_count ();
+ 
+   rc = gcry_cipher_open (&hd, PROT_CIPHER,
+                          GCRY_CIPHER_MODE_OCB,
+@@ -456,7 +484,7 @@ do_encryption (const unsigned char *hashbegin, size_t hashlen,
+         {
+           rc = hash_passphrase (passphrase, GCRY_MD_SHA1,
+                                 3, s2ksalt,
+-				s2k_count? s2k_count:get_standard_s2k_count(),
++				effective_s2k_count,
+ 				key, keylen);
+           if (!rc)
+             rc = gcry_cipher_setkey (hd, key, keylen);
+@@ -518,7 +546,7 @@ do_encryption (const unsigned char *hashbegin, size_t hashlen,
+     char countbuf[35];
+ 
+     snprintf (countbuf, sizeof countbuf, "%lu",
+-	    s2k_count ? s2k_count : get_standard_s2k_count ());
++	    effective_s2k_count);
+     p = xtryasprintf
+       ("(9:protected%d:%s((4:sha18:%n_8bytes_%u:%s)%d:%n%*s)%d:%n%*s)",
+        (int)strlen (modestr), modestr,
+diff --git a/common/asshelp.c b/common/asshelp.c
+index 82a7b11..e3f5831 100644
+--- a/common/asshelp.c
++++ b/common/asshelp.c
+@@ -31,6 +31,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <ctype.h>
+ #include <unistd.h>
+ #include <errno.h>
+ #ifdef HAVE_LOCALE_H
+@@ -385,6 +386,212 @@ wait_for_sock (int secs, int module_name_id, const char *sockname,
+ }
+ 
+ 
++#ifdef __EMSCRIPTEN__
++/* Return the environment variable used to pass a pre-opened Assuan
++ * transport file descriptor for MODULE_NAME_ID.  */
++static const char *
++wasm_service_fd_envname (int module_name_id)
++{
++  switch (module_name_id)
++    {
++    case GNUPG_MODULE_NAME_AGENT:
++      return "GNUPG_WASM_AGENT_FD";
++    case GNUPG_MODULE_NAME_DIRMNGR:
++      return "GNUPG_WASM_DIRMNGR_FD";
++    case GNUPG_MODULE_NAME_KEYBOXD:
++      return "GNUPG_WASM_KEYBOXD_FD";
++    default:
++      return NULL;
++    }
++}
++
++
++/* Try to connect CTX using a pre-opened fd from the environment.
++ * Returns:
++ *   - 0 on success
++ *   - GPG_ERR_NOT_FOUND if no fd env var is set
++ *   - another error code for parse/connect failures
++ * R_HAVE_ENV is set when an env var was present (even if invalid).  */
++static gpg_error_t
++wasm_connect_preopened_service (assuan_context_t ctx,
++                                int module_name_id,
++                                unsigned int connect_flags,
++                                const char *printed_name,
++                                int *r_have_env)
++{
++  const char *envname;
++  const char *value;
++  char *endp;
++  long fdno;
++  gpg_error_t err;
++
++  *r_have_env = 0;
++
++  envname = wasm_service_fd_envname (module_name_id);
++  if (!envname)
++    return gpg_error (GPG_ERR_INV_VALUE);
++
++  value = getenv (envname);
++  if (!value || !*value)
++    {
++      return gpg_error (GPG_ERR_NOT_FOUND);
++    }
++
++  *r_have_env = 1;
++
++  {
++    static unsigned int next_agent_fd_slot;
++    static unsigned int next_dirmngr_fd_slot;
++    static unsigned int next_keyboxd_fd_slot;
++    unsigned int *next_slot;
++    const char *p;
++    const char *tok_start;
++    size_t tok_len = 0;
++    unsigned int tok_idx;
++    unsigned int token_count = 0;
++    unsigned int want_idx = 0;
++    unsigned int pick_idx = 0;
++    char numbuf[64];
++
++    switch (module_name_id)
++      {
++      case GNUPG_MODULE_NAME_AGENT:
++        next_slot = &next_agent_fd_slot;
++        break;
++      case GNUPG_MODULE_NAME_DIRMNGR:
++        next_slot = &next_dirmngr_fd_slot;
++        break;
++      case GNUPG_MODULE_NAME_KEYBOXD:
++        next_slot = &next_keyboxd_fd_slot;
++        break;
++      default:
++        next_slot = &next_dirmngr_fd_slot;
++        break;
++      }
++
++    want_idx = *next_slot;
++
++    /* Count tokens in VALUE.  We accept comma and whitespace as
++     * separators so that multiple pre-opened fds can be passed as a
++     * simple list like "4,5,6".  */
++    p = value;
++    while (*p)
++      {
++        while (*p && (isspace ((unsigned char)*p) || *p == ','))
++          p++;
++        if (!*p)
++          break;
++        while (*p && !isspace ((unsigned char)*p) && *p != ',')
++          p++;
++        token_count++;
++      }
++
++    if (!token_count)
++      {
++        log_error ("invalid value for %s: '%s'\n", envname, value);
++        return gpg_error (GPG_ERR_INV_VALUE);
++      }
++
++    pick_idx = want_idx % token_count;
++    tok_start = NULL;
++    tok_idx = 0;
++    p = value;
++    while (*p)
++      {
++        while (*p && (isspace ((unsigned char)*p) || *p == ','))
++          p++;
++        if (!*p)
++          break;
++        if (tok_idx == pick_idx)
++          {
++            tok_start = p;
++            while (*p && !isspace ((unsigned char)*p) && *p != ',')
++              p++;
++            tok_len = (size_t)(p - tok_start);
++            break;
++          }
++        while (*p && !isspace ((unsigned char)*p) && *p != ',')
++          p++;
++        tok_idx++;
++      }
++
++    if (!tok_start || !tok_len)
++      {
++        log_error ("invalid value for %s: '%s'\n", envname, value);
++        return gpg_error (GPG_ERR_INV_VALUE);
++      }
++
++    if (tok_len >= sizeof numbuf)
++      {
++        log_error ("invalid value for %s: '%s'\n", envname, value);
++        return gpg_error (GPG_ERR_INV_VALUE);
++      }
++
++    memcpy (numbuf, tok_start, tok_len);
++    numbuf[tok_len] = 0;
++
++    errno = 0;
++    fdno = strtol (numbuf, &endp, 10);
++    if (errno || !endp || *endp || fdno < 0)
++      {
++        log_error ("invalid value for %s: '%s'\n", envname, value);
++        return gpg_error (GPG_ERR_INV_VALUE);
++      }
++
++    *next_slot = (pick_idx + 1) % token_count;
++
++  }
++
++  /* There is no fd passing in this transport mode.  */
++  connect_flags &= ~ASSUAN_SOCKET_CONNECT_FDPASSING;
++
++  err = assuan_socket_connect_fd (ctx,
++                                  assuan_fd_from_posix_fd ((int)fdno),
++                                  connect_flags);
++  if (err)
++    log_error ("can't connect to %s via %s: %s\n",
++               printed_name, envname, gpg_strerror (err));
++
++  return err;
++}
++#endif /*__EMSCRIPTEN__*/
++
++
+ /* Try to connect to a new service via socket or start it if it is not
+  * running and AUTOSTART is set.  Handle the server's initial
+  * greeting.  Returns a new assuan context at R_CTX or an error code.
+@@ -416,6 +623,9 @@ start_new_service (assuan_context_t *r_ctx,
+   int seconds_to_wait;
+   unsigned int connect_flags = 0;
+   const char *argv[6];
++#ifdef __EMSCRIPTEN__
++  int have_wasm_service_env = 0;
++#endif
+ 
+   *r_ctx = NULL;
+ 
+@@ -459,9 +669,40 @@ start_new_service (assuan_context_t *r_ctx,
+       return err;
+     }
+ 
++  err = 0;
++#ifdef __EMSCRIPTEN__
++  err = wasm_connect_preopened_service (ctx, module_name_id,
++                                        connect_flags, printed_name,
++                                        &have_wasm_service_env);
++  if (gpg_err_code (err) == GPG_ERR_NOT_FOUND)
++    {
++      err = assuan_socket_connect (ctx, sockname, 0, connect_flags);
++    }
++#else
+   err = assuan_socket_connect (ctx, sockname, 0, connect_flags);
++#endif
+   if (err && (flags & ASSHELP_FLAG_AUTOSTART))
+     {
++#ifdef __EMSCRIPTEN__
++      if (have_wasm_service_env)
++        {
++          xfree (sockname);
++          assuan_release (ctx);
++          return gpg_err_make (errsource, no_service_err);
++        }
++#endif
+       char *abs_homedir;
+       lock_spawn_t lock;
+       char *program = NULL;
+@@ -612,8 +853,18 @@ start_new_service (assuan_context_t *r_ctx,
+     log_debug ("connection to the %s established\n", printed_name);
+ 
+   if (module_name_id == GNUPG_MODULE_NAME_AGENT)
+-    err = assuan_transact (ctx, "RESET",
+-                           NULL, NULL, NULL, NULL, NULL, NULL);
++    {
++      err = assuan_transact (ctx, "RESET",
++                             NULL, NULL, NULL, NULL, NULL, NULL);
++    }
+ 
+   if (!err
+       && module_name_id == GNUPG_MODULE_NAME_AGENT)
+@@ -621,10 +872,19 @@ start_new_service (assuan_context_t *r_ctx,
+       err = send_pinentry_environment (ctx, errsource,
+                                        opt_lc_ctype, opt_lc_messages,
+                                        session_env);
+       if (gpg_err_code (err) == GPG_ERR_FORBIDDEN
+           && gpg_err_source (err) == GPG_ERR_SOURCE_GPGAGENT)
+         {
+           /* Check whether the agent is in restricted mode.  */
+           if (!assuan_transact (ctx, "GETINFO restricted",
+                                 NULL, NULL, NULL, NULL, NULL, NULL))
+             {
+diff --git a/common/sysutils.c b/common/sysutils.c
+index 33545b0..2361551 100644
+--- a/common/sysutils.c
++++ b/common/sysutils.c
+@@ -161,6 +161,9 @@ trap_unaligned(void)
+ int
+ disable_core_dumps (void)
+ {
++#ifdef __EMSCRIPTEN__
++    return 0;
++#else
+ #ifdef HAVE_DOSISH_SYSTEM
+     return 0;
+ #else
+@@ -179,6 +182,7 @@ disable_core_dumps (void)
+ #endif
+     return 1;
+ #endif
++#endif
+ }
+ 
+ int
+diff --git a/g10/call-agent.c b/g10/call-agent.c
+index 5e13a3e..839bd98 100644
+--- a/g10/call-agent.c
++++ b/g10/call-agent.c
+@@ -49,6 +49,26 @@
+ 
+ static assuan_context_t agent_ctx = NULL;
+ static int did_early_card_test;
++#ifdef __EMSCRIPTEN__
++static unsigned long cached_agent_s2k_count;
++
++#endif
+ 
+ struct confirm_parm_s
+ {
+@@ -805,15 +825,33 @@ agent_scd_learn (struct agent_card_info_s *info, int force)
+   memset (info, 0, sizeof *info);
+   memset (&parm, 0, sizeof parm);
+ 
++
+   rc = start_agent (NULL, 1);
+   if (rc)
+     return rc;
+ 
+   parm.ctx = agent_ctx;
+   rc = assuan_transact (agent_ctx,
+                         force ? "LEARN --sendinfo --force" : "LEARN --sendinfo",
+                         dummy_data_cb, NULL, default_inq_cb, &parm,
+                         learn_status_cb, info);
+   /* Also try to get the key attributes.  */
+   if (!rc)
+     agent_scd_getattr ("KEY-ATTR", info);
+@@ -2156,6 +2194,11 @@ agent_get_s2k_count (void)
+   char *buf;
+   unsigned long count = 0;
+ 
++#ifdef __EMSCRIPTEN__
++  if (cached_agent_s2k_count)
++    return cached_agent_s2k_count;
++#endif
++
+   err = start_agent (NULL, 0);
+   if (err)
+     goto leave;
+@@ -2190,6 +2233,10 @@ agent_get_s2k_count (void)
+       count = 65536;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++  cached_agent_s2k_count = count;
++#endif
++
+   return count;
+ }
+ 
+@@ -2525,6 +2572,7 @@ cache_nonce_status_cb (void *opaque, const char *line)
+   struct cache_nonce_parm_s *parm = opaque;
+   const char *s;
+ 
++
+   if ((s = has_leading_keyword (line, "CACHE_NONCE")))
+     {
+       if (parm->cache_nonce_addr)
+@@ -2560,10 +2608,34 @@ inq_genkey_parms (void *opaque, const char *line)
+   struct genkey_parm_s *parm = opaque;
+   gpg_error_t err;
+ 
++
+   if (has_leading_keyword (line, "KEYPARAM"))
+     {
++#ifdef __EMSCRIPTEN__
++      const char *keyparms = parm->keyparms;
++      char *patched = NULL;
++
++      /* In browser/WASM builds, Ed25519 keyparam "(flags eddsa comp)"
++       * has been observed to trigger fatal failure inside gcry_pk_genkey.
++       * Strip the optional 'comp' flag and keep plain eddsa.
++       */
++      if (keyparms && strstr (keyparms, "(flags eddsa comp)"))
++        {
++          patched = xtrystrdup (keyparms);
++          if (patched)
++            {
++              char *p = strstr (patched, "(flags eddsa comp)");
++              if (p)
++                memmove (p + 12, p + 17, strlen (p + 17) + 1);
++              keyparms = patched;
++            }
++        }
++      err = assuan_send_data (parm->dflt->ctx, keyparms, strlen (keyparms));
++      xfree (patched);
++#else
+       err = assuan_send_data (parm->dflt->ctx,
+                               parm->keyparms, strlen (parm->keyparms));
++#endif
+     }
+   else if (has_leading_keyword (line, "NEWPASSWD") && parm->passphrase)
+     {
+@@ -2571,7 +2643,9 @@ inq_genkey_parms (void *opaque, const char *line)
+                               parm->passphrase,  strlen (parm->passphrase));
+     }
+   else
+-    err = default_inq_cb (parm->dflt, line);
++    {
++      err = default_inq_cb (parm->dflt, line);
++    }
+ 
+   return err;
+ }
+diff --git a/g10/gpg.c b/g10/gpg.c
+index db83e6a..aed5a62 100644
+--- a/g10/gpg.c
++++ b/g10/gpg.c
+@@ -5687,6 +5687,9 @@ g10_exit( int rc )
+   gnupg_block_all_signals ();
+   emergency_cleanup ();
+ 
++  es_fflush (es_stdout);
++  es_fflush (es_stderr);
++
+   exit (rc);
+ }
+ 
+diff --git a/g10/passphrase.c b/g10/passphrase.c
+index c5ec8ea..44acb9b 100644
+--- a/g10/passphrase.c
++++ b/g10/passphrase.c
+@@ -310,7 +310,11 @@ passphrase_to_dek (int cipher_algo, STRING2KEY *s2k,
+      new key.  */
+   if (create && (s2k->mode == 1 || s2k->mode == 3))
+     {
+-      gcry_randomize (s2k->salt, 8, GCRY_STRONG_RANDOM);
++      /* The S2K salt only needs to be unique enough to prevent practical
++       * precomputation reuse.  Using nonce-grade randomness avoids expensive
++       * strong-pool acquisition on constrained runtimes (e.g. wasm/browser)
++       * while preserving the intended salt semantics.  */
++      gcry_create_nonce (s2k->salt, 8);
+       if ( s2k->mode == 3 )
+         {
+           /* We delay the encoding until it is really needed.  This is
+diff --git a/scd/app.c b/scd/app.c
+index f08067e..108fa60 100644
+--- a/scd/app.c
++++ b/scd/app.c
+@@ -44,6 +44,25 @@ static gpg_error_t
+ send_serialno_and_app_status (card_t card, int with_apps, ctrl_t ctrl);
+ static gpg_error_t run_reselect (ctrl_t ctrl, card_t c, app_t a, app_t a_prev);
+ 
++
+ /*
+  * Multiple readers, single writer (MRSW) lock.
+  */
+@@ -942,6 +961,13 @@ select_application (ctrl_t ctrl, const char *name,
+   gpg_error_t err = 0;
+   card_t card, card_prev = NULL;
+ 
++
+   ctrl->card_ctx = NULL;
+ 
+   if (scan || !card_top)
+@@ -952,6 +978,11 @@ select_application (ctrl_t ctrl, const char *name,
+       npth_mutex_lock (&new_card_lock);
+       /* Scan the devices to find new device(s).  */
+       err = apdu_dev_list_start (opt.reader_port, &l);
+       if (err)
+         {
+           npth_mutex_unlock (&new_card_lock);
+@@ -964,10 +995,21 @@ select_application (ctrl_t ctrl, const char *name,
+           int periodical_check_needed_this;
+ 
+           slot = apdu_open_reader (l);
+           if (slot < 0)
+             break;
+ 
+           periodical_check_needed_this = apdu_connect (slot);
+           if (periodical_check_needed_this < 0)
+             {
+               /* We close a reader with no card.  */
+@@ -978,6 +1020,11 @@ select_application (ctrl_t ctrl, const char *name,
+               card_list_w_lock ();
+               err = app_new_register (slot, ctrl, name,
+                                       periodical_check_needed_this);
+               card_list_w_unlock ();
+               new_card++;
+             }
+@@ -992,6 +1039,12 @@ select_application (ctrl_t ctrl, const char *name,
+       apdu_dev_list_finish (l);
+       npth_mutex_unlock (&new_card_lock);
+ 
++
+       /* If new device(s), kick the scdaemon loop.  */
+       if (new_card)
+         scd_kick_the_loop ();
+@@ -1010,6 +1063,12 @@ select_application (ctrl_t ctrl, const char *name,
+       card_prev = card;
+     }
+ 
++
+   if (card)
+     {
+       err = check_application_conflict (card, name, NULL, 0);
+@@ -1046,6 +1105,11 @@ select_application (ctrl_t ctrl, const char *name,
+     err = gpg_error (GPG_ERR_ENODEV);
+   card_list_w_unlock ();
+ 
++
+   return err;
+ }
+ 
+diff --git a/scd/ccid-driver.c b/scd/ccid-driver.c
+index 2e955ea..72e0556 100644
+--- a/scd/ccid-driver.c
++++ b/scd/ccid-driver.c
+@@ -1069,6 +1069,20 @@ make_reader_id (libusb_device_handle *idev,
+   char prefix[20];
+ 
+   sprintf (prefix, "%04X:%04X:", (vendor & 0xffff), (product & 0xffff));
++
++#ifdef __EMSCRIPTEN__
++  /* On WebUSB the serial string-descriptor query may block before the
++     interface is claimed.  Use a stable fallback reader id and continue.  */
++  (void)idev;
++  (void)serialno_index;
++  rid = malloc (strlen (prefix) + 3 + 1);
++  if (!rid)
++    return NULL;
++  strcpy (rid, prefix);
++  strcat (rid, "X:0");
++  return rid;
++#endif
++
+   rid = get_escaped_usb_string (idev, serialno_index, prefix, ":0");
+   if (!rid)
+     {
+@@ -1389,18 +1403,39 @@ ccid_dev_scan (int *idx_max_p, void **t_p)
+   *idx_max_p = 0;
+   *t_p = NULL;
+ 
++
+   if (!initialized_usb)
+     {
+       int rc;
+       if ((rc = libusb_init (NULL)))
+         {
+           DEBUGOUT_1 ("usb_init failed: %s.\n", libusb_error_name (rc));
+           return gpg_error (GPG_ERR_ENODEV);
+         }
+       initialized_usb = 1;
+     }
+ 
+   n = libusb_get_device_list (NULL, &ccid_usb_dev_list);
+   for (i = 0; i < n; i++)
+     {
+       struct libusb_config_descriptor *config;
+@@ -1473,6 +1508,11 @@ ccid_dev_scan (int *idx_max_p, void **t_p)
+ 
+  scan_finish:
+ 
++
+   if (err)
+     {
+       for (i = 0; i < idx; i++)
+@@ -1699,7 +1739,15 @@ ccid_open_usb_reader (const char *spec_reader_name,
+   addr = libusb_get_device_address (dev);
+   bai = (bus << 16) | (addr << 8) | ifc_no;
+ 
++
+   rc = libusb_open (dev, &idev);
+   if (rc)
+     {
+       DEBUGOUT_1 ("usb_open failed: %s\n", libusb_error_name (rc));
+@@ -1708,6 +1756,7 @@ ccid_open_usb_reader (const char *spec_reader_name,
+       return map_libusb_error (rc);
+     }
+ 
++#ifndef __EMSCRIPTEN__
+   if (ccid_usb_thread_is_alive++ == 0)
+     {
+       npth_t thread;
+@@ -1736,6 +1785,7 @@ ccid_open_usb_reader (const char *spec_reader_name,
+ 
+       npth_attr_destroy (&tattr);
+     }
++#endif
+ 
+   rc = libusb_get_device_descriptor (dev, &desc);
+   if (rc)
+@@ -1789,6 +1839,14 @@ ccid_open_usb_reader (const char *spec_reader_name,
+         }
+     }
+   rc = libusb_claim_interface (idev, ifc_no);
+   if (rc)
+     {
+       my_npth_protect ();
+@@ -1816,9 +1874,15 @@ ccid_open_usb_reader (const char *spec_reader_name,
+   rc = ccid_vendor_specific_init (*handle);
+ 
+  leave:
+   if (rc)
+     {
++#ifndef __EMSCRIPTEN__
+       --ccid_usb_thread_is_alive;
++#endif
+       free (rid);
+       libusb_release_interface (idev, ifc_no);
+       libusb_close (idev);
+@@ -1958,7 +2022,9 @@ do_close_reader (ccid_driver_t handle)
+ 
+   DEBUGOUT ("libusb_release_interface and libusb_close\n");
+   libusb_release_interface (handle->idev, handle->ifc_no);
++#ifndef __EMSCRIPTEN__
+   --ccid_usb_thread_is_alive;
++#endif
+   libusb_close (handle->idev);
+   handle->idev = NULL;
+ }
+@@ -2022,6 +2088,13 @@ bulk_out (ccid_driver_t handle, unsigned char *msg, size_t msglen,
+   int rc;
+   int transferred;
+ 
++
+   /* No need to continue and clutter the log with USB write error
+      messages after we got the first ENODEV.  */
+   if (handle->enodev_seen)
+@@ -2084,6 +2157,9 @@ bulk_out (ccid_driver_t handle, unsigned char *msg, size_t msglen,
+                              msg, msglen, &transferred,
+                              5000 /* ms timeout */);
+   my_npth_protect ();
+   if (rc == 0 && transferred == msglen)
+     return 0;
+ 
+@@ -2123,10 +2199,23 @@ bulk_in (ccid_driver_t handle, unsigned char *buffer, size_t length,
+   memset (buffer, 0, length);
+  retry:
+ 
++
+   my_npth_unprotect ();
+   rc = libusb_bulk_transfer (handle->idev, handle->ep_bulk_in,
+                              buffer, length, &msglen, bwi*timeout);
+   my_npth_protect ();
+   if (rc)
+     {
+       DEBUGOUT_1 ("usb_bulk_read error: %s\n", libusb_error_name (rc));
+diff --git a/scd/command.c b/scd/command.c
+index 70665d0..0bfbcdb 100644
+--- a/scd/command.c
++++ b/scd/command.c
+@@ -64,6 +64,25 @@
+ 
+ #define IS_LOCKED(c) (locked_session && locked_session != (c)->server_local)
+ 
++
+ 
+ /* Data used to associate an Assuan context with local server data.
+    This object describes the local properties of one session.  */
+@@ -335,6 +354,11 @@ cmd_serialno (assuan_context_t ctx, char *line)
+   card_t card = NULL;
+   int thisslot;
+ 
++
+   if ( IS_LOCKED (ctrl) )
+     return gpg_error (GPG_ERR_LOCKED);
+ 
+@@ -356,6 +380,11 @@ cmd_serialno (assuan_context_t ctx, char *line)
+   /* Clear the remove flag so that the open_card is able to reread it.  */
+   ctrl->server_local->card_removed = 0;
+   err = open_card_with_request (&card, ctrl, *line? line:NULL, demand, opt_all);
+   /* Now clear or set the card_removed flag for all sessions using the
+    * current slot.  In the error case make sure that the flag is set
+    * for the current session. */
+@@ -557,6 +586,12 @@ cmd_learn (assuan_context_t ctx, char *line)
+   card_t card;
+   const char *keygrip = NULL;
+ 
++
+   opt_demand = has_option_name (line, "--demand");
+   if (opt_demand)
+     {
+@@ -574,7 +609,13 @@ cmd_learn (assuan_context_t ctx, char *line)
+     keygrip = line;
+ 
+   if ((rc = open_card (ctrl)))
+-    return rc;
++    return rc;
+ 
+   if (opt_demand)
+     {
+@@ -585,7 +626,18 @@ cmd_learn (assuan_context_t ctx, char *line)
+ 
+   card = card_get (ctrl, keygrip);
+   if (!card)
+-    return gpg_error (GPG_ERR_CARD_NOT_PRESENT);
++    return gpg_error (GPG_ERR_CARD_NOT_PRESENT);
+ 
+   /* Unless the force option is used we try a shortcut by identifying
+      the card using a serial number and inquiring the client with
+@@ -660,6 +712,11 @@ cmd_learn (assuan_context_t ctx, char *line)
+   if (!rc)
+     rc = app_write_learn_status (card, ctrl, flags);
+ 
++
+   card_put (card);
+   return rc;
+ }
+diff --git a/scd/scdaemon.c b/scd/scdaemon.c
+index 48a7def..a3b02ff 100644
+--- a/scd/scdaemon.c
++++ b/scd/scdaemon.c
+@@ -37,6 +37,9 @@
+ #include <unistd.h>
+ #include <signal.h>
+ #include <npth.h>
++#ifdef __EMSCRIPTEN__
++#include <emscripten/threading.h>
++#endif
+ 
+ #define INCLUDED_BY_MAIN_MODULE 1
+ #define GNUPG_COMMON_NEED_AFLOCAL
+@@ -262,6 +265,12 @@ static assuan_sock_nonce_t socket_nonce;
+  * --listen-backlog.  */
+ static int listen_backlog = 64;
+ 
++#ifdef __EMSCRIPTEN__
++#define SCD_EM_PUMP_PROXY_QUEUE() emscripten_current_thread_process_queued_calls ()
++#else
++#define SCD_EM_PUMP_PROXY_QUEUE() do { } while (0)
++#endif
++
+ #ifdef HAVE_W32_SYSTEM
+ static HANDLE the_event;
+ #else
+@@ -800,6 +809,22 @@ main (int argc, char **argv )
+                                      &redir_socket_name, &socket_nonce);
+         }
+ 
++#ifdef __EMSCRIPTEN__
++      if (!multi_server)
++        {
++          ctrl = xtrycalloc (1, sizeof *ctrl);
++          if (!ctrl)
++            {
++              log_error ("error allocating connection control data: %s\n",
++                         strerror (errno));
++              scd_exit (2);
++            }
++          ctrl->thread_startup.fd = GNUPG_INVALID_FD;
++          start_connection_thread (ctrl);
++        }
++      else
++#endif
++        {
+       res = npth_attr_init (&tattr);
+       if (res)
+         {
+@@ -831,6 +856,8 @@ main (int argc, char **argv )
+       /* We run handle_connection to wait for the shutdown signal and
+          to run the ticker stuff.  */
+       handle_connections (fd);
++        }
++
+       if (fd != GNUPG_INVALID_FD)
+         assuan_sock_close (fd);
+     }
+@@ -1348,6 +1375,8 @@ handle_connections (gnupg_fd_t listen_fd)
+       int periodical_check;
+       int max_fd = nfd;
+ 
++      SCD_EM_PUMP_PROXY_QUEUE ();
++
+       if (shutdown_pending)
+         {
+           if (active_connections == 0)
+@@ -1403,9 +1432,11 @@ handle_connections (gnupg_fd_t listen_fd)
+ 
+       if (ret == -1 && saved_errno != EINTR)
+         {
++          SCD_EM_PUMP_PROXY_QUEUE ();
+           log_error (_("npth_pselect failed: %s - waiting 1s\n"),
+                      strerror (saved_errno));
+           gnupg_sleep (1);
++          SCD_EM_PUMP_PROXY_QUEUE ();
+           continue;
+         }
+ 

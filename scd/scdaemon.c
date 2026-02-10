@@ -37,6 +37,9 @@
 #include <unistd.h>
 #include <signal.h>
 #include <npth.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>
+#endif
 
 #define INCLUDED_BY_MAIN_MODULE 1
 #define GNUPG_COMMON_NEED_AFLOCAL
@@ -261,6 +264,12 @@ static assuan_sock_nonce_t socket_nonce;
 /* Value for the listen() backlog argument.  Change at runtime with
  * --listen-backlog.  */
 static int listen_backlog = 64;
+
+#ifdef __EMSCRIPTEN__
+#define SCD_EM_PUMP_PROXY_QUEUE() emscripten_current_thread_process_queued_calls ()
+#else
+#define SCD_EM_PUMP_PROXY_QUEUE() do { } while (0)
+#endif
 
 #ifdef HAVE_W32_SYSTEM
 static HANDLE the_event;
@@ -800,6 +809,22 @@ main (int argc, char **argv )
                                      &redir_socket_name, &socket_nonce);
         }
 
+#ifdef __EMSCRIPTEN__
+      if (!multi_server)
+        {
+          ctrl = xtrycalloc (1, sizeof *ctrl);
+          if (!ctrl)
+            {
+              log_error ("error allocating connection control data: %s\n",
+                         strerror (errno));
+              scd_exit (2);
+            }
+          ctrl->thread_startup.fd = GNUPG_INVALID_FD;
+          start_connection_thread (ctrl);
+        }
+      else
+#endif
+        {
       res = npth_attr_init (&tattr);
       if (res)
         {
@@ -831,6 +856,8 @@ main (int argc, char **argv )
       /* We run handle_connection to wait for the shutdown signal and
          to run the ticker stuff.  */
       handle_connections (fd);
+        }
+
       if (fd != GNUPG_INVALID_FD)
         assuan_sock_close (fd);
     }
@@ -1348,6 +1375,8 @@ handle_connections (gnupg_fd_t listen_fd)
       int periodical_check;
       int max_fd = nfd;
 
+      SCD_EM_PUMP_PROXY_QUEUE ();
+
       if (shutdown_pending)
         {
           if (active_connections == 0)
@@ -1403,9 +1432,11 @@ handle_connections (gnupg_fd_t listen_fd)
 
       if (ret == -1 && saved_errno != EINTR)
         {
+          SCD_EM_PUMP_PROXY_QUEUE ();
           log_error (_("npth_pselect failed: %s - waiting 1s\n"),
                      strerror (saved_errno));
           gnupg_sleep (1);
+          SCD_EM_PUMP_PROXY_QUEUE ();
           continue;
         }
 

@@ -49,6 +49,57 @@
 
 static assuan_context_t agent_ctx = NULL;
 static int did_early_card_test;
+#ifdef __EMSCRIPTEN__
+static unsigned long cached_agent_s2k_count;
+
+static int
+wasm_trace_enabled_g10 (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_TRACE");
+      enabled = (s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+
+
+static int
+wasm_profile_enabled_g10 (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_PROFILE");
+      enabled = !!(s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+
+
+static double
+wasm_profile_now_ms_g10 (void)
+{
+#if defined (HAVE_CLOCK_GETTIME) && defined (CLOCK_MONOTONIC)
+  struct timespec ts;
+
+  if (!clock_gettime (CLOCK_MONOTONIC, &ts))
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+  return (double)clock () * 1000.0 / (double)CLOCKS_PER_SEC;
+}
+#endif
 
 struct confirm_parm_s
 {
@@ -805,15 +856,33 @@ agent_scd_learn (struct agent_card_info_s *info, int force)
   memset (info, 0, sizeof *info);
   memset (&parm, 0, sizeof parm);
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_g10 ())
+    log_info ("[wasm-trace] agent_scd_learn: enter force=%d\n", force);
+#endif
+
   rc = start_agent (NULL, 1);
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_g10 ())
+    log_info ("[wasm-trace] agent_scd_learn: start_agent rc=%d\n", rc);
+#endif
   if (rc)
     return rc;
 
   parm.ctx = agent_ctx;
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_g10 ())
+    log_info ("[wasm-trace] agent_scd_learn: sending LEARN --sendinfo"
+              " force=%d\n", force);
+#endif
   rc = assuan_transact (agent_ctx,
                         force ? "LEARN --sendinfo --force" : "LEARN --sendinfo",
                         dummy_data_cb, NULL, default_inq_cb, &parm,
                         learn_status_cb, info);
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_g10 ())
+    log_info ("[wasm-trace] agent_scd_learn: assuan_transact rc=%d\n", rc);
+#endif
   /* Also try to get the key attributes.  */
   if (!rc)
     agent_scd_getattr ("KEY-ATTR", info);
@@ -2156,6 +2225,11 @@ agent_get_s2k_count (void)
   char *buf;
   unsigned long count = 0;
 
+#ifdef __EMSCRIPTEN__
+  if (cached_agent_s2k_count)
+    return cached_agent_s2k_count;
+#endif
+
   err = start_agent (NULL, 0);
   if (err)
     goto leave;
@@ -2189,6 +2263,10 @@ agent_get_s2k_count (void)
       /* Default to 65536 which was used up to 2.0.13.  */
       count = 65536;
     }
+
+#ifdef __EMSCRIPTEN__
+  cached_agent_s2k_count = count;
+#endif
 
   return count;
 }
@@ -2525,6 +2603,7 @@ cache_nonce_status_cb (void *opaque, const char *line)
   struct cache_nonce_parm_s *parm = opaque;
   const char *s;
 
+
   if ((s = has_leading_keyword (line, "CACHE_NONCE")))
     {
       if (parm->cache_nonce_addr)
@@ -2560,10 +2639,34 @@ inq_genkey_parms (void *opaque, const char *line)
   struct genkey_parm_s *parm = opaque;
   gpg_error_t err;
 
+
   if (has_leading_keyword (line, "KEYPARAM"))
     {
+#ifdef __EMSCRIPTEN__
+      const char *keyparms = parm->keyparms;
+      char *patched = NULL;
+
+      /* In browser/WASM builds, Ed25519 keyparam "(flags eddsa comp)"
+       * has been observed to trigger fatal failure inside gcry_pk_genkey.
+       * Strip the optional 'comp' flag and keep plain eddsa.
+       */
+      if (keyparms && strstr (keyparms, "(flags eddsa comp)"))
+        {
+          patched = xtrystrdup (keyparms);
+          if (patched)
+            {
+              char *p = strstr (patched, "(flags eddsa comp)");
+              if (p)
+                memmove (p + 12, p + 17, strlen (p + 17) + 1);
+              keyparms = patched;
+            }
+        }
+      err = assuan_send_data (parm->dflt->ctx, keyparms, strlen (keyparms));
+      xfree (patched);
+#else
       err = assuan_send_data (parm->dflt->ctx,
                               parm->keyparms, strlen (parm->keyparms));
+#endif
     }
   else if (has_leading_keyword (line, "NEWPASSWD") && parm->passphrase)
     {
@@ -2571,7 +2674,9 @@ inq_genkey_parms (void *opaque, const char *line)
                               parm->passphrase,  strlen (parm->passphrase));
     }
   else
-    err = default_inq_cb (parm->dflt, line);
+    {
+      err = default_inq_cb (parm->dflt, line);
+    }
 
   return err;
 }
@@ -2908,6 +3013,25 @@ agent_pkdecrypt (ctrl_t ctrl, const char *keygrip, const char *desc,
   const char *keygrip2 = NULL;
   struct default_inq_parm_s dfltparm;
   const char *cmdline;
+#ifdef __EMSCRIPTEN__
+  int profile_enabled = wasm_profile_enabled_g10 ();
+  double profile_start_ms = 0;
+  double profile_start_agent_ms = 0;
+  double profile_start_reset_ms = 0;
+  double profile_start_setkey_ms = 0;
+  double profile_start_setkey2_ms = 0;
+  double profile_start_setkeydesc_ms = 0;
+  double profile_start_make_sexp_ms = 0;
+  double profile_start_pkdecrypt_ms = 0;
+  double profile_agent_ms = 0;
+  double profile_reset_ms = 0;
+  double profile_setkey_ms = 0;
+  double profile_setkey2_ms = 0;
+  double profile_setkeydesc_ms = 0;
+  double profile_make_sexp_ms = 0;
+  double profile_pkdecrypt_ms = 0;
+  double profile_parse_ms = 0;
+#endif
 
   memset (&dfltparm, 0, sizeof dfltparm);
   dfltparm.ctrl = ctrl;
@@ -2920,6 +3044,11 @@ agent_pkdecrypt (ctrl_t ctrl, const char *keygrip, const char *desc,
 
   *r_buf = NULL;
   *r_padding = -1;
+
+#ifdef __EMSCRIPTEN__
+  if (profile_enabled)
+    profile_start_ms = wasm_profile_now_ms_g10 ();
+#endif
 
   /* Parse the keygrip in case of a dual algo.  */
   keygrip2 = strchr (keygrip, ',');
@@ -2941,25 +3070,57 @@ agent_pkdecrypt (ctrl_t ctrl, const char *keygrip, const char *desc,
   else
     cmdline = "PKDECRYPT";
 
+  #ifdef __EMSCRIPTEN__
+  if (profile_enabled)
+    profile_start_agent_ms = wasm_profile_now_ms_g10 ();
+  #endif
   err = start_agent (ctrl, 0);
+#ifdef __EMSCRIPTEN__
+  if (profile_enabled)
+    profile_agent_ms = wasm_profile_now_ms_g10 () - profile_start_agent_ms;
+#endif
   if (err)
     return err;
   dfltparm.ctx = agent_ctx;
 
+#ifdef __EMSCRIPTEN__
+  if (profile_enabled)
+    profile_start_reset_ms = wasm_profile_now_ms_g10 ();
+#endif
   err = assuan_transact (agent_ctx, "RESET",
                          NULL, NULL, NULL, NULL, NULL, NULL);
+#ifdef __EMSCRIPTEN__
+  if (profile_enabled)
+    profile_reset_ms = wasm_profile_now_ms_g10 () - profile_start_reset_ms;
+#endif
   if (err)
     return err;
 
   snprintf (line, sizeof line, "SETKEY %.40s", keygrip);
+#ifdef __EMSCRIPTEN__
+  if (profile_enabled)
+    profile_start_setkey_ms = wasm_profile_now_ms_g10 ();
+#endif
   err = assuan_transact (agent_ctx, line, NULL, NULL, NULL, NULL, NULL, NULL);
+#ifdef __EMSCRIPTEN__
+  if (profile_enabled)
+    profile_setkey_ms = wasm_profile_now_ms_g10 () - profile_start_setkey_ms;
+#endif
   if (err)
     return err;
 
   if (*keygrip2)
     {
       snprintf (line, sizeof line, "SETKEY --another %.40s", keygrip2);
+#ifdef __EMSCRIPTEN__
+      if (profile_enabled)
+        profile_start_setkey2_ms = wasm_profile_now_ms_g10 ();
+#endif
       err = assuan_transact (agent_ctx, line, NULL, NULL,NULL,NULL,NULL,NULL);
+#ifdef __EMSCRIPTEN__
+      if (profile_enabled)
+        profile_setkey2_ms = wasm_profile_now_ms_g10 () - profile_start_setkey2_ms;
+#endif
       if (err)
         return err;
     }
@@ -2967,8 +3128,17 @@ agent_pkdecrypt (ctrl_t ctrl, const char *keygrip, const char *desc,
   if (desc)
     {
       snprintf (line, DIM(line), "SETKEYDESC %s", desc);
+#ifdef __EMSCRIPTEN__
+      if (profile_enabled)
+        profile_start_setkeydesc_ms = wasm_profile_now_ms_g10 ();
+#endif
       err = assuan_transact (agent_ctx, line,
                             NULL, NULL, NULL, NULL, NULL, NULL);
+#ifdef __EMSCRIPTEN__
+      if (profile_enabled)
+        profile_setkeydesc_ms = (wasm_profile_now_ms_g10 ()
+                                 - profile_start_setkeydesc_ms);
+#endif
       if (err)
         return err;
     }
@@ -2979,13 +3149,30 @@ agent_pkdecrypt (ctrl_t ctrl, const char *keygrip, const char *desc,
 
     parm.dflt = &dfltparm;
     parm.ctx = agent_ctx;
+#ifdef __EMSCRIPTEN__
+    if (profile_enabled)
+      profile_start_make_sexp_ms = wasm_profile_now_ms_g10 ();
+#endif
     err = make_canon_sexp (s_ciphertext, &parm.ciphertext, &parm.ciphertextlen);
+#ifdef __EMSCRIPTEN__
+    if (profile_enabled)
+      profile_make_sexp_ms = wasm_profile_now_ms_g10 () - profile_start_make_sexp_ms;
+#endif
     if (err)
       return err;
+
+#ifdef __EMSCRIPTEN__
+    if (profile_enabled)
+      profile_start_pkdecrypt_ms = wasm_profile_now_ms_g10 ();
+#endif
     err = assuan_transact (agent_ctx, cmdline,
                            put_membuf_cb, &data,
                            inq_ciphertext_cb, &parm,
                            padding_info_cb, r_padding);
+#ifdef __EMSCRIPTEN__
+    if (profile_enabled)
+      profile_pkdecrypt_ms = wasm_profile_now_ms_g10 () - profile_start_pkdecrypt_ms;
+#endif
     xfree (parm.ciphertext);
   }
   if (err)
@@ -3031,6 +3218,37 @@ agent_pkdecrypt (ctrl_t ctrl, const char *keygrip, const char *desc,
     }
 
   memmove (buf, endp, n);
+
+#ifdef __EMSCRIPTEN__
+  if (profile_enabled)
+    {
+      double total_ms = wasm_profile_now_ms_g10 () - profile_start_ms;
+      double accounted_ms = profile_agent_ms + profile_reset_ms
+                            + profile_setkey_ms + profile_setkey2_ms
+                            + profile_setkeydesc_ms + profile_make_sexp_ms
+                            + profile_pkdecrypt_ms;
+      double other_ms = total_ms - accounted_ms;
+
+      if (other_ms < 0)
+        other_ms = 0;
+
+      profile_parse_ms = other_ms;
+
+      log_info ("[wasm-prof] agent_pkdecrypt total-ms=%.3f start-agent-ms=%.3f"
+                " reset-ms=%.3f setkey-ms=%.3f setkey2-ms=%.3f"
+                " setkeydesc-ms=%.3f sexp-ms=%.3f pkdecrypt-ms=%.3f"
+                " parse-ms=%.3f\n",
+                total_ms,
+                profile_agent_ms,
+                profile_reset_ms,
+                profile_setkey_ms,
+                profile_setkey2_ms,
+                profile_setkeydesc_ms,
+                profile_make_sexp_ms,
+                profile_pkdecrypt_ms,
+                profile_parse_ms);
+    }
+#endif
 
   *r_buflen = n;
   *r_buf = buf;

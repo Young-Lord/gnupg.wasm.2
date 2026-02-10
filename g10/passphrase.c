@@ -310,7 +310,11 @@ passphrase_to_dek (int cipher_algo, STRING2KEY *s2k,
      new key.  */
   if (create && (s2k->mode == 1 || s2k->mode == 3))
     {
-      gcry_randomize (s2k->salt, 8, GCRY_STRONG_RANDOM);
+      /* The S2K salt only needs to be unique enough to prevent practical
+       * precomputation reuse.  Using nonce-grade randomness avoids expensive
+       * strong-pool acquisition on constrained runtimes (e.g. wasm/browser)
+       * while preserving the intended salt semantics.  */
+      gcry_create_nonce (s2k->salt, 8);
       if ( s2k->mode == 3 )
         {
           /* We delay the encoding until it is really needed.  This is

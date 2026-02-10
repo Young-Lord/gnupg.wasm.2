@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "gpg.h"
 #include "../common/util.h"
@@ -36,6 +37,41 @@
 #include "call-agent.h"
 #include "../common/host2net.h"
 #include "../common/compliance.h"
+
+
+static int
+wasm_profile_enabled_pubkey (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+#ifndef __EMSCRIPTEN__
+  return 0;
+#endif
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_PROFILE");
+      enabled = !!(s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+
+
+static double
+wasm_profile_now_ms_pubkey (void)
+{
+#if defined (HAVE_CLOCK_GETTIME) && defined (CLOCK_MONOTONIC)
+  struct timespec ts;
+
+  if (!clock_gettime (CLOCK_MONOTONIC, &ts))
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+  return (double)clock () * 1000.0 / (double)CLOCKS_PER_SEC;
+}
 
 
 static gpg_error_t get_it (ctrl_t ctrl, struct seskey_enc_list *k,
@@ -80,16 +116,37 @@ get_session_key (ctrl_t ctrl, struct seskey_enc_list *list, DEK *dek)
   u32 keyid[2];
   int search_for_secret_keys = 1;
   struct seskey_enc_list *k;
+  int profile_enabled = wasm_profile_enabled_pubkey ();
+  double profile_start_ms = 0;
+  double profile_enum_ms = 0;
+  double profile_get_it_ms = 0;
+  unsigned long profile_enum_calls = 0;
+  unsigned long profile_candidates = 0;
+  unsigned long profile_attempts = 0;
 
   if (DBG_CLOCK)
     log_clock ("get_session_key enter");
 
+  if (profile_enabled)
+    profile_start_ms = wasm_profile_now_ms_pubkey ();
+
   while (search_for_secret_keys)
     {
       sk = xmalloc_clear (sizeof *sk);
-      err = enum_secret_keys (ctrl, &enum_context, sk);
+      if (profile_enabled)
+        {
+          double t0 = wasm_profile_now_ms_pubkey ();
+          err = enum_secret_keys (ctrl, &enum_context, sk);
+          profile_enum_ms += wasm_profile_now_ms_pubkey () - t0;
+          profile_enum_calls++;
+        }
+      else
+        err = enum_secret_keys (ctrl, &enum_context, sk);
       if (err)
         break;
+
+      if (profile_enabled)
+        profile_candidates++;
 
       /* Check compliance.  */
       if (! gnupg_pk_is_allowed (opt.compliance, PK_USE_DECRYPTION,
@@ -152,7 +209,15 @@ get_session_key (ctrl_t ctrl, struct seskey_enc_list *list, DEK *dek)
           else
             continue;
 
-          err = get_it (ctrl, k, dek, sk, keyid);
+          if (profile_enabled)
+            {
+              double t0 = wasm_profile_now_ms_pubkey ();
+              err = get_it (ctrl, k, dek, sk, keyid);
+              profile_get_it_ms += wasm_profile_now_ms_pubkey () - t0;
+              profile_attempts++;
+            }
+          else
+            err = get_it (ctrl, k, dek, sk, keyid);
           k->result = err;
           if (!err)
             {
@@ -187,6 +252,28 @@ get_session_key (ctrl_t ctrl, struct seskey_enc_list *list, DEK *dek)
 
   if (DBG_CLOCK)
     log_clock ("get_session_key leave");
+
+  if (profile_enabled)
+    {
+      double total_ms = wasm_profile_now_ms_pubkey () - profile_start_ms;
+      double other_ms = total_ms - (profile_enum_ms + profile_get_it_ms);
+
+      if (other_ms < 0)
+        other_ms = 0;
+
+      log_info ("[wasm-prof] get_session_key total-ms=%.3f enum-ms=%.3f"
+                " get-it-ms=%.3f other-ms=%.3f enum-calls=%lu"
+                " candidates=%lu attempts=%lu err=%s\n",
+                total_ms,
+                profile_enum_ms,
+                profile_get_it_ms,
+                other_ms,
+                profile_enum_calls,
+                profile_candidates,
+                profile_attempts,
+                gpg_strerror (err));
+    }
+
   return err;
 }
 
@@ -243,9 +330,19 @@ get_it (ctrl_t ctrl,
   gcry_sexp_t s_data;
   char *desc;
   char *keygrip;
+  int profile_enabled = wasm_profile_enabled_pubkey ();
+  double profile_start_ms = 0;
+  double profile_agent_start_ms = 0;
+  double profile_agent_end_ms = 0;
+  double profile_decode_end_ms = 0;
+  double profile_keycheck_start_ms = 0;
+  double profile_keycheck_end_ms = 0;
 
   if (DBG_CLOCK)
     log_clock ("decryption start");
+
+  if (profile_enabled)
+    profile_start_ms = wasm_profile_now_ms_pubkey ();
 
   log_assert (!enc->u_sym);
 
@@ -312,9 +409,13 @@ get_it (ctrl_t ctrl,
   /* Decrypt. */
   desc = gpg_format_keydesc (ctrl, sk, FORMAT_KEYDESC_NORMAL, 1);
 
+  if (profile_enabled)
+    profile_agent_start_ms = wasm_profile_now_ms_pubkey ();
   err = agent_pkdecrypt (NULL, keygrip,
                          desc, sk->keyid, sk->main_keyid, sk->pubkey_algo,
                          s_data, &frame, &nframe, &padding);
+  if (profile_enabled)
+    profile_agent_end_ms = wasm_profile_now_ms_pubkey ();
   xfree (desc);
   gcry_sexp_release (s_data);
   if (err)
@@ -436,6 +537,9 @@ get_it (ctrl_t ctrl,
       goto leave;
     }
 
+  if (profile_enabled)
+    profile_decode_end_ms = wasm_profile_now_ms_pubkey ();
+
   /* Copy the key to DEK and compare the checksum if needed.  */
   /* We use the frameidx as flag for the need of a checksum.  */
   memcpy (dek->key, frame + frameidx, dek->keylen);
@@ -457,99 +561,148 @@ get_it (ctrl_t ctrl,
     log_printhex (dek->key, dek->keylen, "DEK is:");
 
   /* Check that the algo is in the preferences and whether it has
-   * expired.  Also print a status line with the key's fingerprint.  */
-  {
-    PKT_public_key *pk = NULL;
-    PKT_public_key *mainpk = NULL;
-    kbnode_t pkb = get_pubkeyblock_ext (ctrl, keyid, GETKEY_ALLOW_ADSK);
-
-    if (!pkb)
+   * expired.  Also print a status line with the key's fingerprint.
+   *
+   * In quiet mode without status-fd output, this block only emits
+   * informational diagnostics and does not affect decryption
+   * correctness.  Skip it to avoid repeated keydb lookups on the hot
+   * path.  */
+  if (opt.quiet && !is_status_enabled ())
+    err = 0;
+  else
+    {
+      if (profile_enabled)
+        profile_keycheck_start_ms = wasm_profile_now_ms_pubkey ();
       {
-        err = gpg_error (GPG_ERR_UNEXPECTED);
-        log_info ("oops: public key not found for preference check\n");
-      }
-    else if (pkb->pkt->pkt.public_key->selfsigversion > 3
-             && dek->algo != CIPHER_ALGO_3DES
-             && !opt.quiet
-             && !is_algo_in_prefs (pkb, PREFTYPE_SYM, dek->algo))
-      log_info (_("WARNING: cipher algorithm %s not found in recipient"
-                  " preferences\n"), openpgp_cipher_algo_name (dek->algo));
+        PKT_public_key *pk = NULL;
+        PKT_public_key *mainpk = NULL;
+        kbnode_t pkb = get_pubkeyblock_ext (ctrl, keyid, GETKEY_ALLOW_ADSK);
 
-    /* if (!err && 25519 && openpgp_oidbuf_is_ed25519 (curve, len)) */
-    /*   log_info ("Note: legacy OID was used for cv25519\n"); */
-
-    if (!err)
-      {
-        kbnode_t k;
-        int first = 1;
-
-        for (k = pkb; k; k = k->next)
+        if (!pkb)
           {
-            if (k->pkt->pkttype == PKT_PUBLIC_KEY
-                || k->pkt->pkttype == PKT_PUBLIC_SUBKEY)
+            err = gpg_error (GPG_ERR_UNEXPECTED);
+            log_info ("oops: public key not found for preference check\n");
+          }
+        else if (pkb->pkt->pkt.public_key->selfsigversion > 3
+                 && dek->algo != CIPHER_ALGO_3DES
+                 && !opt.quiet
+                 && !is_algo_in_prefs (pkb, PREFTYPE_SYM, dek->algo))
+          log_info (_("WARNING: cipher algorithm %s not found in recipient"
+                      " preferences\n"), openpgp_cipher_algo_name (dek->algo));
+
+        /* if (!err && 25519 && openpgp_oidbuf_is_ed25519 (curve, len)) */
+        /*   log_info ("Note: legacy OID was used for cv25519\n"); */
+
+        if (!err)
+          {
+            kbnode_t k;
+            int first = 1;
+
+            for (k = pkb; k; k = k->next)
               {
-                u32 aki[2];
-
-                if (first)
+                if (k->pkt->pkttype == PKT_PUBLIC_KEY
+                    || k->pkt->pkttype == PKT_PUBLIC_SUBKEY)
                   {
-                    first = 0;
-                    mainpk = k->pkt->pkt.public_key;
-                  }
+                    u32 aki[2];
 
-                keyid_from_pk (k->pkt->pkt.public_key, aki);
-                if (aki[0] == keyid[0] && aki[1] == keyid[1])
-                  {
-                    pk = k->pkt->pkt.public_key;
-                    break;
+                    if (first)
+                      {
+                        first = 0;
+                        mainpk = k->pkt->pkt.public_key;
+                      }
+
+                    keyid_from_pk (k->pkt->pkt.public_key, aki);
+                    if (aki[0] == keyid[0] && aki[1] == keyid[1])
+                      {
+                        pk = k->pkt->pkt.public_key;
+                        break;
+                      }
                   }
               }
+            if (!pk)
+              BUG ();
+            if (pk->expiredate && pk->expiredate <= make_timestamp ())
+              {
+                log_info (_("Note: secret key %s expired at %s\n"),
+                          keystr (keyid), asctimestamp (pk->expiredate));
+              }
           }
-        if (!pk)
-          BUG ();
-        if (pk->expiredate && pk->expiredate <= make_timestamp ())
+
+        if (pk && !(pk->pubkey_usage & PUBKEY_USAGE_ENC)
+            && (pk->pubkey_usage & PUBKEY_USAGE_RENC))
           {
-            log_info (_("Note: secret key %s expired at %s\n"),
-                      keystr (keyid), asctimestamp (pk->expiredate));
+            log_info (_("Note: ADSK key has been used for decryption"));
+            log_printf ("\n");
           }
+
+        if (pk && pk->flags.revoked)
+          {
+            log_info (_("Note: key has been revoked"));
+            log_printf ("\n");
+            show_revocation_reason (ctrl, pk, 1);
+          }
+
+        if (is_status_enabled () && pk && mainpk)
+          {
+            char pkhex[MAX_FINGERPRINT_LEN*2+1];
+            char mainpkhex[MAX_FINGERPRINT_LEN*2+1];
+
+            hexfingerprint (pk, pkhex, sizeof pkhex);
+            hexfingerprint (mainpk, mainpkhex, sizeof mainpkhex);
+
+            /* Note that we do not want to create a trustdb just for
+             * getting the ownertrust: If there is no trustdb there can't
+             * be an ultimately trusted key anyway and thus the ownertrust
+             * value is irrelevant.  */
+            write_status_printf (STATUS_DECRYPTION_KEY, "%s %s %c",
+                                 pkhex, mainpkhex,
+                                 get_ownertrust_info (ctrl, mainpk, 1));
+
+          }
+
+        release_kbnode (pkb);
+        err = 0;
       }
-
-    if (pk && !(pk->pubkey_usage & PUBKEY_USAGE_ENC)
-        && (pk->pubkey_usage & PUBKEY_USAGE_RENC))
-      {
-        log_info (_("Note: ADSK key has been used for decryption"));
-        log_printf ("\n");
-      }
-
-    if (pk && pk->flags.revoked)
-      {
-        log_info (_("Note: key has been revoked"));
-        log_printf ("\n");
-        show_revocation_reason (ctrl, pk, 1);
-      }
-
-    if (is_status_enabled () && pk && mainpk)
-      {
-        char pkhex[MAX_FINGERPRINT_LEN*2+1];
-        char mainpkhex[MAX_FINGERPRINT_LEN*2+1];
-
-        hexfingerprint (pk, pkhex, sizeof pkhex);
-        hexfingerprint (mainpk, mainpkhex, sizeof mainpkhex);
-
-        /* Note that we do not want to create a trustdb just for
-         * getting the ownertrust: If there is no trustdb there can't
-         * be an ultimately trusted key anyway and thus the ownertrust
-         * value is irrelevant.  */
-        write_status_printf (STATUS_DECRYPTION_KEY, "%s %s %c",
-                             pkhex, mainpkhex,
-                             get_ownertrust_info (ctrl, mainpk, 1));
-
-      }
-
-    release_kbnode (pkb);
-    err = 0;
-  }
+      if (profile_enabled)
+        profile_keycheck_end_ms = wasm_profile_now_ms_pubkey ();
+    }
 
  leave:
+  if (profile_enabled)
+    {
+      double total_ms = wasm_profile_now_ms_pubkey () - profile_start_ms;
+      double pre_ms = 0;
+      double agent_ms = 0;
+      double decode_ms = 0;
+      double keycheck_ms = 0;
+      double other_ms;
+
+      if (profile_agent_start_ms)
+        pre_ms = profile_agent_start_ms - profile_start_ms;
+      if (profile_agent_end_ms)
+        agent_ms = profile_agent_end_ms - profile_agent_start_ms;
+      if (profile_decode_end_ms)
+        decode_ms = profile_decode_end_ms - profile_agent_end_ms;
+      if (profile_keycheck_end_ms)
+        keycheck_ms = profile_keycheck_end_ms - profile_keycheck_start_ms;
+
+      other_ms = total_ms - (pre_ms + agent_ms + decode_ms + keycheck_ms);
+      if (other_ms < 0)
+        other_ms = 0;
+
+      log_info ("[wasm-prof] get_it algo=%d total-ms=%.3f pre-ms=%.3f"
+                " agent-ms=%.3f decode-ms=%.3f keycheck-ms=%.3f"
+                " other-ms=%.3f err=%s\n",
+                sk? sk->pubkey_algo : 0,
+                total_ms,
+                pre_ms,
+                agent_ms,
+                decode_ms,
+                keycheck_ms,
+                other_ms,
+                gpg_strerror (err));
+    }
+
   xfree (frame);
   xfree (keygrip);
   return err;

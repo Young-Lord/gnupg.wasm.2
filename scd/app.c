@@ -44,6 +44,25 @@ static gpg_error_t
 send_serialno_and_app_status (card_t card, int with_apps, ctrl_t ctrl);
 static gpg_error_t run_reselect (ctrl_t ctrl, card_t c, app_t a, app_t a_prev);
 
+#ifdef __EMSCRIPTEN__
+static int
+wasm_trace_enabled_app (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_TRACE");
+      enabled = (s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+#endif
+
 /*
  * Multiple readers, single writer (MRSW) lock.
  */
@@ -942,6 +961,13 @@ select_application (ctrl_t ctrl, const char *name,
   gpg_error_t err = 0;
   card_t card, card_prev = NULL;
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_app ())
+    log_info ("[wasm-trace] select_application: enter name=%s scan=%d"
+              " card_top=%p\n",
+              name ? name : "(null)", scan, (void *)card_top);
+#endif
+
   ctrl->card_ctx = NULL;
 
   if (scan || !card_top)
@@ -952,6 +978,11 @@ select_application (ctrl_t ctrl, const char *name,
       npth_mutex_lock (&new_card_lock);
       /* Scan the devices to find new device(s).  */
       err = apdu_dev_list_start (opt.reader_port, &l);
+#ifdef __EMSCRIPTEN__
+      if (wasm_trace_enabled_app ())
+        log_info ("[wasm-trace] select_application: apdu_dev_list_start"
+                  " err=%d\n", err);
+#endif
       if (err)
         {
           npth_mutex_unlock (&new_card_lock);
@@ -964,10 +995,21 @@ select_application (ctrl_t ctrl, const char *name,
           int periodical_check_needed_this;
 
           slot = apdu_open_reader (l);
+#ifdef __EMSCRIPTEN__
+          if (wasm_trace_enabled_app ())
+            log_info ("[wasm-trace] select_application: apdu_open_reader"
+                      " slot=%d\n", slot);
+#endif
           if (slot < 0)
             break;
 
           periodical_check_needed_this = apdu_connect (slot);
+#ifdef __EMSCRIPTEN__
+          if (wasm_trace_enabled_app ())
+            log_info ("[wasm-trace] select_application: apdu_connect"
+                      " slot=%d result=%d\n", slot,
+                      periodical_check_needed_this);
+#endif
           if (periodical_check_needed_this < 0)
             {
               /* We close a reader with no card.  */
@@ -978,6 +1020,11 @@ select_application (ctrl_t ctrl, const char *name,
               card_list_w_lock ();
               err = app_new_register (slot, ctrl, name,
                                       periodical_check_needed_this);
+#ifdef __EMSCRIPTEN__
+              if (wasm_trace_enabled_app ())
+                log_info ("[wasm-trace] select_application: app_new_register"
+                          " slot=%d err=%d\n", slot, err);
+#endif
               card_list_w_unlock ();
               new_card++;
             }
@@ -991,6 +1038,12 @@ select_application (ctrl_t ctrl, const char *name,
 
       apdu_dev_list_finish (l);
       npth_mutex_unlock (&new_card_lock);
+
+#ifdef __EMSCRIPTEN__
+      if (wasm_trace_enabled_app ())
+        log_info ("[wasm-trace] select_application: scan done new_card=%d\n",
+                  new_card);
+#endif
 
       /* If new device(s), kick the scdaemon loop.  */
       if (new_card)
@@ -1009,6 +1062,12 @@ select_application (ctrl_t ctrl, const char *name,
       unlock_card (card);
       card_prev = card;
     }
+
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_app ())
+    log_info ("[wasm-trace] select_application: card search done"
+              " found=%d\n", card != NULL);
+#endif
 
   if (card)
     {
@@ -1045,6 +1104,11 @@ select_application (ctrl_t ctrl, const char *name,
   else
     err = gpg_error (GPG_ERR_ENODEV);
   card_list_w_unlock ();
+
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_app ())
+    log_info ("[wasm-trace] select_application: leave err=%d\n", err);
+#endif
 
   return err;
 }

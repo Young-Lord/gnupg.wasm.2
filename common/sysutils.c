@@ -161,6 +161,9 @@ trap_unaligned(void)
 int
 disable_core_dumps (void)
 {
+#ifdef __EMSCRIPTEN__
+    return 0;
+#else
 #ifdef HAVE_DOSISH_SYSTEM
     return 0;
 #else
@@ -178,6 +181,7 @@ disable_core_dumps (void)
 	log_fatal (_("can't disable core dumps: %s\n"), strerror(errno) );
 #endif
     return 1;
+#endif
 #endif
 }
 

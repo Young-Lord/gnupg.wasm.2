@@ -5687,6 +5687,9 @@ g10_exit( int rc )
   gnupg_block_all_signals ();
   emergency_cleanup ();
 
+  es_fflush (es_stdout);
+  es_fflush (es_stderr);
+
   exit (rc);
 }
 

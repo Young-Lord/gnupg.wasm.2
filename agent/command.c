@@ -38,6 +38,7 @@
 #include <assuan.h>
 #include "../common/i18n.h"
 #include "cvt-openpgp.h"
+
 #include "../common/ssh-utils.h"
 #include "../common/asshelp.h"
 #include "../common/server-help.h"
@@ -57,6 +58,15 @@
 /* A shortcut to call assuan_set_error using an gpg_err_code_t and a
    text string.  */
 #define set_error(e,t) assuan_set_error (ctx, gpg_error (e), (t))
+
+#ifdef __EMSCRIPTEN__
+static int
+wasm_trace_enabled_cmd (void)
+{
+  const char *s = getenv ("GNUPG_WASM_TRACE");
+  return (s && *s && strcmp (s, "0"));
+}
+#endif
 
 /* Check that the maximum digest length we support has at least the
    length of the keygrip.  */
@@ -455,6 +465,14 @@ get_keyinfo_on_cards (ctrl_t ctrl)
 
   if (opt.disable_daemon[DAEMON_SCD])
     return NULL;
+
+#ifdef __EMSCRIPTEN__
+  {
+    const char *scd_fd_env = getenv ("GNUPG_WASM_SCDAEMON_FD");
+    if (!scd_fd_env || !*scd_fd_env)
+      return NULL;
+  }
+#endif
 
   if (ctrl->server_local->last_card_keyinfo.ki
       && ctrl->server_local->last_card_keyinfo.eventno == eventcounter.card
@@ -2709,6 +2727,11 @@ cmd_scd (assuan_context_t ctx, char *line)
 #ifdef BUILD_WITH_SCDAEMON
   ctrl_t ctrl = assuan_get_pointer (ctx);
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_cmd ())
+    log_info ("[wasm-trace] scd-cmd: cmd_scd enter line='%s'\n", line);
+#endif
+
   if (ctrl->restricted)
     {
       const char *argv[5];
@@ -2744,6 +2767,11 @@ cmd_scd (assuan_context_t ctx, char *line)
   eventcounter.maybe_key_change++;
 
   rc = divert_generic_cmd (ctrl, line, ctx);
+
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_cmd ())
+    log_info ("[wasm-trace] scd-cmd: cmd_scd rc=%d line='%s'\n", rc, line);
+#endif
 #else
   (void)ctx; (void)line;
   rc = gpg_error (GPG_ERR_NOT_SUPPORTED);
@@ -4552,7 +4580,6 @@ start_command_handler (ctrl_t ctrl, gnupg_fd_t listen_fd, gnupg_fd_t fd)
         }
       else if (rc)
         {
-          log_info ("Assuan accept problem: %s\n", gpg_strerror (rc));
           break;
         }
 
@@ -4588,7 +4615,6 @@ start_command_handler (ctrl_t ctrl, gnupg_fd_t listen_fd, gnupg_fd_t fd)
       rc = assuan_process (ctx);
       if (rc)
         {
-          log_info ("Assuan processing failed: %s\n", gpg_strerror (rc));
           continue;
         }
     }

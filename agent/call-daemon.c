@@ -208,6 +208,86 @@ atfork_cb (void *opaque, int where)
 }
 
 
+#ifdef __EMSCRIPTEN__
+static int
+wasm_trace_enabled (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_TRACE");
+      enabled = (s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+
+
+/* Try to connect CTX to scdaemon via a pre-opened fd from
+ * GNUPG_WASM_SCDAEMON_FD.
+ * Returns 0 on success.
+ * Returns GPG_ERR_NOT_FOUND if no fd env var is set.
+ * Sets R_HAVE_ENV to true if env var existed (even if invalid).  */
+static gpg_error_t
+wasm_connect_preopened_scdaemon (assuan_context_t ctx, int *r_have_env)
+{
+  const char *envname = "GNUPG_WASM_SCDAEMON_FD";
+  const char *value;
+  char *endp;
+  long fdno;
+  unsigned int connect_flags = ASSUAN_SOCKET_CONNECT_FDPASSING;
+  gpg_error_t err;
+
+  *r_have_env = 0;
+
+  value = getenv (envname);
+  if (!value || !*value)
+    {
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: no pre-opened fd env for %s\n",
+                  envname);
+      return gpg_error (GPG_ERR_NOT_FOUND);
+    }
+
+  *r_have_env = 1;
+
+  if (wasm_trace_enabled ())
+    log_info ("[wasm-trace] scdaemon: found %s='%s'\n", envname, value);
+
+  errno = 0;
+  fdno = strtol (value, &endp, 10);
+  if (errno || !endp || *endp || fdno < 0)
+    {
+      log_error ("invalid value for %s: '%s'\n", envname, value);
+      return gpg_error (GPG_ERR_INV_VALUE);
+    }
+
+  /* There is no fd passing in this transport mode.  */
+  connect_flags &= ~ASSUAN_SOCKET_CONNECT_FDPASSING;
+
+  if (wasm_trace_enabled ())
+    log_info ("[wasm-trace] scdaemon: attempting assuan_socket_connect_fd"
+              " fd=%ld flags=0x%x\n", fdno, connect_flags);
+
+  err = assuan_socket_connect_fd (ctx,
+                                  assuan_fd_from_posix_fd ((int)fdno),
+                                  connect_flags);
+  if (err)
+    log_error ("can't connect to scdaemon via %s: %s\n",
+               envname, gpg_strerror (err));
+  else if (wasm_trace_enabled ())
+    log_info ("[wasm-trace] scdaemon: assuan_socket_connect_fd succeeded"
+              " via %s\n", envname);
+
+  return err;
+}
+#endif /*__EMSCRIPTEN__*/
+
+
 /* Fork off the daemon if this has not already been done.  Lock the
  * daemon and make sure that a proper context has been setup in CTRL.
  * This function might also lock the daemon, which means that the
@@ -234,8 +314,26 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
   if (opt.disable_daemon[type])
     return gpg_error (GPG_ERR_NOT_SUPPORTED);
 
+#ifdef __EMSCRIPTEN__
+  if (type == DAEMON_SCD && wasm_trace_enabled ())
+    log_info ("[wasm-trace] scdaemon: daemon_start enter"
+              " require_socket=%d local=%p local_ctx=%p local_in_use=%d"
+              " primary_ctx=%p reusable=%d\n",
+              require_socket,
+              ctrl->d_local[type],
+              ctrl->d_local[type] ? ctrl->d_local[type]->ctx : NULL,
+              ctrl->d_local[type] ? !!ctrl->d_local[type]->in_use : 0,
+              daemon_global[type].primary_ctx,
+              daemon_global[type].primary_ctx_reusable);
+#endif
+
   if (ctrl->d_local[type] && ctrl->d_local[type]->ctx)
     {
+#ifdef __EMSCRIPTEN__
+      if (type == DAEMON_SCD && wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: daemon_start fast reuse local"
+                  " ctx=%p\n", ctrl->d_local[type]->ctx);
+#endif
       ctrl->d_local[type]->in_use = 1;
       return 0; /* Okay, the context is fine.  */
     }
@@ -255,6 +353,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
                  strerror (rc));
       return gpg_error (GPG_ERR_INTERNAL);
     }
+
+#ifdef __EMSCRIPTEN__
+  if (type == DAEMON_SCD && wasm_trace_enabled ())
+    log_info ("[wasm-trace] scdaemon: daemon_start lock acquired\n");
+#endif
 
   /* If this is the first call for this session, setup the local data
      structure. */
@@ -283,6 +386,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
     {
       ctx = g->primary_ctx;
       g->primary_ctx_reusable = 0;
+#ifdef __EMSCRIPTEN__
+      if (type == DAEMON_SCD && wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: daemon_start reusing primary"
+                  " ctx=%p\n", g->primary_ctx);
+#endif
       if (opt.verbose)
         log_info ("new connection to %s daemon established (reusing)\n",
 		  name);
@@ -297,8 +405,61 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
       goto leave;
     }
 
+#ifdef __EMSCRIPTEN__
+  if (type == DAEMON_SCD)
+    {
+      int have_wasm_scd_env = 0;
+
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: about to call"
+                  " wasm_connect_preopened_scdaemon ctx=%p\n", ctx);
+
+      rc = wasm_connect_preopened_scdaemon (ctx, &have_wasm_scd_env);
+#ifdef __EMSCRIPTEN__
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: preopened connect result"
+                  " rc=%d have_env=%d ctx=%p\n", rc, have_wasm_scd_env, ctx);
+#endif
+      if (!rc)
+        {
+          if (wasm_trace_enabled ())
+            log_info ("[wasm-trace] scdaemon: preopened connect SUCCESS"
+                      " ctx=%p\n", ctx);
+          if (opt.verbose)
+            log_info ("new connection to %s daemon established"
+                      " (wasm pre-opened fd)\n", name);
+          goto leave;
+        }
+
+      if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND)
+        {
+          if (wasm_trace_enabled ())
+            log_info ("[wasm-trace] scdaemon: no pre-opened fd available;"
+                      " skipping socket/autostart fallback\n");
+          err = gpg_error (GPG_ERR_NO_SCDAEMON);
+          goto leave;
+        }
+
+      if (have_wasm_scd_env)
+        {
+#ifdef __EMSCRIPTEN__
+          if (wasm_trace_enabled ())
+            log_info ("[wasm-trace] scdaemon: preopened fd existed but"
+                      " connect failed rc=%d\n", rc);
+#endif
+          err = gpg_error (GPG_ERR_NO_SCDAEMON);
+          goto leave;
+        }
+    }
+#endif
+
   if (g->socket_name)
     {
+#ifdef __EMSCRIPTEN__
+      if (type == DAEMON_SCD && wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: trying socket connect '%s'\n",
+                  g->socket_name);
+#endif
       rc = assuan_socket_connect (ctx, g->socket_name, 0, 0);
       if (rc)
         {
@@ -316,6 +477,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
 
   if (g->primary_ctx)
     {
+#ifdef __EMSCRIPTEN__
+      if (type == DAEMON_SCD && wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: primary_ctx already set but not"
+                  " reusable primary=%p\n", g->primary_ctx);
+#endif
       log_info ("%s daemon is running but won't accept further connections\n",
 		name);
       err = gpg_error (GPG_ERR_NO_SCDAEMON);
@@ -469,6 +635,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
   }
 
  leave:
+#ifdef __EMSCRIPTEN__
+  if (type == DAEMON_SCD && wasm_trace_enabled ())
+    log_info ("[wasm-trace] scdaemon: daemon_start leave err=%d ctx=%p\n",
+              err, ctx);
+#endif
   xfree (abs_homedir);
   abs_homedir = NULL;
   if (err)

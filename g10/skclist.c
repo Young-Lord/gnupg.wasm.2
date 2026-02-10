@@ -35,6 +35,20 @@
 #include "call-agent.h"
 
 
+static int
+maybe_agent_scd_serialno (void)
+{
+#ifdef __EMSCRIPTEN__
+  const char *scd_fd_env = getenv ("GNUPG_WASM_SCDAEMON_FD");
+
+  if (!scd_fd_env || !*scd_fd_env)
+    return gpg_error (GPG_ERR_NO_SCDAEMON);
+#endif
+
+  return agent_scd_serialno (NULL, NULL);
+}
+
+
 /* Return true if Libgcrypt's RNG is in faked mode.  */
 int
 random_is_faked (void)
@@ -138,7 +152,7 @@ build_sk_list (ctrl_t ctrl,
       pk->req_usage = use;
 
       /* Check if a card is available.  If any, use the key as a hint.  */
-      err = agent_scd_serialno (NULL, NULL);
+      err = maybe_agent_scd_serialno ();
       if (!err)
         {
           err = agent_scd_getattr ("KEY-FPR", &info);
@@ -410,7 +424,7 @@ enum_secret_keys (ctrl_t ctrl, void **context, PKT_public_key *sk)
 
                 case 3: /* Init list of card keys to try.  */
                   c->card_keyinfo_list = NULL;
-                  err = agent_scd_serialno (NULL, NULL);
+                  err = maybe_agent_scd_serialno ();
                   if (!err)
                     {
                       err = agent_scd_keyinfo (NULL, GCRY_PK_USAGE_ENCR,

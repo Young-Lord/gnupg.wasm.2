@@ -536,7 +536,28 @@ static int check_for_running_agent (int silent);
 static void *check_own_socket_thread (void *arg);
 #endif
 static void *check_others_thread (void *arg);
-
+
+#ifdef __EMSCRIPTEN__
+static int wasm_initial_option_reset_done;
+static int wasm_secmem_initialized_once;
+
+static int
+wasm_persistent_agent_env_enabled (void)
+{
+  static int initialized;
+  static int enabled;
+
+  if (!initialized)
+    {
+      const char *s = getenv ("GNUPG_WASM_PERSISTENT_AGENT");
+      enabled = (s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+#endif /* __EMSCRIPTEN__ */
+ 
 /*
    Functions.
  */
@@ -875,6 +896,11 @@ parse_rereadable_options (gpgrt_argparse_t *pargs, int reread)
 
   if (!pargs)
     { /* reset mode */
+#ifdef __EMSCRIPTEN__
+      if (!reread && wasm_persistent_agent_env_enabled ()
+          && wasm_initial_option_reset_done)
+        return 1;
+#endif
       opt.quiet = 0;
       opt.verbose = 0;
       opt.debug = 0;
@@ -911,6 +937,10 @@ parse_rereadable_options (gpgrt_argparse_t *pargs, int reread)
       opt.ssh_fingerprint_digest = GCRY_MD_SHA256;
       opt.s2k_count = 0;
       set_s2k_calibration_time (0);  /* Set to default.  */
+#ifdef __EMSCRIPTEN__
+      if (!reread && wasm_persistent_agent_env_enabled ())
+        wasm_initial_option_reset_done = 1;
+#endif
       return 1;
     }
 
@@ -1213,7 +1243,15 @@ main (int argc, char **argv)
   pargs.flags &= ~(ARGPARSE_FLAG_KEEP | ARGPARSE_FLAG_NOVERSION);
 
   /* Initialize the secure memory. */
+#ifdef __EMSCRIPTEN__
+  if (!wasm_persistent_agent_env_enabled () || !wasm_secmem_initialized_once)
+    {
+      gcry_control (GCRYCTL_INIT_SECMEM, SECMEM_BUFFER_SIZE, 0);
+      wasm_secmem_initialized_once = 1;
+    }
+#else
   gcry_control (GCRYCTL_INIT_SECMEM, SECMEM_BUFFER_SIZE, 0);
+#endif
   maybe_setuid = 0;
 
   /*

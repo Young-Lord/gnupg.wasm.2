@@ -24,10 +24,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
 
 #include "agent.h"
 #include "../common/i18n.h"
 #include "../common/sysutils.h"
+
+/* Unbuffered trace macro - bypasses estream to avoid lost output on exit */
 
 
 void
@@ -575,6 +578,15 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
     }
 
   rc = gcry_pk_genkey (&s_key, s_keyparam );
+#ifdef __EMSCRIPTEN__
+  if (gpg_err_code (rc) == GPG_ERR_EOF)
+    {
+      /* Browser/WASM builds occasionally surface EOF here via the
+       * random backend path; force quick-random and retry once.  */
+      gcry_control (GCRYCTL_ENABLE_QUICK_RANDOM, 0);
+      rc = gcry_pk_genkey (&s_key, s_keyparam );
+    }
+#endif
   gcry_sexp_release (s_keyparam);
   if (rc)
     {
@@ -604,14 +616,9 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
   gcry_sexp_release (s_key); s_key = NULL;
 
   /* store the secret key */
-  if (opt.verbose)
-    log_info ("storing %sprivate key\n",
-               ctrl->ephemeral_mode?"ephemeral ":"");
   rc = store_key (ctrl, s_private, passphrase, 0, ctrl->s2k_count, timestamp);
   if (!rc && !ctrl->ephemeral_mode)
     {
-      /* FIXME: or does it make sense to also cache passphrases in
-       * ephemeral mode using a dedicated cache?  */
       if (!cache_nonce)
         {
           char tmpbuf[12];
@@ -622,7 +629,9 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
           && !(flags & GENKEY_FLAG_NO_PROTECTION)
           && !agent_put_cache (ctrl, cache_nonce, CACHE_MODE_NONCE,
                                passphrase, ctrl->cache_ttl_opt_preset))
-        agent_write_status (ctrl, "CACHE_NONCE", cache_nonce, NULL);
+        {
+          agent_write_status (ctrl, "CACHE_NONCE", cache_nonce, NULL);
+        }
       if ((flags & GENKEY_FLAG_PRESET)
           && !(flags & GENKEY_FLAG_NO_PROTECTION))
         {
@@ -648,8 +657,6 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
     }
 
   /* return the public key */
-  if (DBG_CRYPTO)
-    log_debug ("returning public key\n");
   len = gcry_sexp_sprint (s_public, GCRYSEXP_FMT_CANON, NULL, 0);
   log_assert (len);
   buf = xtrymalloc (len);

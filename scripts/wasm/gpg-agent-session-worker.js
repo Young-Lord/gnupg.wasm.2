@@ -1,0 +1,1437 @@
+/* eslint-env worker */
+
+let activeFS = null;
+let activeBridge = null;
+let activeScdaemonBridge = null;
+let activeHomedir = '/gnupg';
+let activePersistRoots = [];
+let activeSessionId = '';
+let activeStderrBuffer = [];
+let sessionRunning = false;
+let persistentScdaemonFd = null;
+let debugEnabled = false;
+
+const runtimeState = {
+  bootPromise: null,
+  scriptUrl: '',
+  wasmUrl: '',
+};
+
+let bridgeMetrics = createBridgeMetrics();
+const DEBUG_BUILD_TAG = '2026-02-13-log-v3';
+
+let workerUrlPolicy = undefined;
+
+function getWorkerUrlPolicy() {
+  if (workerUrlPolicy !== undefined) {
+    return workerUrlPolicy;
+  }
+  if (!self.trustedTypes || typeof self.trustedTypes.createPolicy !== 'function') {
+    workerUrlPolicy = null;
+    return workerUrlPolicy;
+  }
+
+  const policyNames = [
+    'gnupg-wasm-worker-url',
+    'gnupg-wasm',
+    'default',
+  ];
+
+  for (const name of policyNames) {
+    try {
+      workerUrlPolicy = self.trustedTypes.createPolicy(name, {
+        createScriptURL(value) {
+          return String(value);
+        },
+      });
+      return workerUrlPolicy;
+    } catch {
+      /* Ignore policy creation failures and try next candidate. */
+    }
+  }
+
+  if (self.trustedTypes.defaultPolicy
+      && typeof self.trustedTypes.defaultPolicy.createScriptURL === 'function') {
+    workerUrlPolicy = self.trustedTypes.defaultPolicy;
+    return workerUrlPolicy;
+  }
+
+  workerUrlPolicy = null;
+  return workerUrlPolicy;
+}
+
+function asWorkerScriptUrl(value) {
+  const url = String(value);
+  const policy = getWorkerUrlPolicy();
+  if (!policy || typeof policy.createScriptURL !== 'function') {
+    return url;
+  }
+  try {
+    return policy.createScriptURL(url);
+  } catch {
+    return url;
+  }
+}
+
+function createBridgeMetrics() {
+  return {
+    stdinReadCalls: 0,
+    stdinRead: 0,
+    stdoutWriteCalls: 0,
+    stdoutWrite: 0,
+    stderrWrite: 0,
+    stdinPreview: [],
+    stdoutPreview: [],
+    stderrPreview: [],
+  };
+}
+
+function postDebug(step, data) {
+  if (!debugEnabled) {
+    return;
+  }
+  postMessage({
+    type: 'debug',
+    step,
+    data: data && typeof data === 'object' ? data : { value: data },
+  });
+}
+
+function postError(message, sessionId = '') {
+  postMessage({
+    type: 'error',
+    message: String(message || 'unknown agent session worker error'),
+    sessionId: sessionId || '',
+  });
+}
+
+function formatError(error) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function normalizePath(pathValue, fallback) {
+  let value = typeof pathValue === 'string' ? pathValue.trim() : '';
+  if (!value) {
+    value = fallback;
+  }
+  if (!value.startsWith('/')) {
+    value = `/${value}`;
+  }
+  if (value.length > 1 && value.endsWith('/')) {
+    value = value.slice(0, -1);
+  }
+  return value.replace(/\/{2,}/g, '/');
+}
+
+function normalizePersistRoots(value, fallback) {
+  const roots = [];
+  const seen = new Set();
+
+  if (Array.isArray(value)) {
+    for (const raw of value) {
+      if (typeof raw !== 'string') {
+        continue;
+      }
+      const path = normalizePath(raw, '/');
+      if (seen.has(path)) {
+        continue;
+      }
+      seen.add(path);
+      roots.push(path);
+    }
+  }
+
+  if (!roots.length && Array.isArray(fallback)) {
+    for (const raw of fallback) {
+      if (typeof raw !== 'string') {
+        continue;
+      }
+      const path = normalizePath(raw, '/');
+      if (seen.has(path)) {
+        continue;
+      }
+      seen.add(path);
+      roots.push(path);
+    }
+  }
+
+  return roots;
+}
+
+function normalizeUsbAuthorizedDevices(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const out = [];
+  const seen = new Set();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const vendorId = Number(entry.vendorId);
+    const productId = Number(entry.productId);
+    if (!Number.isFinite(vendorId) || !Number.isFinite(productId)) {
+      continue;
+    }
+
+    const normalizedEntry = {
+      vendorId: Math.max(0, Math.min(0xffff, vendorId | 0)),
+      productId: Math.max(0, Math.min(0xffff, productId | 0)),
+      serialNumber: typeof entry.serialNumber === 'string' ? entry.serialNumber : '',
+    };
+
+    const key = `${normalizedEntry.vendorId}:${normalizedEntry.productId}:${normalizedEntry.serialNumber}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(normalizedEntry);
+  }
+
+  return out;
+}
+
+function parentDirectory(pathValue) {
+  const idx = pathValue.lastIndexOf('/');
+  if (idx <= 0) {
+    return '/';
+  }
+  return pathValue.slice(0, idx);
+}
+
+function ensureDirectory(FS, dirPath) {
+  if (!dirPath || dirPath === '/') {
+    return;
+  }
+  const parts = dirPath.split('/').filter(Boolean);
+  let current = '';
+  for (const part of parts) {
+    current += `/${part}`;
+    try {
+      FS.mkdir(current);
+    } catch {
+      if (!FS.analyzePath(current).exists) {
+        throw new Error(`unable to create directory: ${current}`);
+      }
+    }
+  }
+}
+
+function normalizeMode(mode, fallback) {
+  if (Number.isFinite(mode)) {
+    return Number(mode) & 0o777;
+  }
+  return fallback;
+}
+
+function encodeBase64(bytes) {
+  let binary = '';
+  const chunkSize = 0x4000;
+
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    let part = '';
+    for (let j = 0; j < chunk.length; j += 1) {
+      part += String.fromCharCode(chunk[j]);
+    }
+    binary += part;
+  }
+
+  return btoa(binary);
+}
+
+function decodeBase64(base64Text) {
+  if (!base64Text) {
+    return new Uint8Array();
+  }
+  const binary = atob(base64Text);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+function restoreFsState(FS, state) {
+  if (!state || typeof state !== 'object') {
+    return;
+  }
+
+  const dirs = Array.isArray(state.dirs) ? state.dirs.slice() : [];
+  dirs.sort((a, b) => String(a.path || '').length - String(b.path || '').length);
+
+  for (const entry of dirs) {
+    if (!entry || typeof entry.path !== 'string') {
+      continue;
+    }
+    const path = normalizePath(entry.path, '/');
+    ensureDirectory(FS, path);
+    try {
+      FS.chmod(path, normalizeMode(entry.mode, 0o700));
+    } catch {
+      /* Best effort only. */
+    }
+  }
+
+  const files = Array.isArray(state.files) ? state.files.slice() : [];
+  files.sort((a, b) => String(a.path || '').length - String(b.path || '').length);
+
+  for (const entry of files) {
+    if (!entry || typeof entry.path !== 'string') {
+      continue;
+    }
+    const path = normalizePath(entry.path, '/');
+    ensureDirectory(FS, parentDirectory(path));
+    const bytes = decodeBase64(typeof entry.data === 'string' ? entry.data : '');
+    FS.writeFile(path, bytes);
+    try {
+      FS.chmod(path, normalizeMode(entry.mode, 0o600));
+    } catch {
+      /* Best effort only. */
+    }
+  }
+}
+
+function captureFsState(FS, roots) {
+  if (!FS || !roots.length) {
+    return null;
+  }
+
+  const dirs = [];
+  const files = [];
+  const seen = new Set();
+
+  const walk = (path) => {
+    if (seen.has(path)) {
+      return;
+    }
+    seen.add(path);
+
+    const stat = FS.stat(path);
+    if (FS.isDir(stat.mode)) {
+      dirs.push({
+        path,
+        mode: normalizeMode(stat.mode, 0o700),
+      });
+      const names = FS.readdir(path);
+      for (const name of names) {
+        if (name === '.' || name === '..') {
+          continue;
+        }
+        const child = path === '/' ? `/${name}` : `${path}/${name}`;
+        walk(child);
+      }
+      return;
+    }
+
+    if (FS.isFile(stat.mode)) {
+      const bytes = FS.readFile(path, { encoding: 'binary' });
+      files.push({
+        path,
+        mode: normalizeMode(stat.mode, 0o600),
+        data: encodeBase64(bytes),
+      });
+    }
+  };
+
+  for (const rootRaw of roots) {
+    const root = normalizePath(rootRaw, '/');
+    const info = FS.analyzePath(root);
+    if (!info.exists) {
+      continue;
+    }
+    walk(root);
+  }
+
+  dirs.sort((a, b) => a.path.localeCompare(b.path));
+  files.sort((a, b) => a.path.localeCompare(b.path));
+
+  return {
+    version: 1,
+    roots: roots.slice(),
+    dirs,
+    files,
+  };
+}
+
+function createSharedQueue(desc) {
+  if (!desc || !desc.meta || !desc.data) {
+    throw new Error('invalid shared queue descriptor');
+  }
+  return {
+    ctrl: new Int32Array(desc.meta),
+    data: new Uint8Array(desc.data),
+  };
+}
+
+function createSharedQueueDescriptor(size = 262144) {
+  const normalizedSize = Number.isFinite(size) ? Math.max(1024, Number(size) | 0) : 262144;
+  return {
+    meta: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4),
+    data: new SharedArrayBuffer(normalizedSize),
+  };
+}
+
+function queueNotify(queue) {
+  const { ctrl } = queue;
+  Atomics.add(ctrl, 3, 1);
+  Atomics.notify(ctrl, 3);
+}
+
+function queuePushByte(queue, byteValue, shouldBlock = true) {
+  const { ctrl, data } = queue;
+  const size = data.length;
+  const value = Number(byteValue) & 0xff;
+
+  while (true) {
+    const head = Atomics.load(ctrl, 0);
+    const tail = Atomics.load(ctrl, 1);
+    const next = (head + 1) % size;
+    if (next !== tail) {
+      data[head] = value;
+      Atomics.store(ctrl, 0, next);
+      queueNotify(queue);
+      return true;
+    }
+    if (Atomics.load(ctrl, 2) !== 0) {
+      return false;
+    }
+
+    if (!shouldBlock) {
+      return false;
+    }
+
+    const stamp = Atomics.load(ctrl, 3);
+    Atomics.wait(ctrl, 3, stamp, 10);
+  }
+}
+
+function queuePopByte(queue, shouldBlock = false) {
+  const { ctrl, data } = queue;
+  const size = data.length;
+
+  while (true) {
+    const head = Atomics.load(ctrl, 0);
+    const tail = Atomics.load(ctrl, 1);
+
+    if (tail !== head) {
+      const value = data[tail];
+      const next = (tail + 1) % size;
+      Atomics.store(ctrl, 1, next);
+      queueNotify(queue);
+      return value;
+    }
+
+    if (Atomics.load(ctrl, 2) !== 0) {
+      return null;
+    }
+
+    if (!shouldBlock) {
+      return undefined;
+    }
+
+    const stamp = Atomics.load(ctrl, 3);
+    Atomics.wait(ctrl, 3, stamp, 10);
+  }
+}
+
+function queueClose(queue) {
+  Atomics.store(queue.ctrl, 2, 1);
+  queueNotify(queue);
+}
+
+function queueHasData(queue) {
+  return Atomics.load(queue.ctrl, 0) !== Atomics.load(queue.ctrl, 1);
+}
+
+function summarizeQueue(queue) {
+  const head = Atomics.load(queue.ctrl, 0);
+  const tail = Atomics.load(queue.ctrl, 1);
+  const closed = Atomics.load(queue.ctrl, 2) !== 0;
+  const size = queue.data.length;
+  const used = head >= tail ? head - tail : (size - tail) + head;
+  return {
+    head,
+    tail,
+    size,
+    used,
+    closed,
+  };
+}
+
+function ensurePersistentScdaemonFd(FS, envObj) {
+  if (!FS || !envObj) {
+    throw new Error('runtime FS/ENV unavailable for scdaemon bridge');
+  }
+  if (!FS.registerDevice || !FS.mkdev || !FS.makedev) {
+    throw new Error('FS device registration APIs are unavailable');
+  }
+
+  if (persistentScdaemonFd !== null) {
+    envObj.GNUPG_WASM_SCDAEMON_FD = String(persistentScdaemonFd);
+    return persistentScdaemonFd;
+  }
+
+  const devName = `gnupg-scd-bridge-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+  const devPath = `/dev/${devName}`;
+  const major = 64;
+  const minor = ((Date.now() + 29) % 200) + Math.floor(Math.random() * 50);
+  const dev = FS.makedev(major, minor);
+  const POLLIN = 0x001;
+  const POLLOUT = 0x004;
+  const POLLHUP = 0x010;
+  const errnoCodes = self.ERRNO_CODES || (self.Module && self.Module.ERRNO_CODES) || null;
+  const EAGAIN = errnoCodes && Number.isFinite(errnoCodes.EAGAIN)
+    ? Number(errnoCodes.EAGAIN)
+    : 6;
+
+  let scdDevReadCalls = 0;
+  let scdDevReadBytes = 0;
+  let scdDevWriteCalls = 0;
+  let scdDevWriteBytes = 0;
+
+  FS.registerDevice(dev, {
+    read(stream, buffer, offset, length) {
+      scdDevReadCalls += 1;
+      if (!activeScdaemonBridge) {
+        postDebug('session.scd.read.no-bridge', { calls: scdDevReadCalls });
+        throw new FS.ErrnoError(EAGAIN);
+      }
+      if (length <= 0) {
+        return 0;
+      }
+      let count = 0;
+      const firstByte = activeScdaemonBridge.readByte(true);
+      if (firstByte === null) {
+        postDebug('session.scd.read.eof', { calls: scdDevReadCalls, totalBytes: scdDevReadBytes });
+        return 0;
+      }
+      buffer[offset + count] = firstByte;
+      count += 1;
+
+      while (count < length) {
+        const byteValue = activeScdaemonBridge.readByte(false);
+        if (byteValue === undefined || byteValue === null) {
+          break;
+        }
+        buffer[offset + count] = byteValue;
+        count += 1;
+      }
+      scdDevReadBytes += count;
+      if (scdDevReadCalls <= 24 || (scdDevReadCalls % 50) === 0) {
+        const chunk = [];
+        for (let i = 0; i < Math.min(count, 64); i++) {
+          const v = buffer[offset + i];
+          chunk.push((v >= 32 && v <= 126) ? String.fromCharCode(v) : '.');
+        }
+        postDebug('session.scd.rx', {
+          calls: scdDevReadCalls,
+          count,
+          totalBytes: scdDevReadBytes,
+          ascii: chunk.join(''),
+        });
+      }
+      return count;
+    },
+    write(stream, buffer, offset, length) {
+      scdDevWriteCalls += 1;
+      if (!activeScdaemonBridge) {
+        postDebug('session.scd.write.no-bridge', { calls: scdDevWriteCalls });
+        throw new FS.ErrnoError(EAGAIN);
+      }
+      let count = 0;
+      while (count < length) {
+        activeScdaemonBridge.writeByte(buffer[offset + count]);
+        count += 1;
+      }
+      scdDevWriteBytes += count;
+      if (scdDevWriteCalls <= 24 || (scdDevWriteCalls % 50) === 0) {
+        const chunk = [];
+        for (let i = 0; i < Math.min(count, 64); i++) {
+          const v = buffer[offset + i];
+          chunk.push((v >= 32 && v <= 126) ? String.fromCharCode(v) : '.');
+        }
+        postDebug('session.scd.tx', {
+          calls: scdDevWriteCalls,
+          count,
+          totalBytes: scdDevWriteBytes,
+          ascii: chunk.join(''),
+        });
+      }
+      return count;
+    },
+    poll(stream, timeout, notifyCallback) {
+      if (!activeScdaemonBridge) {
+        return POLLOUT;
+      }
+      let mask = POLLOUT;
+      if (activeScdaemonBridge.hasReadableData()) {
+        mask |= POLLIN;
+      }
+      if (activeScdaemonBridge.isReadableClosed()) {
+        mask |= POLLHUP;
+      }
+      if (mask === POLLOUT && typeof notifyCallback === 'function') {
+        activeScdaemonBridge.registerReadableHandler(notifyCallback);
+      }
+      return mask;
+    },
+  });
+
+  FS.mkdev(devPath, 0o600, dev);
+  const stream = FS.open(devPath, 'r+');
+  persistentScdaemonFd = stream.fd;
+  envObj.GNUPG_WASM_SCDAEMON_FD = String(stream.fd);
+  postDebug('runtime.scdaemon-fd', {
+    devPath,
+    fd: stream.fd,
+  });
+  return stream.fd;
+}
+
+function writeStderrByte(ch) {
+  if (ch === null || ch === undefined) {
+    return;
+  }
+  bridgeMetrics.stderrWrite += 1;
+  if (bridgeMetrics.stderrPreview.length < 32) {
+    bridgeMetrics.stderrPreview.push(Number(ch) & 0xff);
+  }
+  activeStderrBuffer.push(Number(ch) & 0xff);
+  if (activeStderrBuffer.length > 65536) {
+    activeStderrBuffer = activeStderrBuffer.slice(-32768);
+  }
+}
+
+function callMainWith(args) {
+  if (typeof self.callMain === 'function') {
+    return self.callMain(args);
+  }
+  if (self.Module && typeof self.Module.callMain === 'function') {
+    return self.Module.callMain(args);
+  }
+  throw new Error('callMain is not available for gpg-agent session worker');
+}
+
+async function importLauncherScript(scriptUrl) {
+  const useFetchBlobPath = !/\.m?js(?:[?#].*)?$/i.test(scriptUrl);
+
+  if (!useFetchBlobPath) {
+    importScripts(asWorkerScriptUrl(scriptUrl));
+    return;
+  }
+
+  const response = await fetch(scriptUrl, { credentials: 'same-origin' });
+  if (!response.ok) {
+    throw new Error(`launcher fetch failed: ${response.status} ${response.statusText}`);
+  }
+
+  const source = await response.text();
+  const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+  try {
+    importScripts(asWorkerScriptUrl(blobUrl));
+  } finally {
+    URL.revokeObjectURL(blobUrl);
+  }
+}
+
+function stripJsSuffix(urlText) {
+  return String(urlText || '').replace(/\.js(?=(?:[?#].*)?$)/i, '');
+}
+
+async function ensureRuntime(gpgAgentScriptUrl, gpgAgentWasmUrl) {
+  const scriptUrl = typeof gpgAgentScriptUrl === 'string' ? gpgAgentScriptUrl : '';
+  const wasmUrl = typeof gpgAgentWasmUrl === 'string' ? gpgAgentWasmUrl : '';
+
+  if (!scriptUrl) {
+    throw new Error('missing gpgAgentScriptUrl for session worker');
+  }
+
+  if (runtimeState.bootPromise) {
+    if (runtimeState.scriptUrl !== scriptUrl || runtimeState.wasmUrl !== wasmUrl) {
+      throw new Error('changing gpg-agent launcher URLs requires a new session worker');
+    }
+    return runtimeState.bootPromise;
+  }
+
+  runtimeState.scriptUrl = scriptUrl;
+  runtimeState.wasmUrl = wasmUrl;
+
+  runtimeState.bootPromise = (async () => {
+    let runtimeReadyResolve;
+    let runtimeReadyReject;
+    const runtimeReady = new Promise((resolve, reject) => {
+      runtimeReadyResolve = resolve;
+      runtimeReadyReject = reject;
+    });
+
+    const scriptDir = (() => {
+      try {
+        return new URL('.', scriptUrl).toString();
+      } catch {
+        return '';
+      }
+    })();
+
+    self.Module = {
+      arguments: [],
+      noInitialRun: true,
+      noExitRuntime: true,
+      mainScriptUrlOrBlob: scriptUrl,
+      locateFile: (fileName, scriptDirectory) => {
+        if (wasmUrl && fileName.endsWith('.wasm')) {
+          return wasmUrl;
+        }
+        if (scriptDir) {
+          return `${scriptDir}${fileName}`;
+        }
+        return `${scriptDirectory}${fileName}`;
+      },
+      preRun: [
+        () => {
+          const FS = self.FS || (self.Module && self.Module.FS);
+          if (!FS || typeof FS.init !== 'function') {
+            throw new Error('FS is not initialized in gpg-agent session worker');
+          }
+          activeFS = FS;
+
+          const envObj = (() => {
+            const base = self.ENV && typeof self.ENV === 'object' ? self.ENV : {};
+            self.ENV = base;
+            if (self.Module && typeof self.Module === 'object') {
+              self.Module.ENV = base;
+            }
+            if (debugEnabled) {
+              base.GNUPG_WASM_TRACE = '1';
+            } else if (Object.prototype.hasOwnProperty.call(base, 'GNUPG_WASM_TRACE')) {
+              delete base.GNUPG_WASM_TRACE;
+            }
+            base.GNUPG_WASM_PERSISTENT_AGENT = '1';
+            return base;
+          })();
+
+          let stdinDeliveredInRead = 0;
+          let stdinReadSeq = 0;
+          const ipcRxTracer = (() => {
+            const bytes = [];
+            let lineCount = 0;
+            return {
+              push(v) {
+                if (v === null || v === undefined) return;
+                const b = Number(v) & 0xff;
+                if (b === 13) return;
+                if (b === 10) {
+                  if (bytes.length > 0 && lineCount < 120) {
+                    lineCount += 1;
+                    postDebug('session.ipc.rx', {
+                      n: lineCount,
+                      line: bytes.map(c => (c >= 32 && c <= 126) ? String.fromCharCode(c) : '.').join(''),
+                    });
+                  }
+                  bytes.length = 0;
+                  return;
+                }
+                if (bytes.length < 220) bytes.push(b);
+              },
+            };
+          })();
+          const ipcTxTracer = (() => {
+            const bytes = [];
+            let lineCount = 0;
+            return {
+              push(v) {
+                if (v === null || v === undefined) return;
+                const b = Number(v) & 0xff;
+                if (b === 13) return;
+                if (b === 10) {
+                  if (bytes.length > 0 && lineCount < 120) {
+                    lineCount += 1;
+                    postDebug('session.ipc.tx', {
+                      n: lineCount,
+                      line: bytes.map(c => (c >= 32 && c <= 126) ? String.fromCharCode(c) : '.').join(''),
+                    });
+                  }
+                  bytes.length = 0;
+                  return;
+                }
+                if (bytes.length < 220) bytes.push(b);
+              },
+            };
+          })();
+
+          FS.init(
+            () => {
+              bridgeMetrics.stdinReadCalls += 1;
+              if (!activeBridge) {
+                return undefined;
+              }
+              const shouldBlock = stdinDeliveredInRead === 0;
+              if (shouldBlock && bridgeMetrics.stdinReadCalls <= 200) {
+                postDebug('session.stdin.blocking', {
+                  seq: stdinReadSeq,
+                  n: bridgeMetrics.stdinReadCalls,
+                  queue: summarizeQueue(activeBridge.gpgToAgent),
+                });
+              }
+              const value = queuePopByte(activeBridge.gpgToAgent, shouldBlock);
+              if (value !== null && value !== undefined) {
+                stdinDeliveredInRead += 1;
+                bridgeMetrics.stdinRead += 1;
+                ipcRxTracer.push(value);
+                if (bridgeMetrics.stdinPreview.length < 32) {
+                  bridgeMetrics.stdinPreview.push(Number(value) & 0xff);
+                }
+              } else {
+                if (value === null) {
+                  postDebug('session.stdin.eof', {
+                    seq: stdinReadSeq,
+                    n: bridgeMetrics.stdinReadCalls,
+                    delivered: stdinDeliveredInRead,
+                    queue: summarizeQueue(activeBridge.gpgToAgent),
+                  });
+                }
+                stdinDeliveredInRead = 0;
+                stdinReadSeq += 1;
+              }
+              return value;
+            },
+            (ch) => {
+              if (ch === null || ch === undefined) {
+                return;
+              }
+              bridgeMetrics.stdoutWriteCalls += 1;
+              bridgeMetrics.stdoutWrite += 1;
+              ipcTxTracer.push(ch);
+              if (bridgeMetrics.stdoutPreview.length < 32) {
+                bridgeMetrics.stdoutPreview.push(Number(ch) & 0xff);
+              }
+              if (activeBridge) {
+                queuePushByte(activeBridge.agentToGpg, ch, true);
+              }
+            },
+            (ch) => {
+              writeStderrByte(ch);
+            }
+          );
+
+          ensurePersistentScdaemonFd(FS, envObj);
+        },
+      ],
+      onRuntimeInitialized: () => {
+        postDebug('runtime.ready', {
+          scriptUrl,
+          wasmUrl,
+        });
+        runtimeReadyResolve(true);
+      },
+      onAbort: (why) => {
+        const text = formatError(why);
+        postDebug('runtime.abort', { why: text });
+        runtimeReadyReject(new Error(text));
+      },
+    };
+
+    try {
+      postDebug('import-launcher.start', { scriptUrl });
+      await importLauncherScript(scriptUrl);
+      postDebug('import-launcher.done', {});
+    } catch (error) {
+      const primaryError = formatError(error);
+      const fallbackUrl = stripJsSuffix(scriptUrl);
+      if (fallbackUrl && fallbackUrl !== scriptUrl) {
+        try {
+          postDebug('import-launcher.fallback.start', {
+            from: scriptUrl,
+            to: fallbackUrl,
+            reason: primaryError,
+          });
+          await importLauncherScript(fallbackUrl);
+          postDebug('import-launcher.fallback.done', {
+            usedUrl: fallbackUrl,
+          });
+        } catch (fallbackError) {
+          throw new Error(`${primaryError}; fallback failed: ${formatError(fallbackError)}`);
+        }
+      } else {
+        throw new Error(primaryError);
+      }
+    }
+
+    await runtimeReady;
+    return true;
+  })();
+
+  try {
+    await runtimeState.bootPromise;
+    return runtimeState.bootPromise;
+  } catch (error) {
+    runtimeState.bootPromise = null;
+    throw error;
+  }
+}
+
+function finishSession(sessionId, exitCode, errorMessage) {
+  const stderrText = new TextDecoder().decode(new Uint8Array(activeStderrBuffer));
+  const fsState = captureFsState(activeFS, activePersistRoots);
+  const result = {
+    type: 'session-result',
+    sessionId,
+    exitCode: Number.isFinite(exitCode) ? exitCode : 1,
+    error: errorMessage ? String(errorMessage) : '',
+    stderr: stderrText,
+    fsState,
+    bridgeMetrics: { ...bridgeMetrics },
+    bridgeState: activeBridge
+      ? {
+          gpgToAgent: summarizeQueue(activeBridge.gpgToAgent),
+          agentToGpg: summarizeQueue(activeBridge.agentToGpg),
+        }
+      : null,
+  };
+
+  postDebug('session.finish', {
+    sessionId,
+    exitCode: result.exitCode,
+    error: result.error,
+    bridgeMetrics: result.bridgeMetrics,
+    bridgeState: result.bridgeState,
+  });
+  postMessage(result);
+
+  if (activeBridge) {
+    queueClose(activeBridge.gpgToAgent);
+    queueClose(activeBridge.agentToGpg);
+  }
+  if (activeScdaemonBridge) {
+    void activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
+  }
+  activeBridge = null;
+  activeScdaemonBridge = null;
+  activeSessionId = '';
+  activeStderrBuffer = [];
+  bridgeMetrics = createBridgeMetrics();
+  sessionRunning = false;
+}
+
+async function handleRunSession(message) {
+  debugEnabled = Boolean(message && message.debug === true);
+
+  const sessionId = typeof message.sessionId === 'string' && message.sessionId
+    ? message.sessionId
+    : `agent-session-${Date.now()}`;
+
+  if (sessionRunning) {
+    postError('agent session worker is already handling a session', sessionId);
+    postMessage({
+      type: 'session-result',
+      sessionId,
+      exitCode: 2,
+      error: 'agent session worker is already handling a session',
+      stderr: '',
+      fsState: captureFsState(activeFS, activePersistRoots),
+      bridgeMetrics: { ...bridgeMetrics },
+      bridgeState: null,
+    });
+    return;
+  }
+
+  try {
+    await ensureRuntime(message.gpgAgentScriptUrl, message.gpgAgentWasmUrl);
+  } catch (error) {
+    const detail = formatError(error);
+    postError(detail, sessionId);
+    postMessage({
+      type: 'session-result',
+      sessionId,
+      exitCode: 2,
+      error: detail,
+      stderr: '',
+      fsState: captureFsState(activeFS, activePersistRoots),
+      bridgeMetrics: { ...bridgeMetrics },
+      bridgeState: null,
+    });
+    return;
+  }
+
+  let bridge = null;
+  try {
+    bridge = {
+      gpgToAgent: createSharedQueue(message.bridge && message.bridge.gpgToAgent),
+      agentToGpg: createSharedQueue(message.bridge && message.bridge.agentToGpg),
+    };
+  } catch (error) {
+    const detail = formatError(error);
+    postError(detail, sessionId);
+    postMessage({
+      type: 'session-result',
+      sessionId,
+      exitCode: 2,
+      error: detail,
+      stderr: '',
+      fsState: captureFsState(activeFS, activePersistRoots),
+      bridgeMetrics: { ...bridgeMetrics },
+      bridgeState: null,
+    });
+    return;
+  }
+
+  sessionRunning = true;
+  activeSessionId = sessionId;
+  activeBridge = bridge;
+  bridgeMetrics = createBridgeMetrics();
+  activeStderrBuffer = [];
+
+  const homedir = normalizePath(message.homedir, '/gnupg');
+  activeHomedir = homedir;
+  const gpgScdaemonWorkerUrl = typeof message.gpgScdaemonWorkerUrl === 'string'
+    ? message.gpgScdaemonWorkerUrl
+    : new URL('./gpg-scdaemon-server-worker.js', self.location.href).toString();
+  let gpgScdaemonScriptUrl = typeof message.gpgScdaemonScriptUrl === 'string'
+    ? message.gpgScdaemonScriptUrl
+    : '';
+  let gpgScdaemonWasmUrl = typeof message.gpgScdaemonWasmUrl === 'string'
+    ? message.gpgScdaemonWasmUrl
+    : '';
+  const incomingFsState = message.fsState && typeof message.fsState === 'object'
+    ? message.fsState
+    : null;
+  const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(message.usbAuthorizedDevices);
+  const webUsbSupportedHint = message.webUsbSupported === false
+    ? false
+    : message.webUsbSupported === true
+      ? true
+      : null;
+
+  if (!gpgScdaemonScriptUrl && message.gpgAgentScriptUrl) {
+    gpgScdaemonScriptUrl = String(message.gpgAgentScriptUrl)
+      .replace(/gpg-agent(?:\.js)?(?=(?:[?#].*)?$)/, 'scdaemon.js');
+  }
+  if (!gpgScdaemonWasmUrl && message.gpgAgentWasmUrl) {
+    gpgScdaemonWasmUrl = String(message.gpgAgentWasmUrl)
+      .replace(/gpg-agent\.wasm(?=(?:[?#].*)?$)/, 'scdaemon.wasm');
+  }
+
+  activePersistRoots = normalizePersistRoots(
+    message.persistRoots,
+    incomingFsState && Array.isArray(incomingFsState.roots)
+      ? incomingFsState.roots
+      : [homedir]
+  );
+  if (!activePersistRoots.includes(homedir)) {
+    activePersistRoots.push(homedir);
+  }
+
+  postDebug('session.start', {
+    buildTag: DEBUG_BUILD_TAG,
+    sessionId,
+    homedir,
+    persistRoots: activePersistRoots,
+    usbAuthorizedDeviceCount: usbAuthorizedDevices.length,
+    webUsbSupportedHint,
+    hasIncomingFsState: Boolean(incomingFsState),
+  });
+
+  const createScdaemonBridge = () => {
+    const worker = new Worker(asWorkerScriptUrl(gpgScdaemonWorkerUrl));
+    let daemonDone = false;
+    let bridgeClosed = false;
+    let resolveResult;
+    let rejectResult;
+    const resultPromise = new Promise((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+    let resolveReady;
+    let rejectReady;
+    const readyPromise = new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+
+    const closeBridgeQueues = () => {
+      if (bridgeClosed) {
+        return;
+      }
+      bridgeClosed = true;
+      queueClose(agentToScdaemon);
+      queueClose(scdaemonToAgent);
+    };
+
+    const agentToScdaemonDesc = createSharedQueueDescriptor();
+    const scdaemonToAgentDesc = createSharedQueueDescriptor();
+    const agentToScdaemon = createSharedQueue(agentToScdaemonDesc);
+    const scdaemonToAgent = createSharedQueue(scdaemonToAgentDesc);
+    const readableHandlers = [];
+    let readableWatcherId = null;
+    let lastReadableState = false;
+    let lastClosedState = false;
+
+    const notifyReadableHandlers = (mask) => {
+      while (readableHandlers.length > 0) {
+        const handler = readableHandlers.shift();
+        try {
+          handler(mask);
+        } catch {
+          /* Ignore runtime poll callback errors. */
+        }
+      }
+    };
+
+    const ensureReadableWatcher = () => {
+      if (readableWatcherId !== null) {
+        return;
+      }
+      readableWatcherId = setInterval(() => {
+        const hasData = queueHasData(scdaemonToAgent);
+        const closed = Atomics.load(scdaemonToAgent.ctrl, 2) !== 0;
+        const becameReadable = hasData && !lastReadableState;
+        const becameClosed = closed && !lastClosedState;
+        lastReadableState = hasData;
+        lastClosedState = closed;
+        if (becameReadable || becameClosed) {
+          const POLLIN = 0x001;
+          const POLLHUP = 0x010;
+          let mask = 0;
+          if (hasData) {
+            mask |= POLLIN;
+          }
+          if (closed) {
+            mask |= POLLHUP;
+          }
+          if (mask !== 0) {
+            notifyReadableHandlers(mask);
+          }
+        }
+      }, 10);
+    };
+
+    worker.addEventListener('message', (event) => {
+      const messageData = event.data;
+      if (!messageData || typeof messageData !== 'object') {
+        return;
+      }
+      if (messageData.type === 'debug') {
+        postDebug(`scdaemon.${messageData.step || 'unknown'}`, messageData.data || null);
+        return;
+      }
+      if (messageData.type === 'ready') {
+        resolveReady(true);
+        return;
+      }
+      if (messageData.type === 'error') {
+        postDebug('scdaemon.error', { message: String(messageData.message || 'unknown worker error') });
+        daemonDone = true;
+        closeBridgeQueues();
+        resolveReady(false);
+        resolveResult({
+          type: 'result',
+          exitCode: 1,
+          error: String(messageData.message || 'unknown worker error'),
+          stderr: '',
+        });
+        return;
+      }
+      if (messageData.type === 'result') {
+        daemonDone = true;
+        closeBridgeQueues();
+        postDebug('scdaemon.exit', {
+          sessionId,
+          exitCode: Number.isFinite(messageData.exitCode) ? Number(messageData.exitCode) : null,
+          error: messageData.error ? String(messageData.error) : '',
+        });
+        resolveReady(false);
+        resolveResult(messageData);
+      }
+    });
+
+    worker.addEventListener('error', (event) => {
+      const text = event && event.message ? event.message : 'scdaemon worker failed';
+      daemonDone = true;
+      closeBridgeQueues();
+      rejectReady(new Error(text));
+      rejectResult(new Error(text));
+    });
+
+    worker.postMessage({
+      type: 'start',
+      debug: debugEnabled,
+      scdaemonScriptUrl: gpgScdaemonScriptUrl,
+      scdaemonWasmUrl: gpgScdaemonWasmUrl,
+      homedir,
+      webUsbSupported: webUsbSupportedHint,
+      usbAuthorizedDevices,
+      bridge: {
+        agentToScdaemon: agentToScdaemonDesc,
+        scdaemonToAgent: scdaemonToAgentDesc,
+      },
+    });
+
+    const SCD_READ_BLOCK_TIMEOUT_MS = 12000;
+    const popScdaemonByte = (shouldBlock = true) => {
+      if (!shouldBlock) {
+        return queuePopByte(scdaemonToAgent, false);
+      }
+
+      const startedAt = Date.now();
+      while (true) {
+        const value = queuePopByte(scdaemonToAgent, false);
+        if (value !== undefined) {
+          return value;
+        }
+
+        if (Atomics.load(scdaemonToAgent.ctrl, 2) !== 0) {
+          return null;
+        }
+
+        const waitedMs = Date.now() - startedAt;
+        if (waitedMs >= SCD_READ_BLOCK_TIMEOUT_MS) {
+          postDebug('scd.bridge.readByte.timeout', {
+            sessionId,
+            waitedMs,
+            daemonDone,
+            a2s: summarizeQueue(agentToScdaemon),
+            s2a: summarizeQueue(scdaemonToAgent),
+          });
+          daemonDone = true;
+          closeBridgeQueues();
+          return null;
+        }
+
+        const stamp = Atomics.load(scdaemonToAgent.ctrl, 3);
+        Atomics.wait(scdaemonToAgent.ctrl, 3, stamp, 25);
+      }
+    };
+
+    return {
+      readByte(shouldBlock = true) {
+        return popScdaemonByte(shouldBlock);
+      },
+      readAvailableByte() {
+        return popScdaemonByte(false);
+      },
+      hasReadableData() {
+        return queueHasData(scdaemonToAgent);
+      },
+      isReadableClosed() {
+        return Atomics.load(scdaemonToAgent.ctrl, 2) !== 0;
+      },
+      registerReadableHandler(callback) {
+        if (typeof callback !== 'function') {
+          return;
+        }
+        readableHandlers.push(callback);
+        ensureReadableWatcher();
+      },
+      writeByte(ch) {
+        if (ch === null || ch === undefined) {
+          return;
+        }
+        queuePushByte(agentToScdaemon, ch, true);
+      },
+      async awaitReady(timeoutMs) {
+        let timeoutId = null;
+        const timeoutPromise = new Promise((resolve) => {
+          timeoutId = setTimeout(() => resolve(false), timeoutMs);
+        });
+        try {
+          const ready = await Promise.race([readyPromise, timeoutPromise]);
+          if (timeoutId !== null) {
+            clearTimeout(timeoutId);
+          }
+          return Boolean(ready);
+        } catch {
+          if (timeoutId !== null) {
+            clearTimeout(timeoutId);
+          }
+          return false;
+        }
+      },
+      async shutdownAndWait(timeoutMs) {
+        if (!daemonDone) {
+          for (const byteValue of [66, 89, 69, 10]) {
+            queuePushByte(agentToScdaemon, byteValue, false);
+          }
+        }
+        closeBridgeQueues();
+
+        let timeoutId = null;
+        const timeoutPromise = new Promise((resolve) => {
+          timeoutId = setTimeout(() => resolve(null), timeoutMs);
+        });
+        const result = await Promise.race([resultPromise, timeoutPromise]).catch(() => null);
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+        if (readableWatcherId !== null) {
+          clearInterval(readableWatcherId);
+          readableWatcherId = null;
+        }
+        closeBridgeQueues();
+        worker.terminate();
+        return result;
+      },
+    };
+  };
+
+  if (webUsbSupportedHint === false) {
+    postDebug('scdaemon.unavailable', {
+      sessionId,
+      reason: 'webusb unsupported in host environment',
+      gpgScdaemonWorkerUrl,
+      gpgScdaemonScriptUrl,
+      gpgScdaemonWasmUrl,
+    });
+  } else {
+    try {
+      activeScdaemonBridge = createScdaemonBridge();
+      const scdReady = await activeScdaemonBridge.awaitReady(12000);
+      postDebug('scdaemon.ready', {
+        sessionId,
+        scdReady,
+        gpgScdaemonWorkerUrl,
+        gpgScdaemonScriptUrl,
+        gpgScdaemonWasmUrl,
+      });
+      if (!scdReady) {
+        postDebug('scdaemon.unavailable', {
+          sessionId,
+          reason: 'worker did not report ready within timeout',
+          gpgScdaemonWorkerUrl,
+          gpgScdaemonScriptUrl,
+          gpgScdaemonWasmUrl,
+        });
+        if (activeScdaemonBridge) {
+          await activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
+          activeScdaemonBridge = null;
+        }
+      }
+    } catch (error) {
+      postDebug('scdaemon.unavailable', {
+        sessionId,
+        reason: 'failed to create scdaemon bridge',
+        errorMessage: formatError(error),
+        gpgScdaemonWorkerUrl,
+        gpgScdaemonScriptUrl,
+        gpgScdaemonWasmUrl,
+      });
+      if (activeScdaemonBridge) {
+        await activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
+        activeScdaemonBridge = null;
+      }
+    }
+  }
+
+  try {
+    if (incomingFsState) {
+      restoreFsState(activeFS, incomingFsState);
+    }
+    for (const root of activePersistRoots) {
+      ensureDirectory(activeFS, root);
+    }
+    ensureDirectory(activeFS, homedir);
+    try {
+      activeFS.chmod(homedir, 0o700);
+    } catch {
+      /* Best effort only. */
+    }
+  } catch (error) {
+    finishSession(sessionId, 2, `failed to prepare session FS: ${formatError(error)}`);
+    return;
+  }
+
+  postMessage({ type: 'session-ready', sessionId });
+
+  const useQuickRandom = message.quickRandom !== false;
+  const disableScdaemon = !activeScdaemonBridge;
+  const finalArgs = [
+    '--server',
+    '--homedir', homedir,
+  ];
+  if (disableScdaemon) {
+    finalArgs.push('--disable-scdaemon');
+  }
+  if (useQuickRandom) {
+    finalArgs.push('--debug-quick-random');
+  }
+  postDebug('session.quick-random', {
+    sessionId,
+    enabled: useQuickRandom,
+    disableScdaemon,
+  });
+
+  try {
+    const envObj = self.ENV || (self.Module && self.Module.ENV);
+    if (!envObj) {
+      throw new Error('runtime ENV unavailable for scdaemon bridge');
+    }
+    if (persistentScdaemonFd === null) {
+      throw new Error('persistent scdaemon fd is not initialized');
+    }
+    if (activeScdaemonBridge) {
+      envObj.GNUPG_WASM_SCDAEMON_FD = String(persistentScdaemonFd);
+      postDebug('session.scdaemon-fd', {
+        sessionId,
+        fd: persistentScdaemonFd,
+        persistent: true,
+      });
+    } else if (envObj.GNUPG_WASM_SCDAEMON_FD) {
+      delete envObj.GNUPG_WASM_SCDAEMON_FD;
+      postDebug('session.scdaemon-fd.disabled', {
+        sessionId,
+      });
+    }
+  } catch (error) {
+    finishSession(sessionId, 2, `failed to create scdaemon bridge fd: ${formatError(error)}`);
+    return;
+  }
+
+  try {
+    postDebug('session.callMain.enter', { args: finalArgs, sessionId });
+    const rc = callMainWith(finalArgs.slice());
+    postDebug('session.callMain.exit', { rc, sessionId, stdinReadCalls: bridgeMetrics.stdinReadCalls, stdinRead: bridgeMetrics.stdinRead });
+    finishSession(sessionId, Number.isFinite(rc) ? rc : 0, 'callMain returned');
+  } catch (error) {
+    postDebug('session.callMain.error', { error: formatError(error), sessionId, stdinReadCalls: bridgeMetrics.stdinReadCalls });
+    if (error && typeof error === 'object' && Number.isFinite(error.status)) {
+      finishSession(sessionId, Number(error.status), 'callMain exit status');
+      return;
+    }
+    finishSession(sessionId, 1, formatError(error));
+  }
+}
+
+self.addEventListener('message', (event) => {
+  const message = event.data;
+  if (!message || typeof message !== 'object') {
+    return;
+  }
+
+  if (message.type === 'run-session') {
+    void handleRunSession(message).catch((error) => {
+      const sessionId = typeof message.sessionId === 'string' ? message.sessionId : '';
+      finishSession(sessionId, 1, formatError(error));
+    });
+    return;
+  }
+
+  if (message.type === 'shutdown') {
+    if (activeBridge) {
+      queueClose(activeBridge.gpgToAgent);
+      queueClose(activeBridge.agentToGpg);
+    }
+    if (activeScdaemonBridge) {
+      void activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
+      activeScdaemonBridge = null;
+    }
+    postMessage({ type: 'shutdown-complete' });
+    setTimeout(() => {
+      self.close();
+    }, 0);
+  }
+});

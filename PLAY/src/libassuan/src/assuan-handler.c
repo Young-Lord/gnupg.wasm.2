@@ -907,9 +907,11 @@ gpg_error_t
 assuan_process (assuan_context_t ctx)
 {
   gpg_error_t rc;
+  int iter = 0;
 
   ctx->flags.process_complete = 0;
   do {
+    iter++;
     rc = process_request (ctx);
   } while (!rc && !ctx->flags.process_complete);
 

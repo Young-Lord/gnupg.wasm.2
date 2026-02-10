@@ -1380,12 +1380,17 @@ void
 encrypt_crypt_files (ctrl_t ctrl, int nfiles, char **files, strlist_t remusr)
 {
   int rc = 0;
+  pk_list_t pk_list = NULL;
 
   if (opt.outfile)
     {
       log_error(_("--output doesn't work for this command\n"));
       return;
     }
+
+  rc = build_pk_list (ctrl, remusr, &pk_list);
+  if (rc)
+    return;
 
   if (!nfiles)
     {
@@ -1397,12 +1402,12 @@ encrypt_crypt_files (ctrl_t ctrl, int nfiles, char **files, strlist_t remusr)
           if (!*line || line[strlen(line)-1] != '\n')
             {
               log_error("input line %u too long or missing LF\n", lno);
-              return;
+              goto leave;
             }
           line[strlen(line)-1] = '\0';
           print_file_status(STATUS_FILE_START, line, 2);
           rc = encrypt_crypt (ctrl, GNUPG_INVALID_FD, line, remusr,
-                              0, NULL, GNUPG_INVALID_FD);
+                              0, pk_list, GNUPG_INVALID_FD);
           if (rc)
             log_error ("encryption of '%s' failed: %s\n",
                        print_fname_stdin(line), gpg_strerror (rc) );
@@ -1415,11 +1420,14 @@ encrypt_crypt_files (ctrl_t ctrl, int nfiles, char **files, strlist_t remusr)
         {
           print_file_status(STATUS_FILE_START, *files, 2);
           if ((rc = encrypt_crypt (ctrl, GNUPG_INVALID_FD, *files, remusr,
-                                   0, NULL, GNUPG_INVALID_FD)))
+                                   0, pk_list, GNUPG_INVALID_FD)))
             log_error("encryption of '%s' failed: %s\n",
                       print_fname_stdin(*files), gpg_strerror (rc) );
           write_status( STATUS_FILE_DONE );
           files++;
         }
     }
+
+ leave:
+  release_pk_list (pk_list);
 }

@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 
 #include "gpg.h"
 #include "options.h"
@@ -38,6 +39,54 @@
 #include "filter.h"
 #include "../common/ttyio.h"
 #include "../common/i18n.h"
+
+
+static int
+wasm_profile_enabled_verify (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+#ifndef __EMSCRIPTEN__
+  return 0;
+#endif
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_PROFILE");
+      enabled = !!(s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+
+
+static double
+wasm_profile_now_ms_verify (void)
+{
+#if defined (HAVE_CLOCK_GETTIME) && defined (CLOCK_MONOTONIC)
+  struct timespec ts;
+
+  if (!clock_gettime (CLOCK_MONOTONIC, &ts))
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+  return (double)clock () * 1000.0 / (double)CLOCKS_PER_SEC;
+}
+
+
+struct wasm_verify_profile_accum_s
+{
+  unsigned long files;
+  double file_ms;
+  double open_ms;
+  double setup_ms;
+  double proc_ms;
+};
+
+
+static struct wasm_verify_profile_accum_s wasm_verify_profile_accum;
 
 
 /****************
@@ -147,8 +196,20 @@ verify_one_file (ctrl_t ctrl, const char *name )
     armor_filter_context_t *afx = NULL;
     progress_filter_context_t *pfx = new_progress_context ();
     int rc;
+    int profile_enabled = wasm_profile_enabled_verify ();
+    double t_file_start = 0;
+    double t0;
+    double open_ms = 0;
+    double setup_ms = 0;
+    double proc_ms = 0;
+
+    if (profile_enabled)
+      t_file_start = wasm_profile_now_ms_verify ();
 
     print_file_status( STATUS_FILE_START, name, 1 );
+
+    if (profile_enabled)
+      t0 = wasm_profile_now_ms_verify ();
     fp = iobuf_open(name);
     if (fp)
       iobuf_ioctl (fp, IOBUF_IOCTL_NO_CACHE, 1, NULL);
@@ -163,8 +224,25 @@ verify_one_file (ctrl_t ctrl, const char *name )
 	log_error(_("can't open '%s': %s\n"),
                   print_fname_stdin(name), strerror (errno));
 	print_file_status( STATUS_FILE_ERROR, name, 1 );
+
+	if (profile_enabled)
+	  {
+	    open_ms = wasm_profile_now_ms_verify () - t0;
+	    wasm_verify_profile_accum.files++;
+	    wasm_verify_profile_accum.open_ms += open_ms;
+	    wasm_verify_profile_accum.file_ms += (wasm_profile_now_ms_verify ()
+	                                         - t_file_start);
+	  }
+
         goto leave;
     }
+
+    if (profile_enabled)
+      {
+        open_ms = wasm_profile_now_ms_verify () - t0;
+        t0 = wasm_profile_now_ms_verify ();
+      }
+
     handle_progress (pfx, fp, name);
 
     if( !opt.no_armor ) {
@@ -174,11 +252,31 @@ verify_one_file (ctrl_t ctrl, const char *name )
 	}
     }
 
+    if (profile_enabled)
+      {
+        setup_ms = wasm_profile_now_ms_verify () - t0;
+        t0 = wasm_profile_now_ms_verify ();
+      }
+
     rc = proc_signature_packets (ctrl, NULL, fp, NULL, name );
+
+    if (profile_enabled)
+      proc_ms = wasm_profile_now_ms_verify () - t0;
+
     iobuf_close(fp);
     write_status( STATUS_FILE_DONE );
 
     reset_literals_seen();
+
+    if (profile_enabled)
+      {
+        wasm_verify_profile_accum.files++;
+        wasm_verify_profile_accum.open_ms += open_ms;
+        wasm_verify_profile_accum.setup_ms += setup_ms;
+        wasm_verify_profile_accum.proc_ms += proc_ms;
+        wasm_verify_profile_accum.file_ms += (wasm_profile_now_ms_verify ()
+                                            - t_file_start);
+      }
 
  leave:
     release_armor_context (afx);
@@ -196,6 +294,14 @@ verify_files (ctrl_t ctrl, int nfiles, char **files )
 {
     int i, rc;
     int first_rc = 0;
+    int profile_enabled = wasm_profile_enabled_verify ();
+    double profile_cmd_start = 0;
+
+    if (profile_enabled)
+      {
+        memset (&wasm_verify_profile_accum, 0, sizeof wasm_verify_profile_accum);
+        profile_cmd_start = wasm_profile_now_ms_verify ();
+      }
 
     if( !nfiles ) { /* read the filenames from stdin */
 	char line[2048];
@@ -225,6 +331,31 @@ verify_files (ctrl_t ctrl, int nfiles, char **files )
               first_rc = rc;
           }
     }
+
+    if (profile_enabled && wasm_verify_profile_accum.files)
+      {
+        double cmd_ms = wasm_profile_now_ms_verify () - profile_cmd_start;
+        double other_ms = wasm_verify_profile_accum.file_ms
+                          - (wasm_verify_profile_accum.open_ms
+                             + wasm_verify_profile_accum.setup_ms
+                             + wasm_verify_profile_accum.proc_ms);
+
+        if (other_ms < 0)
+          other_ms = 0;
+
+        log_info ("[wasm-prof] verify_files files=%lu cmd-ms=%.3f"
+                  " file-ms=%.3f open-ms=%.3f setup-ms=%.3f proc-ms=%.3f"
+                  " other-ms=%.3f per-file-ms=%.3f\n",
+                  wasm_verify_profile_accum.files,
+                  cmd_ms,
+                  wasm_verify_profile_accum.file_ms,
+                  wasm_verify_profile_accum.open_ms,
+                  wasm_verify_profile_accum.setup_ms,
+                  wasm_verify_profile_accum.proc_ms,
+                  other_ms,
+                  wasm_verify_profile_accum.file_ms
+                  / wasm_verify_profile_accum.files);
+      }
 
     return first_rc;
 }

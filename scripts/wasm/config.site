@@ -1,0 +1,15 @@
+# Autoconf cache overrides for wasm32-unknown-emscripten.
+#
+# Current Emscripten userspace does not provide full process/socket APIs,
+# so we pre-answer these probes to avoid unsafe assumptions in cross builds.
+
+ac_cv_func_fork=no
+ac_cv_func_fork_works=no
+ac_cv_func_vfork=no
+ac_cv_func_vfork_works=no
+ac_cv_func_wait4=no
+ac_cv_func_waitpid=no
+ac_cv_func_initgroups=no
+ac_cv_func_setrlimit=no
+ac_cv_func_socketpair=no
+ac_cv_header_pwd_h=no

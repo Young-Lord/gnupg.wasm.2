@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 
 #include "gpg.h"
 #include "options.h"
@@ -36,6 +37,41 @@
 #include "main.h"
 #include "../common/status.h"
 #include "../common/i18n.h"
+
+
+static int
+wasm_profile_enabled_decrypt (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+#ifndef __EMSCRIPTEN__
+  return 0;
+#endif
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_PROFILE");
+      enabled = !!(s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+
+
+static double
+wasm_profile_now_ms_decrypt (void)
+{
+#if defined (HAVE_CLOCK_GETTIME) && defined (CLOCK_MONOTONIC)
+  struct timespec ts;
+
+  if (!clock_gettime (CLOCK_MONOTONIC, &ts))
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+  return (double)clock () * 1000.0 / (double)CLOCKS_PER_SEC;
+}
 
 
 
@@ -224,6 +260,13 @@ decrypt_messages (ctrl_t ctrl, int nfiles, char *files[])
   char *p, *output = NULL;
   int rc=0,use_stdin=0;
   unsigned int lno=0;
+  int profile_enabled = wasm_profile_enabled_decrypt ();
+  double profile_cmd_start = 0;
+  double profile_file_total_ms = 0;
+  double profile_open_ms = 0;
+  double profile_setup_ms = 0;
+  double profile_proc_ms = 0;
+  unsigned long profile_files = 0;
 
   if (opt.outfile)
     {
@@ -232,6 +275,9 @@ decrypt_messages (ctrl_t ctrl, int nfiles, char *files[])
     }
 
   pfx = new_progress_context ();
+
+  if (profile_enabled)
+    profile_cmd_start = wasm_profile_now_ms_decrypt ();
 
   if(!nfiles)
     use_stdin=1;
@@ -267,6 +313,76 @@ decrypt_messages (ctrl_t ctrl, int nfiles, char *files[])
 
       if(filename==NULL)
 	break;
+
+      if (profile_enabled)
+        {
+          double profile_file_start = wasm_profile_now_ms_decrypt ();
+          double profile_stage_start;
+
+          print_file_status(STATUS_FILE_START, filename, 3);
+          output = make_outfile_name(filename);
+          if (!output)
+            {
+              profile_files++;
+              profile_file_total_ms += (wasm_profile_now_ms_decrypt ()
+                                        - profile_file_start);
+              goto next_file;
+            }
+
+          profile_stage_start = wasm_profile_now_ms_decrypt ();
+          fp = iobuf_open(filename);
+          if (fp)
+            iobuf_ioctl (fp, IOBUF_IOCTL_NO_CACHE, 1, NULL);
+          if (fp && is_secured_file (iobuf_get_fd (fp)))
+            {
+              iobuf_close (fp);
+              fp = NULL;
+              gpg_err_set_errno (EPERM);
+            }
+          profile_open_ms += wasm_profile_now_ms_decrypt () - profile_stage_start;
+
+          if (!fp)
+            {
+              log_error(_("can't open '%s'\n"), print_fname_stdin(filename));
+              profile_files++;
+              profile_file_total_ms += (wasm_profile_now_ms_decrypt ()
+                                        - profile_file_start);
+              goto next_file;
+            }
+
+          profile_stage_start = wasm_profile_now_ms_decrypt ();
+          handle_progress (pfx, fp, filename);
+
+          if (!opt.no_armor)
+            {
+              if (use_armor_filter(fp))
+                {
+                  armor_filter_context_t *afx = new_armor_context ();
+                  rc = push_armor_filter (afx, fp);
+                  if (rc)
+                    log_error("failed to push armor filter");
+                  release_armor_context (afx);
+                }
+            }
+          profile_setup_ms += wasm_profile_now_ms_decrypt () - profile_stage_start;
+
+          profile_stage_start = wasm_profile_now_ms_decrypt ();
+          rc = proc_packets (ctrl,NULL, fp);
+          profile_proc_ms += wasm_profile_now_ms_decrypt () - profile_stage_start;
+
+          iobuf_close(fp);
+          if (rc)
+            log_error("%s: decryption failed: %s\n", print_fname_stdin(filename),
+                      gpg_strerror (rc));
+          p = get_last_passphrase();
+          set_next_passphrase(p);
+          xfree (p);
+
+          profile_files++;
+          profile_file_total_ms += (wasm_profile_now_ms_decrypt ()
+                                    - profile_file_start);
+          goto next_file;
+        }
 
       print_file_status(STATUS_FILE_START, filename, 3);
       output = make_outfile_name(filename);
@@ -318,4 +434,26 @@ decrypt_messages (ctrl_t ctrl, int nfiles, char *files[])
 
   set_next_passphrase(NULL);
   release_progress_context (pfx);
+
+  if (profile_enabled && profile_files)
+    {
+      double cmd_total = wasm_profile_now_ms_decrypt () - profile_cmd_start;
+      double other_ms = profile_file_total_ms
+                        - (profile_open_ms + profile_setup_ms + profile_proc_ms);
+
+      if (other_ms < 0)
+        other_ms = 0;
+
+      log_info ("[wasm-prof] decrypt_messages files=%lu cmd-ms=%.3f"
+                " file-ms=%.3f open-ms=%.3f setup-ms=%.3f proc-ms=%.3f"
+                " other-ms=%.3f per-file-ms=%.3f\n",
+                profile_files,
+                cmd_total,
+                profile_file_total_ms,
+                profile_open_ms,
+                profile_setup_ms,
+                profile_proc_ms,
+                other_ms,
+                profile_file_total_ms / profile_files);
+    }
 }

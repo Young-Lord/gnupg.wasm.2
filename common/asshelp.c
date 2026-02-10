@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
 #ifdef HAVE_LOCALE_H
@@ -385,6 +386,212 @@ wait_for_sock (int secs, int module_name_id, const char *sockname,
 }
 
 
+#ifdef __EMSCRIPTEN__
+static int
+wasm_trace_enabled (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_TRACE");
+      enabled = (s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+
+
+/* Return the environment variable used to pass a pre-opened Assuan
+ * transport file descriptor for MODULE_NAME_ID.  */
+static const char *
+wasm_service_fd_envname (int module_name_id)
+{
+  switch (module_name_id)
+    {
+    case GNUPG_MODULE_NAME_AGENT:
+      return "GNUPG_WASM_AGENT_FD";
+    case GNUPG_MODULE_NAME_DIRMNGR:
+      return "GNUPG_WASM_DIRMNGR_FD";
+    case GNUPG_MODULE_NAME_KEYBOXD:
+      return "GNUPG_WASM_KEYBOXD_FD";
+    default:
+      return NULL;
+    }
+}
+
+
+/* Try to connect CTX using a pre-opened fd from the environment.
+ * Returns:
+ *   - 0 on success
+ *   - GPG_ERR_NOT_FOUND if no fd env var is set
+ *   - another error code for parse/connect failures
+ * R_HAVE_ENV is set when an env var was present (even if invalid).  */
+static gpg_error_t
+wasm_connect_preopened_service (assuan_context_t ctx,
+                                int module_name_id,
+                                unsigned int connect_flags,
+                                const char *printed_name,
+                                int *r_have_env)
+{
+  const char *envname;
+  const char *value;
+  char *endp;
+  long fdno;
+  gpg_error_t err;
+
+  *r_have_env = 0;
+
+  envname = wasm_service_fd_envname (module_name_id);
+  if (!envname)
+    return gpg_error (GPG_ERR_INV_VALUE);
+
+  value = getenv (envname);
+  if (!value || !*value)
+    {
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] %s: no pre-opened fd env for %s\n",
+                  printed_name, envname);
+      return gpg_error (GPG_ERR_NOT_FOUND);
+    }
+
+  if (wasm_trace_enabled ())
+    log_info ("[wasm-trace] %s: found %s='%s'\n",
+              printed_name, envname, value);
+
+  *r_have_env = 1;
+
+  {
+    static unsigned int next_agent_fd_slot;
+    static unsigned int next_dirmngr_fd_slot;
+    static unsigned int next_keyboxd_fd_slot;
+    unsigned int *next_slot;
+    const char *p;
+    const char *tok_start;
+    size_t tok_len = 0;
+    unsigned int tok_idx;
+    unsigned int token_count = 0;
+    unsigned int want_idx = 0;
+    unsigned int pick_idx = 0;
+    char numbuf[64];
+
+    switch (module_name_id)
+      {
+      case GNUPG_MODULE_NAME_AGENT:
+        next_slot = &next_agent_fd_slot;
+        break;
+      case GNUPG_MODULE_NAME_DIRMNGR:
+        next_slot = &next_dirmngr_fd_slot;
+        break;
+      case GNUPG_MODULE_NAME_KEYBOXD:
+        next_slot = &next_keyboxd_fd_slot;
+        break;
+      default:
+        next_slot = &next_dirmngr_fd_slot;
+        break;
+      }
+
+    want_idx = *next_slot;
+
+    /* Count tokens in VALUE.  We accept comma and whitespace as
+     * separators so that multiple pre-opened fds can be passed as a
+     * simple list like "4,5,6".  */
+    p = value;
+    while (*p)
+      {
+        while (*p && (isspace ((unsigned char)*p) || *p == ','))
+          p++;
+        if (!*p)
+          break;
+        while (*p && !isspace ((unsigned char)*p) && *p != ',')
+          p++;
+        token_count++;
+      }
+
+    if (!token_count)
+      {
+        log_error ("invalid value for %s: '%s'\n", envname, value);
+        return gpg_error (GPG_ERR_INV_VALUE);
+      }
+
+    pick_idx = want_idx % token_count;
+    tok_start = NULL;
+    tok_idx = 0;
+    p = value;
+    while (*p)
+      {
+        while (*p && (isspace ((unsigned char)*p) || *p == ','))
+          p++;
+        if (!*p)
+          break;
+        if (tok_idx == pick_idx)
+          {
+            tok_start = p;
+            while (*p && !isspace ((unsigned char)*p) && *p != ',')
+              p++;
+            tok_len = (size_t)(p - tok_start);
+            break;
+          }
+        while (*p && !isspace ((unsigned char)*p) && *p != ',')
+          p++;
+        tok_idx++;
+      }
+
+    if (!tok_start || !tok_len)
+      {
+        log_error ("invalid value for %s: '%s'\n", envname, value);
+        return gpg_error (GPG_ERR_INV_VALUE);
+      }
+
+    if (tok_len >= sizeof numbuf)
+      {
+        log_error ("invalid value for %s: '%s'\n", envname, value);
+        return gpg_error (GPG_ERR_INV_VALUE);
+      }
+
+    memcpy (numbuf, tok_start, tok_len);
+    numbuf[tok_len] = 0;
+
+    errno = 0;
+    fdno = strtol (numbuf, &endp, 10);
+    if (errno || !endp || *endp || fdno < 0)
+      {
+        log_error ("invalid value for %s: '%s'\n", envname, value);
+        return gpg_error (GPG_ERR_INV_VALUE);
+      }
+
+    *next_slot = (pick_idx + 1) % token_count;
+
+    if (wasm_trace_enabled ())
+      log_info ("[wasm-trace] %s: selected %s slot=%u fd=%ld\n",
+                printed_name, envname, pick_idx, fdno);
+  }
+
+  if (wasm_trace_enabled ())
+    log_info ("[wasm-trace] %s: attempting assuan_socket_connect_fd fd=%ld flags=0x%x\n",
+              printed_name, fdno, connect_flags);
+
+  /* There is no fd passing in this transport mode.  */
+  connect_flags &= ~ASSUAN_SOCKET_CONNECT_FDPASSING;
+
+  err = assuan_socket_connect_fd (ctx,
+                                  assuan_fd_from_posix_fd ((int)fdno),
+                                  connect_flags);
+  if (err)
+    log_error ("can't connect to %s via %s: %s\n",
+               printed_name, envname, gpg_strerror (err));
+  else if (wasm_trace_enabled ())
+    log_info ("[wasm-trace] %s: assuan_socket_connect_fd succeeded via %s\n",
+              printed_name, envname);
+
+  return err;
+}
+#endif /*__EMSCRIPTEN__*/
+
+
 /* Try to connect to a new service via socket or start it if it is not
  * running and AUTOSTART is set.  Handle the server's initial
  * greeting.  Returns a new assuan context at R_CTX or an error code.
@@ -416,6 +623,9 @@ start_new_service (assuan_context_t *r_ctx,
   int seconds_to_wait;
   unsigned int connect_flags = 0;
   const char *argv[6];
+#ifdef __EMSCRIPTEN__
+  int have_wasm_service_env = 0;
+#endif
 
   *r_ctx = NULL;
 
@@ -459,9 +669,40 @@ start_new_service (assuan_context_t *r_ctx,
       return err;
     }
 
+  err = 0;
+#ifdef __EMSCRIPTEN__
+  err = wasm_connect_preopened_service (ctx, module_name_id,
+                                        connect_flags, printed_name,
+                                        &have_wasm_service_env);
+  if (wasm_trace_enabled ())
+    log_info ("[wasm-trace] %s: preopened connect rc=%d have_env=%d\n",
+              printed_name, gpg_err_code (err), have_wasm_service_env);
+  if (gpg_err_code (err) == GPG_ERR_NOT_FOUND)
+    {
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] %s: falling back to assuan_socket_connect sock='%s' flags=0x%x\n",
+                  printed_name, sockname, connect_flags);
+      err = assuan_socket_connect (ctx, sockname, 0, connect_flags);
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] %s: socket connect fallback rc=%d\n",
+                  printed_name, gpg_err_code (err));
+    }
+#else
   err = assuan_socket_connect (ctx, sockname, 0, connect_flags);
+#endif
   if (err && (flags & ASSHELP_FLAG_AUTOSTART))
     {
+#ifdef __EMSCRIPTEN__
+      if (have_wasm_service_env)
+        {
+          if (wasm_trace_enabled ())
+            log_info ("[wasm-trace] %s: env fd exists and connect failed; autostart suppressed\n",
+                      printed_name);
+          xfree (sockname);
+          assuan_release (ctx);
+          return gpg_err_make (errsource, no_service_err);
+        }
+#endif
       char *abs_homedir;
       lock_spawn_t lock;
       char *program = NULL;
@@ -612,8 +853,18 @@ start_new_service (assuan_context_t *r_ctx,
     log_debug ("connection to the %s established\n", printed_name);
 
   if (module_name_id == GNUPG_MODULE_NAME_AGENT)
-    err = assuan_transact (ctx, "RESET",
-                           NULL, NULL, NULL, NULL, NULL, NULL);
+    {
+#ifdef __EMSCRIPTEN__
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] gpg-agent: sending RESET\n");
+#endif
+      err = assuan_transact (ctx, "RESET",
+                             NULL, NULL, NULL, NULL, NULL, NULL);
+#ifdef __EMSCRIPTEN__
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] gpg-agent: RESET rc=%d\n", gpg_err_code (err));
+#endif
+    }
 
   if (!err
       && module_name_id == GNUPG_MODULE_NAME_AGENT)
@@ -621,10 +872,19 @@ start_new_service (assuan_context_t *r_ctx,
       err = send_pinentry_environment (ctx, errsource,
                                        opt_lc_ctype, opt_lc_messages,
                                        session_env);
+#ifdef __EMSCRIPTEN__
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] gpg-agent: send_pinentry_environment rc=%d\n",
+                  gpg_err_code (err));
+#endif
       if (gpg_err_code (err) == GPG_ERR_FORBIDDEN
           && gpg_err_source (err) == GPG_ERR_SOURCE_GPGAGENT)
         {
           /* Check whether the agent is in restricted mode.  */
+#ifdef __EMSCRIPTEN__
+          if (wasm_trace_enabled ())
+            log_info ("[wasm-trace] gpg-agent: checking restricted mode\n");
+#endif
           if (!assuan_transact (ctx, "GETINFO restricted",
                                 NULL, NULL, NULL, NULL, NULL, NULL))
             {

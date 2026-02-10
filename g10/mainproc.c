@@ -1958,6 +1958,7 @@ check_sig_and_print (CTX c, kbnode_t node)
   PKT_signature *sig = node->pkt->pkt.signature;
   const char *astr;
   gpg_error_t rc;
+  int fast_quiet_verify;
   int is_expkey = 0;
   int is_revkey = 0;
   char *issuer_fpr = NULL;
@@ -2089,6 +2090,26 @@ check_sig_and_print (CTX c, kbnode_t node)
         goto leave;
       }
   } /* End checking signature packet composition.  */
+
+  fast_quiet_verify =
+    (opt.quiet
+     && !is_status_enabled ()
+     && !opt.assert_signer_list
+     && !opt.assert_pubkey_algos
+     && !(opt.keyserver_options.options & KEYSERVER_AUTO_KEY_RETRIEVE)
+     && !opt.flags.auto_key_import
+     && !opt.flags.require_compliance);
+
+  if (fast_quiet_verify)
+    {
+      rc = do_check_sig (c, node, extrahash, extrahashlen, NULL,
+                         NULL, &is_expkey, &is_revkey, &pk, NULL);
+      free_public_key (pk);
+      pk = NULL;
+      if (rc)
+        g10_errors_seen = 1;
+      goto leave;
+    }
 
   if (sig->signers_uid)
     write_status_buffer (STATUS_NEWSIG,

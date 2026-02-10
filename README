@@ -1,3 +1,32 @@
+将 GnuPG 2.x 移植到浏览器端，并通过 WebUSB 功能，在 Isolated Web App 中与智能卡交互的示例。
+
+只是一个玩具，短期内不能用于生产用途。
+但是，对将已有的 C/C++ 程序移植到 WASM 环境，特别是 处理异步 stdio、模拟基于 socket 的 IPC、持久化进程状态 等，都有些许参考价值。
+
+---
+
+For WASM / IWA:
+
+Path: scripts/wasm/
+
+```shell
+bash scripts/wasm/build-gnupg-browser.sh --force && bash scripts/wasm/build-iwa.sh
+pkill -f "chromium.*chromium-iwa-test" || true
+rm -rf /tmp/chromium-iwa-test
+chromium \
+  --user-data-dir=/tmp/chromium-iwa-test \
+  --no-first-run \
+  --enable-features=IsolatedWebApps,IsolatedWebAppDevMode \
+  --install-isolated-web-app-from-file=/gnupg-w32/gnupg/PLAY/iwa/gnupg-wasm-demo.swbn
+```
+
+Go to `isolated-app://r2m3p4dvre3uofxuq3qdhj3mhv5rb5nmtandzekfbdajgviaorjaaaic/scripts/wasm/demo/demo.html`
+
+Remember to stop pcscd.service before testing smartcard feature.
+
+
+
+
                        The GNU Privacy Guard
                       =======================
                            Version 2.5

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "gpg.h"
 #include "../common/util.h"
@@ -34,6 +35,91 @@
 #include "options.h"
 #include "pkglue.h"
 #include "../common/compliance.h"
+
+static int check_signature_end (PKT_public_key *pk, PKT_signature *sig,
+				gcry_md_hd_t digest,
+                                const void *extrahash, size_t extrahashlen,
+				int *r_expired, int *r_revoked,
+				PKT_public_key *ret_pk);
+
+
+static int
+wasm_profile_enabled_sigcheck (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+#ifndef __EMSCRIPTEN__
+  return 0;
+#endif
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_PROFILE");
+      enabled = !!(s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+
+
+static double
+wasm_profile_now_ms_sigcheck (void)
+{
+#if defined (HAVE_CLOCK_GETTIME) && defined (CLOCK_MONOTONIC)
+  struct timespec ts;
+
+  if (!clock_gettime (CLOCK_MONOTONIC, &ts))
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+  return (double)clock () * 1000.0 / (double)CLOCKS_PER_SEC;
+}
+
+
+static gpg_error_t
+timed_get_pubkey_for_sig (ctrl_t ctrl, PKT_public_key *pk,
+                          PKT_signature *sig, PKT_public_key *forced_pk,
+                          kbnode_t *r_keyblock, double *r_ms)
+{
+  gpg_error_t err;
+  double t0 = 0;
+
+  if (r_ms)
+    t0 = wasm_profile_now_ms_sigcheck ();
+
+  err = get_pubkey_for_sig (ctrl, pk, sig, forced_pk, r_keyblock);
+
+  if (r_ms)
+    *r_ms = wasm_profile_now_ms_sigcheck () - t0;
+
+  return err;
+}
+
+
+static int
+timed_check_signature_end (PKT_public_key *pk, PKT_signature *sig,
+                           gcry_md_hd_t digest,
+                           const void *extrahash, size_t extrahashlen,
+                           int *r_expired, int *r_revoked,
+                           PKT_public_key *ret_pk,
+                           double *r_ms)
+{
+  int rc;
+  double t0 = 0;
+
+  if (r_ms)
+    t0 = wasm_profile_now_ms_sigcheck ();
+
+  rc = check_signature_end (pk, sig, digest, extrahash, extrahashlen,
+                            r_expired, r_revoked, ret_pk);
+
+  if (r_ms)
+    *r_ms = wasm_profile_now_ms_sigcheck () - t0;
+
+  return rc;
+}
 
 static int check_signature_end (PKT_public_key *pk, PKT_signature *sig,
 				gcry_md_hd_t digest,
@@ -147,6 +233,13 @@ check_signature (ctrl_t ctrl,
 {
   int rc=0;
   PKT_public_key *pk;
+  int profile_enabled = wasm_profile_enabled_sigcheck ();
+  double profile_start_ms = 0;
+  double profile_lookup_ms = 0;
+  double profile_check_end_ms = 0;
+
+  if (profile_enabled)
+    profile_start_ms = wasm_profile_now_ms_sigcheck ();
 
   if (r_expiredate)
     *r_expiredate = 0;
@@ -188,7 +281,9 @@ check_signature (ctrl_t ctrl,
       log_info(_("WARNING: signature digest conflict in message\n"));
       rc = gpg_error (GPG_ERR_GENERAL);
     }
-  else if (get_pubkey_for_sig (ctrl, pk, sig, forced_pk, r_keyblock))
+  else if (timed_get_pubkey_for_sig (ctrl, pk, sig, forced_pk, r_keyblock,
+                                     profile_enabled
+                                     ? &profile_lookup_ms : NULL))
     rc = gpg_error (GPG_ERR_NO_PUBKEY);
   else if ((rc = check_key_verify_compliance (pk)))
     ;/* Compliance failure.  */
@@ -202,8 +297,10 @@ check_signature (ctrl_t ctrl,
       if (r_expiredate)
         *r_expiredate = pk->expiredate;
 
-      rc = check_signature_end (pk, sig, digest, extrahash, extrahashlen,
-                                r_expired, r_revoked, NULL);
+      rc = timed_check_signature_end (pk, sig, digest, extrahash, extrahashlen,
+                                      r_expired, r_revoked, NULL,
+                                      profile_enabled
+                                      ? &profile_check_end_ms : NULL);
 
       /* Check the backsig.  This is a back signature (0x19) from
        * the subkey on the primary key.  The idea here is that it
@@ -325,6 +422,24 @@ check_signature (ctrl_t ctrl,
     {
       release_public_key_parts (pk);
       xfree (pk);
+    }
+
+  if (profile_enabled)
+    {
+      double total_ms = wasm_profile_now_ms_sigcheck () - profile_start_ms;
+      double other_ms = total_ms - (profile_lookup_ms + profile_check_end_ms);
+
+      if (other_ms < 0)
+        other_ms = 0;
+
+      log_info ("[wasm-prof] check_signature class=%u total-ms=%.3f"
+                " lookup-ms=%.3f check-end-ms=%.3f other-ms=%.3f rc=%s\n",
+                sig->sig_class,
+                total_ms,
+                profile_lookup_ms,
+                profile_check_end_ms,
+                other_ms,
+                gpg_strerror (rc));
     }
 
   return rc;
