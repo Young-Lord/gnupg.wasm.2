@@ -1,0 +1,4 @@
+@set UPDATED 18 June 2024
+@set UPDATED-MONTH June 2024
+@set EDITION 3.0.2
+@set VERSION 3.0.2

@@ -1,0 +1,168 @@
+/* ntbtls.h -  Not Too Bad TLS                                  -*- c -*-
+ * Copyright (C) 2014-2022 g10 Code GmbH
+ *
+ * This file is part of NTBTLS
+ *
+ * NTBTLS is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * NTBTLS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * File: src/ntbtls.h.  Generated from ntbtls.h.in by configure.
+ */
+
+#ifndef _NTBTLS_H
+#define _NTBTLS_H
+
+#include <gpg-error.h>
+#include <ksba.h>
+
+#ifdef __cplusplus
+extern "C" {
+#if 0 /* (Keep Emacsens' auto-indent happy.) */
+}
+#endif
+#endif
+
+/*
+ * The version of this header file.
+ *
+ * A program should better the fucntion ntbtls_check_version() which
+ * will return the actual version of the library.  The sole purpose of
+ * this macro is to let autoconf (using the AM_PATH_NTBTLS macro)
+ * check that this header matches the installed library.
+ */
+#define NTBTLS_VERSION "0.3.2"
+
+/*
+ * The version number of this header.
+ *
+ * It may be used to handle minor API incompatibilities.
+*/
+#define NTBTLS_VERSION_NUMBER 0x000302
+
+
+/* Flags used by ntbtls_new.  */
+#define NTBTLS_SERVER      0
+#define NTBTLS_CLIENT      1
+#define NTBTLS_SAMETRHEAD  (1<<4)
+
+
+/* The TLS context object.  */
+struct _ntbtls_context_s;
+typedef struct _ntbtls_context_s *ntbtls_t;
+
+
+/*
+ * The type of the verification callback.
+ *
+ * This must be registered prior to the handshake and will be called
+ * by ntbltls when a peer's certificate needs to be verified.  OPAQUE
+ * is the vale set when the callback has been set.  TLS is the
+ * respective TLS context.  VERIFY_FLAGS are not yet defined flags.
+ */
+typedef gpg_error_t (*ntbtls_verify_cb_t) (void *opaque,
+                                           ntbtls_t tls,
+                                           unsigned int verify_flags);
+
+
+/*
+ * The type of an optional log handler.
+ *
+ * OPAQUE is the value supplied to the set function.  LEVEL is the
+ * debug level for that message; it might be -1 for always log or any
+ * value less than the limit set with ntbtls_set_debug.  FMT is the
+ * format string.  Unless FMT starts with a '\b' the log function is
+ * expected to append a missing final linefeed.
+ */
+typedef void (*ntbtls_log_handler_t)(void *opaque,
+                                     int level,
+                                     const char *fmt,
+                                     va_list argv);
+
+/* Check that the library fulfills the version requirement.  */
+const char *ntbtls_check_version (const char *req_version);
+
+/* Create a new TLS context.  */
+gpg_error_t ntbtls_new (ntbtls_t *r_tls, unsigned int flags);
+
+/* Destroy a TLS context.  */
+void        ntbtls_release (ntbtls_t tls);
+
+/* Check that TLS is not NULL and valid.  (Use only the macro). */
+gpg_error_t _ntbtls_check_context (ntbtls_t tls, const char *file, int line);
+#define ntbtls_check_context(t) _ntbtls_check_context ((t), __FILE__, __LINE__)
+
+/* Setup the transport streams (usually connected to one socket).  */
+gpg_error_t ntbtls_set_transport (ntbtls_t tls,
+                                  gpgrt_stream_t inbound,
+                                  gpgrt_stream_t outbound);
+
+/* Get the read and write stream for the plaintext.  */
+gpg_error_t ntbtls_get_stream (ntbtls_t tls,
+                               gpgrt_stream_t *r_readfp,
+                               gpgrt_stream_t *r_writefp);
+
+/* Set the data required to verify peer certificate.  */
+gpg_error_t ntbtls_set_verify_cb (ntbtls_t tls,
+                                  ntbtls_verify_cb_t cb, void *cb_value);
+
+/* Set the hostname to check against the received server certificate.
+   It is used for SNI, too.  */
+gpg_error_t ntbtls_set_hostname (ntbtls_t tls, const char *hostname);
+
+/* Return the hostname which has been set with ntbtls_set_hostname.
+ * The returned value is valid as long as TLS is valid and
+ * ntbtls_set_hostname has not been used again.  */
+const char *ntbtls_get_hostname (ntbtls_t tls);
+
+/* Perform the handshake with the peer.  The transport streams must be
+   connected before starting this handshake.  */
+gpg_error_t ntbtls_handshake (ntbtls_t tls);
+
+/* Return the peer's certificate.  */
+ksba_cert_t ntbtls_x509_get_peer_cert (ntbtls_t tls, int idx);
+
+/* Return a string with the last received alert message.  NULL is
+ * return if no alert has yet been received.  If R_LEVEL or R_TYPE are
+ * not NULL the level of the alert and its type are stored tehre.  A
+ * level of 1 is a warning alert and a level of 2 is fatal alert.  */
+const char *ntbtls_get_last_alert (ntbtls_t tls,
+                                   unsigned int *r_level, unsigned int *r_type);
+
+/*
+ * Support functions
+ */
+
+/* Enable debugging at LEVEL (> 0) using an optional PREFIX (default:
+ * "ntbtls") and an optional debug stream STREAM (default: es_stderr).
+ * This function is not thread-safe and shall thus be called only once
+ * before any extra threads have been started.  */
+void ntbtls_set_debug (int level, const char *prefix, gpgrt_stream_t stream);
+
+/* Set a dedicated log handler.  See the description of
+ * ntbtls_log_handler_t for details.  This is not thread-safe.  */
+void ntbtls_set_log_handler (ntbtls_log_handler_t cb, void *cb_value);
+
+
+#if 0 /* (Keep Emacsens' auto-indent happy.) */
+{
+#endif
+#ifdef __cplusplus
+}
+#endif
+#endif /* _NTBTLS_H */
+/*
+Local Variables:
+buffer-read-only: t
+End:
+*/

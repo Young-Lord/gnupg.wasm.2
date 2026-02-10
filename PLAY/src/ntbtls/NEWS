@@ -1,0 +1,69 @@
+Noteworthy changes in version 0.3.2 (2024-01-12) [C1/A1/R3]
+------------------------------------------------
+
+ * Allow server's use of SHA256 hash with secpr384 key.  [T6059]
+
+ * Modernize the build scripts.
+
+ Release-info: https://dev.gnupg.org/T6925
+
+
+Noteworthy changes in version 0.3.1 (2022-04-07) [C1/A1/R2]
+------------------------------------------------
+
+ * Support ephemeral ECDSA cipher suites. [rT08c1622944]
+
+ * Do not install ntbtls-config if the new gpgrt-config is available.
+
+
+Noteworthy changes in version 0.3.0 (2022-02-07) [C1/A1/R1]
+------------------------------------------------
+
+ * Support for X448 and X25519 when build with Libgcrypt 1.9 or later.
+
+ * Updates to the build system.
+
+ * Build fixes for macOS.  [T5440,T5601]
+
+
+Noteworthy changes in version 0.2.0 (2020-08-27) [C1/A1/R0]
+------------------------------------------------
+
+ * Add support for ciphersuites using GCM.
+
+ * New function to return alert messages.
+
+ * Improvements to the build system.
+
+ * Interface changes relative to version 0.1.2
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   ntbtls_get_last_alert           NEW function.
+
+
+Noteworthy changes in version 0.1.2 (2017-09-19) [C0/A0/R2]
+------------------------------------------------
+
+ * Add support for secp384r1, secp521r1, and 3 Brainpool curves.
+
+
+Noteworthy changes in version 0.1.1 (2017-03-16) [C0/A0/R1]
+------------------------------------------------
+
+ * Now supports ECDHE-RSA key exchange.
+
+
+Noteworthy changes in version 0.1.0 (2017-02-21) [C0/A0/R0]
+------------------------------------------------
+
+ * Initial experimental release with only the client code.
+
+
+ See the file AUTHORS for copying conditions.
+
+ This file is free software; as a special exception the author gives
+ unlimited permission to copy and/or distribute it, with or without
+ modifications, as long as this notice is preserved.
+
+ This file is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY, to the extent permitted by law; without even the
+ implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.

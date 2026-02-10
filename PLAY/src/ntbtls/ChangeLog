@@ -1,0 +1,832 @@
+2024-01-12  Werner Koch  <wk@gnupg.org>
+
+	Release 0.3.2.
+	+ commit 2c38007bc4a5c6ecbbf9519fd3c9972eb835642a
+
+
+2023-09-01  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Change the default for --with-libtool-modification.
+	+ commit 549fa42584219dcbf0bb2c742e3012490995c9bf
+	* configure.ac (--with-libtool-modification): default=never.
+
+2023-08-16  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: New configure option --with-libtool-modification.
+	+ commit 8ad3808130d08c7d8e4a7d06b0f51a577cd3c75d
+	* Makefile.am (EXTRA_DIST): Add build-aux/libtool-patch.sed.
+	* build-aux/libtool-patch.sed: New.
+	* configure.ac (--with-libtool-modification): New.
+	* build-aux/ltmain.sh: Revert our own local modification.
+
+2023-05-30  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Fix the previous change.
+	+ commit ee3cbee5a24d458496f52df66a870d003b74c662
+
+
+	Use -no-fast-install LDFLAGS for Windows.
+	+ commit 2977b554dec9cb6eef718b72850dca00646be963
+	* src/Makefile.am [HAVE_W32_SYSTEM] (AM_LDFLAGS): Conditionalize.
+
+2023-05-16  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Sync libtool from libgpg-error for 64-bit Windows.
+	+ commit 1fe9e9b5597cd6b99e9582bacabc916dc8608ca4
+	* build-aux/ltmain.hs: Update from libgpg-error.
+
+2023-04-05  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Fix to silence a warning.
+	+ commit 79f76d68dac683765b18a1af4d0f2ad320f0fd1e
+	* src/protocol.c (_ntbtls_psk_derive_premaster): Initialize ZLEN.
+
+	build: Update gpg-error.m4.
+	+ commit fe949f34928675b06fb94a2d0e1353f4c0783bb9
+	* m4/gpg-error.m4: Update from libgpg-error master.
+
+2022-11-02  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Update ksba.m4 and libgcrypt.m4.
+	+ commit 6c26d9e245d71760c18ed11f4965a6121a58a495
+	* m4/ksba.m4: Update from libksba master.
+	* m4/libgcrypt.m4: Update from libgcrypt master.
+
+2022-11-01  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Prefer gpgrt-config when available.
+	+ commit 01a563cd1b8db2a4f321f604197ef0776ece5f93
+	* src/libassuan.m4: Overriding the decision by --with-ntbtls-prefix,
+	use gpgrt-config ntbtls when gpgrt-config is available.
+
+2022-10-24  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Update gpg-error.m4.
+	+ commit a26eff802ff70921e834bb6264b464b76727866f
+	* m4/gpg-error.m4: Update from libgpg-error 1.46.
+
+2022-07-21  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Update config.guess, config.sub, and config.rpath.
+	+ commit 656c28c6d7c85aee7557a6e6b15423dff5b54e1a
+	* build-aux/config.guess: Update from upstream.
+	* build-aux/config.sub: Ditto.
+	* build-aux/config.rpath: Update from gettext 0.21.
+
+	build: Update configure.ac for modern Autoconf.
+	+ commit d18f06132738b18f0d1bc9a3b6aca88c445c6fa5
+	* configure.ac: Use AC_CONFIG_HEADERS.
+	(AC_HEADER_TIME): Remove.
+
+2022-07-08  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Allow server's use of SHA256 hash with secpr384 key.
+	+ commit 5d3d9d9904d22ef52deee0eaf919137e027c2ccd
+	* src/pkglue.c (_ntbtls_pk_verify): Don't reject shorter hash.
+
+2022-06-28  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Update gpg-error.m4.
+	+ commit b0e62c24316577d4aced3b2b4e7709ce0ef70fd1
+	* m4/gpg-error.m4: Update from libgpg-error.
+
+2022-04-07  Werner Koch  <wk@gnupg.org>
+
+	Release 0.3.1.
+	+ commit 802494e014c8cadfa0caa718c9083f850b9d14ce
+
+
+2022-03-31  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: When no gpg-error-config, not install ntbtls-config.
+	+ commit 6c961671c1d74a0f73d2eaaf03bb4f6abed505b1
+	* configure.ac (USE_GPGRT_CONFIG): New.
+	* src/Makefile.am [USE_GPGRT_CONFIG]: Conditionalize the install
+	of ntbtls-config.
+
+2022-03-30  Werner Koch  <wk@gnupg.org>
+
+	Allow ephemeral ECDSA cipher suites.
+	+ commit 08c1622944dadabf455a04533a2a104cdbe891e2
+	* src/pkglue.c (_ntbtls_pk_verify): Support ECDSA.
+	* src/ciphersuites.c (_ntbtls_ciphersuite_list): Enable ECDHE_ECDSA.
+
+2022-02-07  Werner Koch  <wk@gnupg.org>
+
+	Post release updates.
+	+ commit c08cc859a93089af855e9ee189a6327aad5b8e76
+
+
+	Release 0.3.0.
+	+ commit 97a5cdaedbe9b49e556294e839dba1575d066ce8
+	* configure.ac: Set LT version to C1/A1/R1.
+
+2022-02-04  Werner Koch  <wk@gnupg.org>
+
+	Make X25519 support depend on the Libgcrypt version.
+	+ commit a95b108c6cfd741234d935eff22d9a81207ce47c
+	* src/ntbtls-int.h (SUPPORT_X25519): New.
+	* src/ecdh.c (_ntbtls_ecdh_read_params): Include X25519 only with
+	modern libgcrypt versions.
+	* src/protocol-cli.c (write_supported_elliptic_curves_ext): Announce
+	X25519 only if we support it.
+
+	Fix building with libgcrypt and libksba in non-standard locations.
+	+ commit 3aab430f4d6b31edad1c700cc2ce823fec443f17
+	* src/Makefile.am: Replace most subst vars by make macros.
+	(AM_CFLAGS): Add libgcrypt clags.
+	(libntbtls_la_LIBADD): A
+	(ntbtls_cli_LDADD): Add libksba and libgcrypt.
+
+	Make X448 support depend on the Libgcrypt version.
+	+ commit 5fbe0e18e2660a2dbb030d96e1d12f3b470fb73d
+	* src/ntbtls-int.h (SUPPORT_X448): New.
+	* src/ecdh.c (_ntbtls_ecdh_read_params): Include X448 only with modern
+	libgcrypt versions.
+	* src/protocol-cli.c (write_supported_elliptic_curves_ext): Announce
+	X448 only if we support it.
+
+2021-12-22  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Update for newer autoconf.
+	+ commit 2f2a787ac6b4fb695963d56d1143a435e1f3b526
+	* configure.ac (AC_PREREQ): Require >= 2.69.
+	(AC_HEADER_STDC): Remove.
+	* m4/sys_socket_h.m4: Remove.
+
+2021-12-17  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build,w32: Fix configure script.
+	+ commit c2900c4f1d2b3982a3b4efce8d521431e49a41f1
+	* configure.ac: Don't use gl_HEADER_SYS_SOCKET, but check winsock2.h.
+
+2021-11-12  NIIBE Yutaka  <gniibe@fsij.org>
+
+	ntbtls.pc: Fix library dependency.
+	+ commit c612c4f1649423886cc61aafd9515d6ec85d7b26
+	* src/ntbtls.pc.in (Requires): Remove libgcrypt and ksba.
+	(Requires.private): New with libgcrypt and ksba.
+	(Libs.private: New with forgotten @NETLIB@.
+
+	build: Fix library dependency for ntbtls-cli test program.
+	+ commit 612351adc7ca1da000afad3ec9c2b8aab581120c
+	* src/Makefile.am (ntbtls_cli_LDADD): Remove libgcrypt and ksba.
+
+2021-11-10  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Fix internal API of functions to match declaration.
+	+ commit a5042e298d5c3cd91de4f0356063d44ebd1750e7
+	* src/protocol.c (calc_verify_tls_sha256): Use pointer.
+	(calc_verify_tls_sha384): Likewise.
+
+	libtool: Link without -flat_namespace for macOS.
+	+ commit 27ac2776f3238c2d7de8d9239340e6f2cc0a4ea0
+	* m4/libtool.m4: Not setting 10.0 to MACOSX_DEPLOYMENT_TARGET when not
+	defined.  Only specify -flat_namespace to linker for specific
+	(older) versions and hosts.
+
+2021-05-27  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: _DARWIN_C_SOURCE should be 1.
+	+ commit 01464c04267a177df9e7eef4520b6cca14df0498
+	* configure.ac (*-apple-darwin*): Set _DARWIN_C_SOURCE 1.
+
+2021-04-19  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Update gpg-error.m4.
+	+ commit 1c2f98da3364a030ebec1ef5774ffafd88296461
+	* m4/gpg-error.m4: Update from libgpg-error.
+
+2021-03-23  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Support X25519 and X448.
+	+ commit 64f895dba734802662cbb81b64cd0b4af198ee71
+	* src/ecdh.c (ntbtls_ecdh_read_params): Add X25519 and X448.
+	(gen_d): Likewise.
+	(_ntbtls_ecdh_make_public, _ntbtls_ecdh_calc_secret): Likewise.
+	(src/protocol-cli.c): Add the two curves.
+
+2020-11-18  NIIBE Yutaka  <gniibe@fsij.org>
+
+	m4: Update with newer autoconf constructs.
+	+ commit e0a807eec263ca27c1622f6bc9c2947a193dbf62
+	* src/ntbtls.m4: Replace AC_HELP_STRING to AS_HELP_STRING.
+
+	build: Update to newer autoconf constructs.
+	+ commit 35d7429480b0bf5ee73492b41657e00db5a9299b
+	* configure.ac (AC_INIT): Use 'https://'.
+	Use AC_USE_SYSTEM_EXTENSIONS instead of AC_GNU_SOURCE.
+	(AC_ISC_POSIX): Replace by AC_SEARCH_LIBS.
+	Use AS_HELP_STRING instead of AC_HELP_STRING.
+	(AC_TYPE_SIGNAL): Remove.
+	(AC_DECL_SYS_SIGLIST): Remove.
+	* m4/ksba.m4: Update from libksba.
+	* m4/libgcrypt.m4: Update from libgcrypt.
+	* m4/libtool.m4: Update from libgpg-error.
+	* m4/gpg-error.m4: Update from libgpg-error.
+
+2020-08-27  Werner Koch  <wk@gnupg.org>
+
+	Release 0.2.0.
+	+ commit 6a4ffcc68cb04915715bc0ba11dedd31050b8b7c
+	* configure.ac: Set LT version to C1/A1/R0.
+
+	Add public function ntbtls_get_last_alert.
+	+ commit f10e83874e86193d804a40ec90571e3e9899fb3d
+	* src/ntbtls.h.in (ntbtls_get_last_alert): New.
+	* src/libntbtls.def, src/libntbtls.vers: Add it.
+	* src/visibility.c, src/visibility.h: Add wrapper.
+	* src/context.h (struct _ntbtls_context_s): Add field last_alert.
+	* src/protocol.c (_ntbtls_read_record): Store alert.
+	(_ntbtls_get_last_alert): New.
+	* src/ntbtls-cli.c (simple_client): Print last alert.
+
+	Fix printf error in debug output.
+	+ commit 8b3a059e8a816eee211b3063569b49d286a5cb89
+	* src/util.h (_ntbtls_debug_msg): Fix printf attribute.
+	* src/protocol-cli.c (write_cli_session_ticket_ext): Fix format
+	strings flaws in debug messages.
+	* src/protocol.c: Ditto.
+
+2020-08-26  Werner Koch  <wk@gnupg.org>
+
+	Silence some compiler warnings.
+	+ commit 408d5b469a2a55746948ef19233ae79b3effd34d
+	(cookie_read, cookie_write): Change return type to gpgrt_ssize_t to
+	silence compler warnings.
+
+	Improve debug messages for alerts.
+	+ commit 1003f94975ecfea36acfb21d930f49e7fdbc8f4a
+	* src/protocol.c (alert_msg_to_string): New.
+	(_ntbtls_read_record): Add alert description to debug output.
+
+2020-08-04  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Update for newer autotools.
+	+ commit e9bf89a6f611bed4951f6b280af37ed091b9c408
+	* build-aux/missing: Update from GnuPG master.
+	* m4/lt~obsolete.m4: New.  Copied from GnuPG master.
+
+2020-06-03  Werner Koch  <wk@gnupg.org>
+
+	Require a maintained version of libgcrypt.
+	+ commit 821cd31a87272d60638f7fac8a04fe9f7a1edf24
+	* configure.ac: Require libgpg-error 1.25 and Libgcrypt 1.8
+	* src/util.h: Add missing error codes up to libgpg-error 1.27
+
+2020-02-27  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Change NTBTLS_CONFIG_LIBS.
+	+ commit c77450d9cbf04fac0c922904ce49670952dbe99b
+	* configure.ac (NTBTLS_CONFIG_LIBS): Only the specific library.
+	* src/Makefile.am (libntbtls_la_LIBADD): Remove NETLIBS.
+	* src/ntbtls-config.in: Add -lksba -lgcrypt.
+	* src/ntbtls.pc.in (Requires): Add ksba and libgcrypt.
+
+2019-08-20  NIIBE Yutaka  <gniibe@fsij.org>
+
+	pkgconfig: Fix ntbtls.pc.
+	+ commit 35a91c4961d442334483d224f3fb0015d7a84d0c
+	* src/ntbtls.pc.in (Cflags, Libs): Have flags.
+
+2019-07-03  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Support GCM.
+	+ commit 7b2c4d9dd50be585e0333b0892cb5175f83a55a8
+	* src/ciphersuites.c (_ntbtls_ciphersuite_list): Remove non support of
+	GCRY_CIPHER_MODE_GCM.
+	* src/protocol.c (encrypt_buf): Implement encryption with AEAD cipher.
+	(decrypt_buf): Likewise for decryption.
+
+2019-01-17  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Remove duplicated typedefs.
+	+ commit f27c17396c9e2f3c1581c5d9c80ac257f173cdf6
+	* src/ciphersuites.h (ciphersuite_t): Remove.
+	* src/context.h (x509_cert_t): Remove.
+
+2018-11-13  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Update m4/libgcrypt.m4.
+	+ commit 838f83398d728031ea9cab1e7fed5950f4faefa5
+	* m4/libgcrypt.m4: Update libgcrypt master.
+
+	ntbtls.m4: Prefer gpgrt-config to SYSROOT support.
+	+ commit 1fbb2f544c145f271ea929b05b3d5d0399eaa16a
+	* src/ntbtls.m4: Move SYSROOT support after checking GPGRT_CONFIG.
+
+	build: Update autogen.rc.
+	+ commit 005e61e7c20352e070f53edbe82b8a2338576b43
+	* autogen.rc: Remove obsolete --with-gpg-error-prefix,
+	--with-ksba-prefix, and --with-libgcrypt-prefix options.
+
+2018-11-08  NIIBE Yutaka  <gniibe@fsij.org>
+
+	ntbtls-cli: Use union to access hostent addr.
+	+ commit ac406d38e49d4bbe2c6b41680abf7c717ce9b393
+	* src/ntbtls-cli.c (connect_server): Use union.
+
+2018-11-02  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Update *.m4 files.
+	+ commit 4b7c6a91f56c2bd5baa859146298f8f20519313f
+	* m4/gpg-error.m4: Update to 2018-11-02.
+	* m4/ksba.m4: Ditto.
+	* m4/libgcrypt.m4: Ditto.
+	* src/ntbtls.m4: Add AC_MSG_NOTICE.
+
+2018-10-29  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Update *.m4 files.
+	+ commit 6b4fb70b94c70ca071ae2ea20c6d25dffff06664
+	* m4/gpg-error.m4: Update to 2018-10-29.
+	* m4/ksba.m4: Ditto.
+	* m4/libgcrypt.m4: Ditto.
+	* src/ntbtls.m4: Follow the change of gpgrt-config.
+
+2018-10-26  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Update ksba.m4 again.
+	+ commit 3bd7643ceb11630d4e483ff60016d794c73faea9
+
+
+	build: Update ksba.m4 and libgcrypt.m4.
+	+ commit 07568d097f3e9662a5e49297d27324cbcd2407a4
+	* m4/ksba.m4: Update.
+	* m4/libgcrypt.m4: Update.
+
+	ntbtls.m4: Better backward compatibility support.
+	+ commit cf45bc9db3d63283169026bf6e8300712991fc01
+	* m4/gpg-error.m4: Update.
+	* src/ntbtls.m4: Don't assume ntbtls-config is newer.
+
+	build: Relax build requirements.
+	+ commit 64bc82e24961cde6bae6615154bc3b2d6ce1a274
+	* m4/gpg-error.m4: Update.
+	* m4/ksba.m4: Update.
+	* m4/libgcrypt.m4: Update.
+	* configure.ac (NEED_GPG_ERROR_VERSION): Don't require newer.
+	* src/ntbtls.m4: Don't require AM_PATH_GPG_ERROR.  Use GPGRT_CONFIG
+	when it is confirmed that it is available and working well.  Fall back
+	to detecting NTBTLS_CONFIG, if not.
+
+2018-10-25  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Require libgpg-error >= 1.33.
+	+ commit 1233f3293f2076544f9924b268b2eca04e0ada39
+	* configure.ac (NEED_GPG_ERROR_VERSION): Require >= 1.33.
+	* m4/gpg-error.m4: Update from libgpg-error 1.33.
+	* src/ntbtls.m4 (AM_PATH_GPG_ERROR): Required.
+
+2018-10-24  NIIBE Yutaka  <gniibe@fsij.org>
+
+	build: Fix ntbtls.pc.in.
+	+ commit ace1fa90ec40e30cefa65a3cf8552960c9f5e761
+	* src/ntbtls.pc.in: Don't quote.
+
+	build: Fix ntbtls.m4.
+	+ commit 39d0b3a02afe78cced546e7f9a61566b7be068c1
+	* src/ntbtls.m4: Use --modversion to get the version.
+
+	build: Compatibility to pkg-config.
+	+ commit ea6edafcf8393fd7ae6eb0cef5c3b41d943c3e2b
+	* src/ntbtls-config.in: Support --variable and --modversion.
+
+	build: Make ntbtls.m4 use gpg-error-config.
+	+ commit 06e6d62dcaf6ecd08e16cc692a4bb4bc6acc9307
+	* src/ntbtls.m4: Use gpg-error-config.
+
+	build: Provide ntbtls.pc, generated by configure.
+	+ commit 548b70b9db46f028d43a1ae41118b73d170bb57e
+	* configure.ac (PACKAGE, VERSION): Remove.
+	Generate src/ntbtls.pc.
+	* src/Makefile.am (pkgconfigdir, pkgconfig_DATA): New.
+	(EXTRA_DIST): Add ntbtls.pc.in.
+	* src/ntbtls-config.in: Use @PACKAGE_VERSION@.
+	* src/ntbtls.pc.in: New.
+
+	build: Update m4 scripts.
+	+ commit f4e5435e1d4cf0c9517d9056e293cc13bc2b5000
+	* m4/gpg-error.m4: Update from libgpg-error.
+	* m4/ksba.m4: Update from libksba.
+	* m4/libgcrypt.m4: Update from libgcrypt.
+
+2018-10-16  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Update autogen.sh from libgpg-error.
+	+ commit 9d54948d6ca3e3e3e3040dab0c5fded0757472e9
+	* autogen.sh: Update.
+
+2018-01-29  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Fix wipemem.h for other architectures.
+	+ commit 0b56e5c076ae22853bf919c696db1e994acd1ef0
+	* src/wipemem.h (FASTWIPE_T): Defined.
+
+2017-09-19  Werner Koch  <wk@gnupg.org>
+
+	Release 0.1.2.
+	+ commit a68e81e9daead32d1cddcbddc3455aeff298019a
+	* configure.ac: Set LT version to C0/A0/R2.
+
+2017-09-18  Werner Koch  <wk@gnupg.org>
+
+	Support the other two NIST curves and their Brainpool counterparts.
+	+ commit 387f2fda683bfa4e01c7ef5165c1f675ae2ff248
+	* src/ecdh.c (_ntbtls_ecdh_read_params): Add new curves.
+	* src/protocol-cli.c (write_supported_elliptic_curves_ext): Ditto.
+
+	Print "handshake failure" debug msg for the the 2:40 alert.
+	+ commit 55071ab71133333ebabbf40ca872829dc9089bf7
+	* src/protocol.c (_ntbtls_read_record): Explain error message.
+
+2017-03-17  Andre Heinecke  <aheinecke@intevation.de>
+
+	Include KSBA includedir while compiling.
+	+ commit 455fbea598c528c17f6a961dbe52414fc845c0d9
+	* src/Makefile.am (AM_CFLAGS): Include libksba
+
+2017-03-16  Werner Koch  <wk@gnupg.org>
+
+	Release 0.1.1.
+	+ commit 5de470fbeb7b6d92070206414d130dfb53d96e69
+
+
+	Implement ECDHE-RSA key exchange.
+	+ commit 17efdd6202ed0901b51bfd1045e7e48e3a8a3ead
+	* src/ecdh.c: New file.
+	* src/Makefile.am (libntbtls_la_SOURCES): Add new file.
+	* src/context.h (ecdh_context_t): New type.
+	(_ntbtls_handshake_params_s): Use new type for 'ecdh_ctx'.
+	* src/protocol.c (handshake_params_init): Init ECDH_CTX.
+	(handshake_params_deinit): Deinit ECDH_CTX.
+	(ssl_write_hello_request): Rename to write_hello_request.  Change
+	caller.
+	* src/protocol-cli.c (write_supported_elliptic_curves_ext): Implement.
+	(write_cli_supported_point_formats_ext): Implement.
+	(write_client_hello): Call them.
+	(parse_supported_point_formats_ext): Implement.
+	(parse_server_ecdh_params): Implement.
+	(parse_signature_algorithm): Fix debug output.
+	(read_server_key_exchange): Improve debug output.
+	(write_client_key_exchange): Implement ECDHE key exchange.
+	* src/ciphersuites.c (_ntbtls_ciphersuite_list): Advertise ECDHE_RSA
+	key exchange.
+
+	New debug macro for print a point value.
+	+ commit 1fc1669e037cfcc1cef1c1af58141d5aace2e9d2
+	* src/debug.c (_ntbtls_debug_pnt): New.
+	* src/util.h (debug_pnt): New macro.
+
+2017-03-08  Justus Winter  <justus@gnupg.org>
+
+	build: Use macOS' compatibility macros to enable all features.
+	+ commit e582e91e47a164816ac074b9078dbed8537601dc
+	* configure.ac: On macOS, use the compatibility macros to expose every
+	feature of the libc.  This is the equivalent of _GNU_SOURCE on GNU
+	libc.
+
+2017-02-23  Werner Koch  <wk@gnupg.org>
+
+	Make ntbtls-cli work for W32.
+	+ commit 23670ada738071ec464c9a40f6b3528e23998655
+	* src/ntbtls-cli.c: Include errno.h.
+	(w32_cookie_read) [W32]: New.
+	(w32_write_server) [W32]: New.
+	(w32_cookie_write) [W32]: New.
+	(w32_cookie_functions) [W32]: New.
+	(connect_estreams) [W32]: Use es_fopencookie.
+	(main) [W32]: Init Winsock.
+
+2017-02-21  Werner Koch  <wk@gnupg.org>
+
+	Release 0.1.0.
+	+ commit 50ad7a2206bac7682195e8285af96e0d790891b3
+
+
+	Remove now superfluous functions from the public API.
+	+ commit 8a3e8a9948d7545238d5d0fd54eed43c7c0fb174
+	* src/visibility.c (ntbtls_x509_cert_new): Remove
+	(ntbtls_x509_cert_release): Remove.
+	(ntbtls_x509_append_cert): Remove.
+
+	New macro ntbtls_check_context.
+	+ commit 4e4d5a4c436ecf2d2ae96b61b2c0cfc177f585b7
+	* src/ntbtls.h.in (ntbtls_check_context): New macro.
+	* src/visibility.c (_ntbtls_check_context): New function.
+	* src/libntbtls.def, src/libntbtls.vers: Add _ntbtls_check_context.
+	* configure.ac (SIZEOF_UNSIGNED_LONG): Define.
+	* src/context.h (NTBTLS_CONTEXT_MAGIC): New constant.
+	(_ntbtls_context_s): New field 'magic'.
+	* src/debug.c (_ntbtls_debug_bug): Always print a message.
+	* src/protocol.c (_ntbtls_new): Set MAGIC.
+	(_ntbtls_release): Test MAGIC.
+
+	New function ntbtls_get_hostname.
+	+ commit 59b779b8c0f7bb22c48527f8ed8d1d28acc8bad3
+	* src/ntbtls.h.in (ntbtls_get_hostname): New.
+	* src/protocol.c (_ntbtls_get_hostname): New.
+	* src/visibility.c, src/visibility.h: Export ntbtls_get_hostname.
+	* src/libntbtls.def, src/libntbtls.vers: Ditto.
+
+2017-02-20  Werner Koch  <wk@gnupg.org>
+
+	Implement wildcards for hostname checking.
+	+ commit 19d9776ac40e7ff9fcfed7838ff8261ba8d61fac
+	* src/x509.c (count_labels): New.
+	(check_hostname): Implement wildcards.
+
+	ntbtls-cli: New option --head and use a default SNI.
+	+ commit cd1bbb3182178fa1db487d8a1bcbc1647201ba97
+	* src/ntbtls-cli.c (opt_head): New var.
+	(simple_client): Request "HEAD".
+	(main): Add option --head.  Use default SNI value.
+
+	Implement hostname checking.
+	+ commit 379c449b6fa539f188fc1d7666ceae17c40a645a
+	* src/x509.c (struct dn_array_s): New.
+	(release_dn_array): New.
+	(parse_dn_part): New.
+	(parse_dn): New.
+	(check_hostname): New.
+	(_ntbtls_x509_check_hostname): New.
+	* src/protocol.c (_ntbtls_read_certificate): Add hostname check.
+
+	New function ntbtls_set_log_handler.
+	+ commit 204627b9fd5d67a87a8bee9e2ac3345c06f4c0d8
+	* src/ntbtls.h.in (ntbtls_log_handler_t): New type.
+	(ntbtls_set_log_handler): New.
+	* src/visibility.c (ntbtls_set_log_handler): New.
+	* src/visibility.h (ntbtls_set_log_handler): Mark visible.
+	* src/libntbtls.def: Add ntbtls_set_log_handler.
+	* src/libntbtls.vers: Add ntbtls_set_log_handler.
+	* src/debug.c (log_handler, log_handler_value): New vars.
+	(_ntbtls_set_log_handler): New.
+	(_ntbtls_set_debug): Do not re-set the prefix.
+	(_ntbtls_debug_msg): Divert to a log handler.
+
+	* src/util.c (_ntbtls_trim_trailing_spaces): New.
+	(ascii_toupper): New.
+	(_ntbtls_ascii_strcasecmp): New.
+	* src/util.h (spacep, digitp, alphap, alnump, hexdigitp): New macros.
+	(ascii_isspace): New macro.
+	(atoi_1, atoi_2, atoi_4, xtoi_1, xtoi_2, xtoi_4): New macros.
+
+2017-02-19  Werner Koch  <wk@gnupg.org>
+
+	Change verification API to use a callback.
+	+ commit f9552b3c9f2c9705b2715f8a90479bfc600c61d6
+	* src/ntbtls.h.in: Include ksba.h.
+	(ntbtls_verify_cb_t): New type.
+	(ntbtls_set_ca_chain): Remove prototype.
+	(ntbtls_set_verify_cb): New.
+	(ntbtls_x509_get_peer_cert): New.
+	* src/visibility.c (ntbtls_set_ca_chain): Remove.
+	(ntbtls_set_verify_cb): New.
+	(ntbtls_x509_get_peer_cert): New.
+	* src/visibility.h (ntbtls_set_ca_chain): Remove
+	(ntbtls_set_verify_cb): Mark visible.
+	(ntbtls_x509_get_peer_cert): Ditto.
+	* src/libntbtls.def (ntbtls_set_ca_chain): Remove.
+	(ntbtls_set_verify_cb, ntbtls_x509_get_peer_cert): New.
+	* src/libntbtls.vers (ntbtls_set_ca_chain): Remove.
+	(ntbtls_set_verify_cb, ntbtls_x509_get_peer_cert): New.
+
+	* src/context.h (_ntbtls_context_s: Remove 'ca_chain' and
+	'crl_chain'.  Add 'verify_cb' and 'verify_cb_value'.
+	* src/protocol.c (_ntbtls_read_certificate): Call verify callback.
+	(session_deinit): Remove superfluous conditional.
+	(_ntbtls_set_ca_chain): Remove.
+	(_ntbtls_set_verify_cb): New.
+	* src/x509.c (x)509_cert_s): Remove fields 'fpr', 'is_self_signed',
+	and 'is_valid'.
+	(_ntbtls_x509_verify): Remove
+	(_ntbtls_x509_get_cert): Fix use of IDX.
+	(_ntbtls_x509_get_peer_cert): New.
+
+2017-01-27  Werner Koch  <wk@gnupg.org>
+
+	In debug mode write some infos about the certificates.
+	+ commit b5cbe683800f431737fa47d96edd9e5bdbeb374b
+	* src/debug.c (_ntbtls_debug_msg): Add hack to not print the final LF.
+	(_ntbtls_debug_crt): New.
+	* src/util.h (debug_crt): New macro.
+	* src/x509.c (x509_log_serial, x509_log_time): New.
+	(_ntbtls_x509_log_cert): New.
+	* src/protocol-cli.c (read_server_hello): Tweak debug levels.
+	* src/protocol.c (_ntbtls_read_certificate): Call debug_crt.
+
+2017-01-20  NIIBE Yutaka  <gniibe@fsij.org>
+
+	configure: Add check for sys/socket.
+	+ commit af472e2554bf8b8ed0c3387a7625a65792e85ffb
+	* configure.ac (gl_HEADER_SYS_SOCKET): Add.
+	* m4/sys_socket_h.m4: New from gnupg.
+	* src/Makefile.am (libntbtls_la_LIBADD, ntbtls_cli_LDADD): Fix.
+
+	Fix ntbtls-cli.c for Windows.
+	+ commit 33f3b5f298ded3c34b65bc08ee714294c9918411
+	* src/ntbtls-cli.c: Include files fix.
+
+	Add src/versioninfo.rc.in.
+	+ commit 876e1b298022b84277890036b84d3d94452c9a1e
+	* src/versioninfo.rc.in: New.
+	* src/Makefile.am (EXTRA_DIST): Add versioninfo.rc.in.
+	* configure.ac: Add versioninfo.rc output.
+
+2017-01-19  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Add missing m4/libtool.m4.
+	+ commit 2832bfe5373fc1967e0af5d71f9db6af4e35059c
+	* m4/Makefile.am (EXTRA_DIST): Update.
+	* m4/libtool.m4: New.
+
+	Fix ciphersuite version check.
+	+ commit 190afc87b3fd6742398fa67cf5dd3469233c0529
+	* src/ciphersuites.c (_ntbtls_ciphersuite_version_ok): Fix.
+
+	Release CA at ntbtls_release.
+	+ commit 983512851b9052720bd65eb582bbfbd612441a21
+
+
+	Rename ntbtls_x509_* to ntbtls_x509_cert_*.
+	+ commit 61d4d3eff76c1321796b56860219104affb24992
+
+
+	Expose x509 certificate API.
+	+ commit 171038778ea3d5acfeca6eb2b34b8041f9d9bf9a
+
+
+	Expose ntbtls_set_ca_chain API.
+	+ commit 8ae0bdff28ffabc9018da032fb207872cab7368a
+
+
+	Use hostname removing peer_cn.
+	+ commit 4c5dc1776227c81d106e177e231fc43c2d044f66
+	* src/context.h (struct _ntbtls_context_s): Remove peer_cn field.
+	* src/protocol.c (_ntbtls_read_certificate): Use ->hostname.
+
+2017-01-18  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Move pk_encrypt into pkglue.c.
+	+ commit 58ce55fefaf450c534622fea63d073dac8f218de
+	* src/x509.c (_ntbtls_x509_pk_encrypt): Renaming and move to...
+	* src/pkglue.c (_ntbtls_pk_encrypt): Here.  Use _ntbtls_x509_get_pk.
+	* src/protocol-cli.c (write_encrypted_pms): Follow the rename.
+
+2017-01-17  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Implement public key encryption in write_encrypted_pms.
+	+ commit 86d3ccebd64da692ef03a95da015ca68b8c2e938
+	* src/x509.c (ntbtls_x509_pk_encrypt): New.
+	* src/protocol-cli.c (write_encrypted_pms): Call
+	ntbtls_x509_pk_encrypt.
+
+2017-01-16  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Ignore non-fatal TLS_ALERT_MSG.
+	+ commit c9231ca6c256708d6e8d583f54bb339d4c6e14c7
+	* src/protocol.c (_ntbtls_read_record): Skip to next message.
+
+2016-12-13  NIIBE Yutaka  <gniibe@fsij.org>
+
+	Fix EOF handling.
+	+ commit 907219a13b74e4903cc776bd70519cc23a98c227
+	* src/protocol.c (_ntbtls_fetch_input): Return GPG_ERR_EOF.
+
+	Modify autogen.sh for git workflow.
+	+ commit 9750f0dd64f224e679cfcde8c73f913d431b3964
+	* autogen.sh: Fix to check .git directory.
+
+2016-07-13  Werner Koch  <wk@gnupg.org>
+
+	Small debug message improvement.
+	+ commit 3a713a5d97f8e19bebf534120fa1d87edd2c9401
+	* src/protocol-cli.c (parse_signature_algorithm): Show algo names in
+	debug messages.
+	* src/util.h: Use the offical GPGRT_ATTR_PRINTF.
+
+	build: Update config.{guess,sub} to {2016-05-15,2016-06-20}.
+	+ commit 755226dac18a10f56f765a44b9b92509e4963cbd
+	* build-aux/config.guess: Update.
+	* build-aux/config.sub: Update.
+
+2015-08-25  Werner Koch  <wk@gnupg.org>
+
+	Make --disable-build-timestamp the default.
+	+ commit 69809bcb2904b1cb223348afbdabf0c7bf5ef558
+	* configure.ac (BUILD_TIMESTAMP): Default to "<none>".
+
+2015-06-24  Werner Koch  <wk@gnupg.org>
+
+	Change state handler names from parse_* to read_*.
+	+ commit 94ad8969257ea19ce9ae3bdf98ed6230e56d0805
+
+
+	Rework some debug messages.
+	+ commit c82ad134f10620db6d9395f584cd6b3f2319c237
+	* src/protocol.c (_ntbtls_state2str): New.
+	* src/ntbtls-cli.c (simple_client): Send some headers.
+
+2015-06-23  Werner Koch  <wk@gnupg.org>
+
+	Use buffer to int conversion macros and other cleanups.
+	+ commit 5da1924db8bc9dc3283aa66adbef5cedad4a4be6
+	* src/util.h (buf16_to_uint, buf16_to_size_t)
+	(buf24_to_size_t, buf32_to_u32): New.  Use them where approriate.
+
+	* src/protocol.c (is_aead_mode): New.  Use instead of explicit
+	conditionals.
+	(encrypt_buf, decrypt_buf): Add error checking.
+
+	* src/protocol-cli.c (parse_server_dh_params): Set lower limit to
+	1024.
+	(parse_server_psk_hint): Check length of length header.
+
+2014-12-28  Werner Koch  <wk@gnupg.org>
+
+	Code cleanup of the server hello parser.
+	+ commit a41846450b37a2dd44d732fe0e61466d183f381f
+	* src/protocol-cli.c (parse_server_hello): Use meaningful var name and
+	change strange loop construct.
+
+	Add Lucky Thirteen protection.
+	+ commit 11e5666cf4576d57bc8beb601a44c03642ee6b5c
+	* src/protocol.c (decrypt_buf): Keep on hashing.
+
+	Use new error code GPG_ERR_REQUEST_TOO_LONG.
+	+ commit a28c9e756eec9798e5f33b6f5f85bd52efb8a661
+	* src/protocol.c (_ntbtls_fetch_input): Change error code.
+
+	Add some comments.
+	+ commit 57876545cc6b12ade5ba9bb7d5d48c30eebae972
+	* src/ntbtls-cli.c (main): Add option --help.
+
+	Remove unused code for stream modes.
+	+ commit 35ceea0149853c43438472d2b0c8419c82798aa2
+	* src/protocol.c (_ntbtls_derive_keys, encrypt_buf)
+	(decrypt_buf): Remove cipher_mode_stream branches.
+
+2014-10-02  Werner Koch  <wk@gnupg.org>
+
+	Add ntbtls_set_hostname.
+	+ commit edbd2d22fab66c2bdc7dc2666aeb5b9e949aee9b
+
+
+2014-10-01  Werner Koch  <wk@gnupg.org>
+
+	More changes - first successful handshake.
+	+ commit e51efcab2b4fb9383dae56f639d12e1b704a59ee
+	* src/dhm.c: New.
+	* src/pkglue.c: New.
+	* src/util.c: New.
+
+	Add ciphersuites code from PolarSSL.
+	+ commit 9fb4d1d1a12fec458c758f22c84c6956315491e0
+	* src/ciphersuites.c: New. Change license from GPLv2+ to GPLv3+.  Some
+	editorial changes.
+	* src/ciphersuites.h: New. Ditto.
+
+	Replaced error codes by libgpg-error and other changes.
+	+ commit 9d11c0356b6c5a686f36ee2b8601f7e0dfcd2df0
+
+
+	Remove most non-TLS-1.2 stuff and most configure options - part 2.
+	+ commit 2305e06e786b92d56b8dcf7fb61de466d4d2f95e
+	* src/protocol-cli.c, src/protocol-srv.c: Simplify.
+
+2014-09-16  Werner Koch  <wk@gnupg.org>
+
+	Add new header files and rename ssl_{tls,cli,srv}.c.
+	+ commit 665d29cb2f28b91d36c79f9acfd609a05ce621d2
+	* src/util.h: New.
+	* src/ntbtls-int.h: New.
+	* src/ssl_tls.c: Rename to protocol.c.
+	* src/ssl_cli.c: Rename to protocol-cli.c.
+	* src/ssl_srv.c: Rename to protocol-srv.c.
+	* src/protocol.c, src/protocol-cli.c, src/protocol-srv.c: Change
+	license from GPLv2+ to GPLv3+.  Replace most include files by
+	ntbtls-int.h.
+	(polarssl_zeroize): Remove.  Change callers to use wipememory.
+
+2014-09-15  Werner Koch  <wk@gnupg.org>
+
+	Add wipemem.h.
+	+ commit 7c838d620b7fec057816831b00e92e50e2af3b8e
+	* src/wipemem.h: New.
+
+	Add some build environment files.
+	+ commit 0b42607158b370a1950ea00e5b2fa0d927d228f4
+
+
+	Remove most non-TLS-1.2 stuff and most configure options.
+	+ commit 6b265ce7b42a701f25705513fb4c713da730fd35
+
+
+        -----
+	Copyright (C) 2014 g10 Code GmbH
+
+	Copying and distribution of this file and/or the original GIT
+	commit log messages, with or without modification, are
+	permitted provided the copyright notice and this notice are
+	preserved.

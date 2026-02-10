@@ -1,0 +1,22 @@
+# autogen.sh configuration for GnuPG                           -*- sh -*-
+
+ersion_parts=3
+
+case "$myhost:$myhostsub" in
+  w32:)
+    extraoptions=""
+    ;;
+esac
+
+case "$myhost" in
+  w32)
+    configure_opts="
+      --with-zlib=@SYSROOT@
+      "
+    ;;
+esac
+
+
+extra_aclocal_flags=
+
+final_info="./configure --enable-maintainer-mode && make"
