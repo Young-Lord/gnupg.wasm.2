@@ -3,6 +3,7 @@
 let started = false;
 let finished = false;
 let activeFS = null;
+let activeHomedir = '/gnupg';
 let persistRoots = [];
 let bridge = null;
 let stderrBuffer = [];
@@ -412,8 +413,8 @@ function finish(exitCode, errorMessage) {
     queueClose(bridge.agentToGpg);
   }
 
-  const fsState = captureFsState(activeFS, persistRoots);
   const stderrText = new TextDecoder().decode(new Uint8Array(stderrBuffer));
+  const fsState = captureFsState(activeFS, persistRoots);
   postDebug('finish', {
     exitCode: Number.isFinite(exitCode) ? exitCode : 1,
     errorMessage: errorMessage ? String(errorMessage) : '',
@@ -449,6 +450,7 @@ async function handleStart(message) {
     ? message.gpgAgentWasmUrl
     : '';
   const homedir = normalizePath(message.homedir, '/gnupg');
+  activeHomedir = homedir;
   const incomingFsState = message.fsState && typeof message.fsState === 'object'
     ? message.fsState
     : null;

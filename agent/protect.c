@@ -28,6 +28,9 @@
 #include <assert.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#ifdef __EMSCRIPTEN__
+# include <emscripten/emscripten.h>
+#endif
 #ifdef HAVE_W32_SYSTEM
 # ifdef HAVE_WINSOCK2_H
 #  include <winsock2.h>
@@ -77,12 +80,39 @@ static const struct {
  * calibration has not yet been done or needs to be done again.  */
 static unsigned int s2k_calibration_time = AGENT_S2K_CALIBRATION;
 static unsigned long s2k_calibrated_count;
+static int s2k_probe_logged;
+
+#ifdef __EMSCRIPTEN__
+static int
+s2k_trace_verbose_enabled (void)
+{
+  static int initialized;
+  static int enabled;
+
+  if (!initialized)
+    {
+      const char *s = getenv ("GNUPG_WASM_S2K_TRACE_VERBOSE");
+      enabled = (s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+#else
+static int
+s2k_trace_verbose_enabled (void)
+{
+  return 0;
+}
+#endif
 
 
 /* A helper object for time measurement.  */
 struct calibrate_time_s
 {
-#ifdef HAVE_W32_SYSTEM
+#ifdef __EMSCRIPTEN__
+  double milliseconds;
+#elif defined(HAVE_W32_SYSTEM)
   FILETIME creation_time, exit_time, kernel_time, user_time;
 #else
   clock_t ticks;
@@ -124,7 +154,9 @@ hash_passphrase (const char *passphrase, int hashalgo,
 static void
 calibrate_get_time (struct calibrate_time_s *data)
 {
-#ifdef HAVE_W32_SYSTEM
+#ifdef __EMSCRIPTEN__
+  data->milliseconds = emscripten_get_now ();
+#elif defined(HAVE_W32_SYSTEM)
   GetProcessTimes (GetCurrentProcess (),
                    &data->creation_time, &data->exit_time,
                    &data->kernel_time, &data->user_time);
@@ -146,7 +178,14 @@ calibrate_elapsed_time (struct calibrate_time_s *starttime)
   struct calibrate_time_s stoptime;
 
   calibrate_get_time (&stoptime);
-#ifdef HAVE_W32_SYSTEM
+#ifdef __EMSCRIPTEN__
+  {
+    double elapsed = stoptime.milliseconds - starttime->milliseconds;
+    if (elapsed < 0)
+      elapsed = 0;
+    return (unsigned long)(elapsed + 0.5);
+  }
+#elif defined(HAVE_W32_SYSTEM)
   {
     unsigned long long t1, t2;
 
@@ -193,6 +232,10 @@ calibrate_s2k_count (void)
   unsigned long count;
   unsigned long ms;
 
+  if (s2k_trace_verbose_enabled ())
+    log_info ("[wasm-s2k] enter calibrate_s2k_count target_ms=%u\n",
+              s2k_calibration_time);
+
   for (count = 65536; count; count *= 2)
     {
       ms = calibrate_s2k_count_one (count);
@@ -202,17 +245,25 @@ calibrate_s2k_count (void)
         break;
     }
 
-  count = (unsigned long)(((double)count / ms) * s2k_calibration_time);
-  count /= 1024;
-  count *= 1024;
-  if (count < 65536)
+  if (!count || !ms)
     count = 65536;
+  else
+    {
+      count = (unsigned long)(((double)count / ms) * s2k_calibration_time);
+      count /= 1024;
+      count *= 1024;
+      if (count < 65536)
+        count = 65536;
+    }
 
   if (opt.verbose)
     {
       ms = calibrate_s2k_count_one (count);
       log_info ("S2K calibration: %lu -> %lums\n", count, ms);
     }
+
+  if (s2k_trace_verbose_enabled ())
+    log_info ("[wasm-s2k] leave calibrate_s2k_count raw_count=%lu\n", count);
 
   return count;
 }
@@ -227,8 +278,13 @@ set_s2k_calibration_time (unsigned int milliseconds)
     milliseconds = AGENT_S2K_CALIBRATION;
   else if (milliseconds > 60 * 1000)
     milliseconds = 60 * 1000;  /* Cap at 60 seconds.  */
+
+  if (milliseconds == s2k_calibration_time && s2k_calibrated_count)
+    return;
+
   s2k_calibration_time = milliseconds;
   s2k_calibrated_count = 0;  /* Force re-calibration.  */
+  s2k_probe_logged = 0;
 }
 
 
@@ -237,11 +293,33 @@ set_s2k_calibration_time (unsigned int milliseconds)
 unsigned long
 get_calibrated_s2k_count (void)
 {
+  unsigned long effective_count;
+  int did_calibrate = 0;
+
   if (!s2k_calibrated_count)
-    s2k_calibrated_count = calibrate_s2k_count ();
+    {
+      did_calibrate = 1;
+      if (s2k_trace_verbose_enabled ())
+        log_info ("[wasm-s2k] enter get_calibrated_s2k_count cached=0\n");
+      s2k_calibrated_count = calibrate_s2k_count ();
+    }
+
+  effective_count = s2k_calibrated_count < 65536 ? 65536 : s2k_calibrated_count;
+
+  if (!s2k_probe_logged)
+    {
+      unsigned long ms = calibrate_s2k_count_one (effective_count);
+      log_info ("[wasm-s2k] probe calibrated raw_count=%lu effective_count=%lu s2k_time_ms=%lu\n",
+                s2k_calibrated_count, effective_count, ms);
+      s2k_probe_logged = 1;
+    }
+
+  if (did_calibrate && s2k_trace_verbose_enabled ())
+    log_info ("[wasm-s2k] leave get_calibrated_s2k_count effective=%lu\n",
+              effective_count);
 
   /* Enforce a lower limit.  */
-  return s2k_calibrated_count < 65536 ? 65536 : s2k_calibrated_count;
+  return effective_count;
 }
 
 
@@ -250,9 +328,22 @@ unsigned long
 get_standard_s2k_count (void)
 {
   if (opt.s2k_count)
-    return opt.s2k_count < 65536 ? 65536 : opt.s2k_count;
+    {
+      unsigned long count = opt.s2k_count < 65536 ? 65536 : opt.s2k_count;
+      if (s2k_trace_verbose_enabled ())
+        log_info ("[wasm-s2k] leave get_standard_s2k_count explicit=%lu\n", count);
+      return count;
+    }
 
-  return get_calibrated_s2k_count ();
+  if (s2k_calibrated_count)
+    return s2k_calibrated_count < 65536 ? 65536 : s2k_calibrated_count;
+
+  {
+    unsigned long count = get_calibrated_s2k_count ();
+    if (s2k_trace_verbose_enabled ())
+      log_info ("[wasm-s2k] leave get_standard_s2k_count calibrated=%lu\n", count);
+    return count;
+  }
 }
 
 
@@ -261,7 +352,17 @@ get_standard_s2k_count (void)
 unsigned long
 get_standard_s2k_time (void)
 {
-  return calibrate_s2k_count_one (get_standard_s2k_count ());
+  unsigned long count;
+  unsigned long ms;
+
+  if (s2k_trace_verbose_enabled ())
+    log_info ("[wasm-s2k] enter get_standard_s2k_time\n");
+  count = get_standard_s2k_count ();
+  ms = calibrate_s2k_count_one (count);
+  if (s2k_trace_verbose_enabled ())
+    log_info ("[wasm-s2k] leave get_standard_s2k_time count=%lu ms=%lu\n",
+              count, ms);
+  return ms;
 }
 
 
@@ -394,6 +495,7 @@ do_encryption (const unsigned char *hashbegin, size_t hashlen,
   char *outbuf = NULL;
   char *p;
   int saltpos, ivpos, encpos;
+  unsigned long effective_s2k_count;
 
   s2ksalt = iv;  /* Silence compiler warning.  */
 
@@ -401,6 +503,7 @@ do_encryption (const unsigned char *hashbegin, size_t hashlen,
   *result = NULL;
 
   modestr = "openpgp-s2k3-ocb-aes";
+  effective_s2k_count = s2k_count ? s2k_count : get_standard_s2k_count ();
 
   rc = gcry_cipher_open (&hd, PROT_CIPHER,
                          GCRY_CIPHER_MODE_OCB,
@@ -456,7 +559,7 @@ do_encryption (const unsigned char *hashbegin, size_t hashlen,
         {
           rc = hash_passphrase (passphrase, GCRY_MD_SHA1,
                                 3, s2ksalt,
-				s2k_count? s2k_count:get_standard_s2k_count(),
+				effective_s2k_count,
 				key, keylen);
           if (!rc)
             rc = gcry_cipher_setkey (hd, key, keylen);
@@ -518,7 +621,7 @@ do_encryption (const unsigned char *hashbegin, size_t hashlen,
     char countbuf[35];
 
     snprintf (countbuf, sizeof countbuf, "%lu",
-	    s2k_count ? s2k_count : get_standard_s2k_count ());
+	    effective_s2k_count);
     p = xtryasprintf
       ("(9:protected%d:%s((4:sha18:%n_8bytes_%u:%s)%d:%n%*s)%d:%n%*s)",
        (int)strlen (modestr), modestr,

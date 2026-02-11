@@ -125,6 +125,16 @@
           <button id="btnVerify" class="run-action">Verify</button>
         </div>
 
+        <div class="field-grid two">
+          <label>
+            Symmetric profile
+            <select id="symmetricProfile">
+              <option value="secure" selected>Secure (default S2K)</option>
+              <option value="fast-dev">Fast Dev (--s2k-count 65536)</option>
+            </select>
+          </label>
+        </div>
+
         <p class="hint">
           Crypto buttons write editor content into the configured source path,
           run gpg, and then load output file content back to the editor when applicable.

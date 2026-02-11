@@ -15,6 +15,7 @@ COOP/COEP headers (`Cross-Origin-Opener-Policy: same-origin`,
 - Worker transport for browser runtime:
   - `scripts/wasm/gpg-browser-worker.js`
   - `scripts/wasm/gpg-agent-server-worker.js`
+  - `scripts/wasm/gpg-agent-session-worker.js`
 - Host-side helper API:
   - `scripts/wasm/gpg-browser-client.mjs`
 - Loopback pinentry callback model (no external pinentry process):
@@ -35,6 +36,10 @@ COOP/COEP headers (`Cross-Origin-Opener-Policy: same-origin`,
   - gpg worker can launch `gpg-agent --server` in a side Worker
   - side channel wired via Emscripten virtual fd + `GNUPG_WASM_AGENT_FD`
   - enables loopback pinentry-backed operations like key generation/signing
+- Persistent agent runtime mode (client-managed):
+  - `WasmGpgBrowserClient` can keep a dedicated agent session worker alive
+  - each gpg command gets a fresh bridge session while reusing one agent wasm runtime
+  - avoids losing in-memory agent runtime cache variables between commands
 
 ## Pinentry callback protocol
 
@@ -88,6 +93,8 @@ fsState = result.fsState;
 - This is the browser callback transport baseline.
 - It intentionally does not reuse the Node extra-fd bridge path.
 - `WasmGpgBrowserClient.run()` is one-shot per invocation (fresh Worker per run).
+- `WasmGpgBrowserClient` keeps gpg runs one-shot, and can optionally keep the
+  agent runtime persistent across runs.
 - Session persistence is in-memory host transfer only (`fsState`), not IDBFS yet.
 - Agent/dirmngr browser transport channels are not wired yet; this layer is
   focused on stdout/stderr/status + loopback pinentry callback flow.

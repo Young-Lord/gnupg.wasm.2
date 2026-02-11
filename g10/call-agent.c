@@ -49,6 +49,9 @@
 
 static assuan_context_t agent_ctx = NULL;
 static int did_early_card_test;
+#ifdef __EMSCRIPTEN__
+static unsigned long cached_agent_s2k_count;
+#endif
 
 struct confirm_parm_s
 {
@@ -2156,6 +2159,11 @@ agent_get_s2k_count (void)
   char *buf;
   unsigned long count = 0;
 
+#ifdef __EMSCRIPTEN__
+  if (cached_agent_s2k_count)
+    return cached_agent_s2k_count;
+#endif
+
   err = start_agent (NULL, 0);
   if (err)
     goto leave;
@@ -2189,6 +2197,10 @@ agent_get_s2k_count (void)
       /* Default to 65536 which was used up to 2.0.13.  */
       count = 65536;
     }
+
+#ifdef __EMSCRIPTEN__
+  cached_agent_s2k_count = count;
+#endif
 
   return count;
 }

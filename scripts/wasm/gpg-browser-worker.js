@@ -520,8 +520,48 @@ function buildFinalArgs(inputArgs, options) {
   return [...enforced, ...base, ...tail];
 }
 
+function emitS2kDebugFromStderr(text) {
+  const line = String(text || '');
+  if (!line.includes('[wasm-s2k]')) {
+    return;
+  }
+
+  let match = line.match(/\[wasm-s2k\]\s+gpg\s+s2k-count\s+encoded=(\d+)\s+decoded=(\d+)\s+source=([^\s]+)/);
+  if (match) {
+    postDebug('run.s2k.actual', {
+      encodedCount: Number.parseInt(match[1], 10),
+      decodedCount: Number.parseInt(match[2], 10),
+      source: String(match[3] || ''),
+    });
+    return;
+  }
+
+  match = line.match(/\[wasm-s2k\]\s+probe\s+calibrated\s+raw_count=(\d+)\s+effective_count=(\d+)\s+s2k_time_ms=(\d+)/);
+  if (match) {
+    postDebug('run.s2k.agent-probe', {
+      rawCount: Number.parseInt(match[1], 10),
+      effectiveCount: Number.parseInt(match[2], 10),
+      s2kTimeMs: Number.parseInt(match[3], 10),
+    });
+    return;
+  }
+
+  match = line.match(/\[wasm-s2k\]\s+(enter|leave)\s+([a-zA-Z0-9_]+)/);
+  if (match) {
+    postDebug('run.s2k.agent-fn', {
+      phase: String(match[1]),
+      fn: String(match[2]),
+      line,
+    });
+    return;
+  }
+
+  postDebug('run.s2k.raw-log', { line });
+ }
+
 function emitStderrAndStatus(line) {
   const text = String(line ?? '');
+  emitS2kDebugFromStderr(text);
   if (self.__gnupg_stream_capture) {
     self.__gnupg_stream_capture.stderr.push(text);
     self.__gnupg_stream_capture.metrics.stderrLivePosted += 1;
@@ -663,6 +703,16 @@ function createSharedQueueDescriptor(size = 262144) {
   return {
     meta: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4),
     data: new SharedArrayBuffer(normalizedSize),
+  };
+}
+
+function createSharedQueue(desc) {
+  if (!desc || !desc.meta || !desc.data) {
+    throw new Error('invalid shared queue descriptor');
+  }
+  return {
+    ctrl: new Int32Array(desc.meta),
+    data: new Uint8Array(desc.data),
   };
 }
 
@@ -965,6 +1015,10 @@ async function handleRun(message) {
   }, 'fsStderrChars', 'fsStderrFlushes');
 
   const enableAgentBridge = message.enableAgentBridge !== false;
+  const sharedAgentBridge =
+    message.sharedAgentBridge && typeof message.sharedAgentBridge === 'object'
+      ? message.sharedAgentBridge
+      : null;
   let agentBridge = null;
   let agentHeartbeatId = null;
 
@@ -1221,6 +1275,152 @@ async function handleRun(message) {
     };
   };
 
+  const createExternalAgentBridge = (bridgeDesc) => {
+    const gpgToAgent = createSharedQueue(bridgeDesc.gpgToAgent);
+    const agentToGpg = createSharedQueue(bridgeDesc.agentToGpg);
+    const bridgeMetrics = {
+      gpgWriteBytes: 0,
+      gpgReadBytes: 0,
+      gpgWritePreview: [],
+      gpgReadPreview: [],
+      lastWriteAt: 0,
+      lastReadAt: 0,
+    };
+    const readableHandlers = [];
+    let readableWatcherId = null;
+    let lastReadableState = false;
+    let lastClosedState = false;
+    let didCloseWriteQueue = false;
+
+    const pushPreview = (list, value) => {
+      if (list.length < 32) {
+        list.push(Number(value) & 0xff);
+      }
+    };
+
+    const notifyReadableHandlers = (mask) => {
+      while (readableHandlers.length > 0) {
+        const handler = readableHandlers.shift();
+        try {
+          handler(mask);
+        } catch {
+          /* Ignore callback failures from runtime polling layer. */
+        }
+      }
+    };
+
+    const ensureReadableWatcher = () => {
+      if (readableWatcherId !== null) {
+        return;
+      }
+      readableWatcherId = setInterval(() => {
+        const hasData = queueHasData(agentToGpg);
+        const closed = Atomics.load(agentToGpg.ctrl, 2) !== 0;
+        const becameReadable = hasData && !lastReadableState;
+        const becameClosed = closed && !lastClosedState;
+        lastReadableState = hasData;
+        lastClosedState = closed;
+        if (becameReadable || becameClosed) {
+          const POLLIN = 0x001;
+          const POLLHUP = 0x010;
+          let mask = 0;
+          if (hasData) {
+            mask |= POLLIN;
+          }
+          if (closed) {
+            mask |= POLLHUP;
+          }
+          if (mask !== 0) {
+            notifyReadableHandlers(mask);
+          }
+        }
+      }, 10);
+    };
+
+    const recordRead = (value) => {
+      if (value === null || value === undefined) {
+        return value;
+      }
+      bridgeMetrics.gpgReadBytes += 1;
+      bridgeMetrics.lastReadAt = Date.now();
+      pushPreview(bridgeMetrics.gpgReadPreview, value);
+      return value;
+    };
+
+    return {
+      externalMode: true,
+      readByte(shouldBlock = true) {
+        const value = queuePopByte(agentToGpg, shouldBlock);
+        return recordRead(value);
+      },
+      readAvailableByte() {
+        const value = queuePopByte(agentToGpg, false);
+        return recordRead(value);
+      },
+      hasReadableData() {
+        return queueHasData(agentToGpg);
+      },
+      isReadableClosed() {
+        return Atomics.load(agentToGpg.ctrl, 2) !== 0;
+      },
+      registerReadableHandler(callback) {
+        if (typeof callback !== 'function') {
+          return;
+        }
+        readableHandlers.push(callback);
+        ensureReadableWatcher();
+      },
+      writeByte(ch) {
+        if (ch === null || ch === undefined) {
+          return;
+        }
+        bridgeMetrics.gpgWriteBytes += 1;
+        bridgeMetrics.lastWriteAt = Date.now();
+        pushPreview(bridgeMetrics.gpgWritePreview, ch);
+        if (!queuePushByte(gpgToAgent, ch, true)) {
+          emitStderrAndStatus('[agent] bridge queue is full/closed while writing');
+          postDebug('run.agent.write-failed', {
+            byte: Number(ch) & 0xff,
+            gpgToAgent: summarizeQueue(gpgToAgent),
+          });
+        }
+      },
+      getStats() {
+        return {
+          ...bridgeMetrics,
+          gpgToAgent: summarizeQueue(gpgToAgent),
+          agentToGpg: summarizeQueue(agentToGpg),
+        };
+      },
+      async awaitReady() {
+        return true;
+      },
+      async shutdownAndWait() {
+        if (!didCloseWriteQueue) {
+          didCloseWriteQueue = true;
+          for (const byteValue of [66, 89, 69, 10]) {
+            queuePushByte(gpgToAgent, byteValue, false);
+          }
+          queueClose(gpgToAgent);
+        }
+
+        if (readableWatcherId !== null) {
+          clearInterval(readableWatcherId);
+          readableWatcherId = null;
+        }
+
+        postDebug('run.agent.external.shutdown', {
+          bridgeMetrics,
+          gpgToAgent: summarizeQueue(gpgToAgent),
+          agentToGpg: summarizeQueue(agentToGpg),
+        });
+        return {
+          external: true,
+        };
+      },
+    };
+  };
+
   if (shouldRequestPinentry(args, pinentryConfig)) {
     postDebug('run.pinentry.await', {
       mode: pinentryConfig && pinentryConfig.always === true ? 'always' : 'heuristic',
@@ -1310,17 +1510,33 @@ async function handleRun(message) {
   }
 
   if (enableAgentBridge) {
-    if (!gpgAgentScriptUrl) {
+    if (sharedAgentBridge) {
+      postDebug('run.agent.start', {
+        mode: 'external',
+      });
+      try {
+        agentBridge = createExternalAgentBridge(sharedAgentBridge);
+      } catch (error) {
+        postError(`failed to bind external agent bridge: ${formatError(error)}`);
+      }
+    } else if (!gpgAgentScriptUrl) {
       emitStderrAndStatus('[wasm] warning: gpg-agent bridge requested but gpgAgentScriptUrl is missing');
     } else {
       postDebug('run.agent.start', {
+        mode: 'spawn',
         gpgAgentWorkerUrl,
         gpgAgentScriptUrl,
         gpgAgentWasmUrl,
       });
       agentBridge = createAgentBridge();
+    }
+
+    if (agentBridge) {
       const agentReady = await agentBridge.awaitReady(12000);
-      postDebug('run.agent.ready', { agentReady });
+      postDebug('run.agent.ready', {
+        agentReady,
+        external: agentBridge.externalMode === true,
+      });
       if (!agentReady) {
         emitStderrAndStatus('[agent] worker did not report ready within timeout');
       }
@@ -1425,6 +1641,9 @@ async function handleRun(message) {
       if (agentBridge) {
         const agentResult = await agentBridge.shutdownAndWait(2500);
         if (agentResult && typeof agentResult === 'object') {
+          if (agentResult.external === true) {
+            agentInfo.external = true;
+          }
           if (Number.isFinite(agentResult.exitCode)) {
             agentInfo.exitCode = Number(agentResult.exitCode);
           }
@@ -1435,7 +1654,7 @@ async function handleRun(message) {
           if (typeof agentResult.stderr === 'string' && agentResult.stderr.trim()) {
             emitStderrAndStatus(`[agent] ${agentResult.stderr.trimEnd()}`);
           }
-          if (agentResult.fsState && typeof agentResult.fsState === 'object') {
+          if (agentResult.external !== true && agentResult.fsState && typeof agentResult.fsState === 'object') {
             capturedState = mergeFsStates(capturedState, agentResult.fsState);
             agentInfo.merged = true;
           }

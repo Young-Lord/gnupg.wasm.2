@@ -37,6 +37,17 @@ CONFIGURE_ONLY=0
 RECONFIGURE=0
 TARGET="node"
 
+is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --clean)
@@ -231,6 +242,13 @@ if [[ "$TARGET" == "browser" ]]; then
   GNUPG_LDFLAGS="$(wasm_append_flags "$LDFLAGS" "$WASM_BROWSER_LDFLAGS")"
 else
   GNUPG_LDFLAGS="$(wasm_append_flags "$LDFLAGS" "$WASM_NODE_LDFLAGS")"
+fi
+
+if [[ "$TARGET" == "browser" ]] && is_truthy "${WASM_KEEP_SYMBOLS:-0}"; then
+  GNUPG_CFLAGS="$(wasm_append_flags "$GNUPG_CFLAGS" "$WASM_KEEP_SYMBOLS_CFLAGS")"
+  GNUPG_CXXFLAGS="$(wasm_append_flags "$GNUPG_CXXFLAGS" "$WASM_KEEP_SYMBOLS_CFLAGS")"
+  GNUPG_LDFLAGS="$(wasm_append_flags "$GNUPG_LDFLAGS" "$WASM_KEEP_SYMBOLS_LDFLAGS")"
+  wasm_info "Browser symbol retention enabled"
 fi
 
 wasm_info "Configuring gnupg"

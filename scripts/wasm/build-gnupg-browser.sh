@@ -23,14 +23,20 @@ for arg in "$@"; do
   esac
 done
 
+if [[ -z "${WASM_KEEP_SYMBOLS:-}" ]]; then
+  WASM_KEEP_SYMBOLS=1
+fi
+
 WASM_PREFIX="$BROWSER_PREFIX" \
 WASM_BUILD_DIR="$BROWSER_BUILD_DIR" \
 WASM_LOG_DIR="$BROWSER_LOG_DIR" \
+WASM_KEEP_SYMBOLS="$WASM_KEEP_SYMBOLS" \
 bash "$SCRIPT_DIR/build-gnupg.sh" --target browser "$@"
 
 if [[ "$SKIP_PREPARE" -eq 0 ]]; then
   WASM_PREFIX="$BROWSER_PREFIX" \
   WASM_BUILD_DIR="$BROWSER_BUILD_DIR" \
   WASM_LOG_DIR="$BROWSER_LOG_DIR" \
+  WASM_KEEP_SYMBOLS="$WASM_KEEP_SYMBOLS" \
   bash "$SCRIPT_DIR/prepare-browser-assets.sh"
 fi

@@ -10,6 +10,7 @@ const el = {
   homedir: document.querySelector('#homedir'),
   defaultPassphrase: document.querySelector('#defaultPassphrase'),
   autoPinentry: document.querySelector('#autoPinentry'),
+  symmetricProfile: document.querySelector('#symmetricProfile'),
   sessionInfo: document.querySelector('#sessionInfo'),
 
   filePath: document.querySelector('#filePath'),
@@ -56,6 +57,8 @@ const el = {
 let fsState = null;
 let running = false;
 let pinentryResolver = null;
+let gpgClient = null;
+let gpgClientKey = '';
 
 function nowLabel() {
   return new Date().toLocaleTimeString();
@@ -256,6 +259,16 @@ function readTextFile(pathValue) {
   return decoder.decode(bytes);
 }
 
+function readFileSize(pathValue) {
+  ensureState();
+  const path = normalizePath(pathValue, '/work/note.txt');
+  const entry = fsState.files.find((item) => item.path === path);
+  if (!entry) {
+    return null;
+  }
+  return approxBase64Bytes(entry.data);
+}
+
 function deleteFile(pathValue) {
   ensureState();
   const path = normalizePath(pathValue, '/work/note.txt');
@@ -304,6 +317,85 @@ function appendConsole(kind, text) {
     el.console.removeChild(el.console.firstChild);
   }
   el.console.scrollTop = el.console.scrollHeight;
+}
+
+function formatMs(value) {
+  return `${Math.max(0, Math.round(value))}ms`;
+}
+
+function createPerfTracker(options = {}) {
+  const enabled = options && options.enabled === true;
+  const label = options && typeof options.label === 'string' && options.label
+    ? options.label
+    : 'run';
+  const markOrder = [];
+  const marks = new Map();
+  const startAt = performance.now();
+
+  const mark = (name) => {
+    if (!enabled || marks.has(name)) {
+      return;
+    }
+    marks.set(name, performance.now() - startAt);
+    markOrder.push(name);
+  };
+
+  const markFromDebugStep = (step) => {
+    if (!enabled) {
+      return;
+    }
+    if (step === 'run.import-launcher.done') {
+      mark('launcher-loaded');
+      return;
+    }
+    if (step === 'run.preRun.fs-init') {
+      mark('prerun-fs-init');
+      return;
+    }
+    if (step === 'run.runtime-initialized') {
+      mark('runtime-ready');
+      return;
+    }
+    if (step === 'client.pinentry.request') {
+      mark('pinentry-request');
+      return;
+    }
+    if (step === 'client.pinentry.reply') {
+      mark('pinentry-reply');
+      return;
+    }
+    if (step === 'run.callMain.return') {
+      mark('callMain-return');
+    }
+  };
+
+  return {
+    mark,
+    markFromDebugStep,
+    flush(extra = {}) {
+      if (!enabled) {
+        return;
+      }
+      mark('result-received');
+      const totalMs = performance.now() - startAt;
+      const parts = [`[perf:${label}] total=${formatMs(totalMs)}`];
+      for (const name of markOrder) {
+        const value = marks.get(name);
+        parts.push(`${name}=${formatMs(value)}`);
+      }
+      if (Number.isFinite(extra.inputBytes)) {
+        parts.push(`input=${extra.inputBytes}B`);
+      }
+      if (Number.isFinite(extra.outputBytes)) {
+        parts.push(`output=${extra.outputBytes}B`);
+      }
+      if (Number.isFinite(extra.outputBytes) && totalMs > 0) {
+        const kbps = (extra.outputBytes / 1024) / (totalMs / 1000);
+        parts.push(`throughput=${kbps.toFixed(1)}KiB/s`);
+      }
+      appendConsole('note', parts.join(' '));
+    },
+  };
 }
 
 function updateSessionInfo(message) {
@@ -518,7 +610,50 @@ function createClient(homedir, persistRoots) {
     gpgAgentWasmUrl,
     homedir,
     persistRoots,
+    persistentAgentRuntime: true,
   });
+}
+
+async function destroyClient(reason) {
+  if (!gpgClient) {
+    gpgClientKey = '';
+    return;
+  }
+
+  const client = gpgClient;
+  gpgClient = null;
+  gpgClientKey = '';
+  try {
+    await client.close();
+    if (reason) {
+      appendConsole('note', `agent session reset (${reason})`);
+    }
+  } catch (error) {
+    appendConsole('error', `failed to close client: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function buildClientKey(homedir, persistRoots) {
+  const gpgScriptUrl = el.gpgScriptUrl.value.trim();
+  const gpgWasmUrl = el.gpgWasmUrl.value.trim();
+  return JSON.stringify({
+    gpgScriptUrl,
+    gpgWasmUrl,
+    homedir,
+    persistRoots,
+  });
+}
+
+async function getClient(homedir, persistRoots) {
+  const key = buildClientKey(homedir, persistRoots);
+  if (gpgClient && gpgClientKey === key) {
+    return gpgClient;
+  }
+
+  await destroyClient('config-changed');
+  gpgClient = createClient(homedir, persistRoots);
+  gpgClientKey = key;
+  return gpgClient;
 }
 
 async function runGpg(args, pinentryRequest = {}, options = {}) {
@@ -540,9 +675,15 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
 
   setRunningUi(true);
   appendConsole('cmd', `$ gpg ${args.map((arg) => shellQuote(arg)).join(' ')}`);
+  const perf = createPerfTracker({
+    enabled: options.perfEnabled === true,
+    label: typeof options.perfLabel === 'string' && options.perfLabel ? options.perfLabel : 'run',
+  });
+  perf.mark('command-dispatched');
 
   try {
-    const client = createClient(homedir, persistRoots);
+    const client = await getClient(homedir, persistRoots);
+    perf.mark('client-created');
     const defaultRunTimeoutMs = isLikelyKeygenArgs(args) ? 600000 : 90000;
     const runTimeoutMs = Number.isFinite(options.runTimeoutMs)
       ? Number(options.runTimeoutMs)
@@ -569,6 +710,7 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
       },
       onDebug: (entry) => {
         const step = entry && typeof entry.step === 'string' ? entry.step : 'unknown';
+        perf.markFromDebugStep(step);
         const dataText = formatDebugData(entry ? entry.data : null);
         appendConsole('note', `[debug:${step}] ${dataText}`);
       },
@@ -600,6 +742,11 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
       );
     }
 
+    perf.flush({
+      inputBytes: options.perfInputPath ? readFileSize(options.perfInputPath) : null,
+      outputBytes: options.perfOutputPath ? readFileSize(options.perfOutputPath) : null,
+    });
+
     return result;
   } catch (error) {
     const detail = error instanceof Error
@@ -610,6 +757,10 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
       appendConsole('error', error.stack);
     }
     updateSessionInfo(`command failed before exit code: ${detail}`);
+    perf.flush({
+      inputBytes: options.perfInputPath ? readFileSize(options.perfInputPath) : null,
+      outputBytes: options.perfOutputPath ? readFileSize(options.perfOutputPath) : null,
+    });
     return { exitCode: 1, fsState };
   } finally {
     setRunningUi(false);
@@ -674,13 +825,34 @@ async function handleImportFromEditor() {
 async function handleSymmetricEncrypt() {
   const source = normalizePath(el.sourcePath.value, '/work/input.txt');
   const output = normalizePath(el.outputPath.value, '/work/output.asc');
+  const symmetricProfile = el.symmetricProfile && typeof el.symmetricProfile.value === 'string'
+    ? el.symmetricProfile.value.trim()
+    : 'secure';
   el.sourcePath.value = source;
   el.outputPath.value = output;
 
   writeEditorToPath(source);
-  const result = await runGpg(['--armor', '--output', output, '--symmetric', source], {
+  const args = ['--armor', '--output', output];
+  let perfLabel = 'symmetric-encrypt';
+
+  if (symmetricProfile === 'fast-dev') {
+    args.push('--s2k-count', '65536');
+    perfLabel = 'symmetric-encrypt-fast-dev';
+    appendConsole('note', 'symmetric profile: fast-dev (--s2k-count 65536, weaker KDF for testing)');
+  } else {
+    appendConsole('note', 'symmetric profile: secure (default S2K cost)');
+  }
+
+  args.push('--symmetric', source);
+
+  const result = await runGpg(args, {
     op: 'symmetric',
     keyHint: source,
+  }, {
+    perfEnabled: true,
+    perfLabel,
+    perfInputPath: source,
+    perfOutputPath: output,
   });
   if (result.exitCode === 0) {
     loadPathIntoEditor(output);
@@ -778,6 +950,7 @@ function resetSession() {
     appendConsole('error', 'wait for current command to finish before resetting session');
     return;
   }
+  void destroyClient('manual-reset');
   fsState = createInitialState();
   ensureState();
   renderFileTree();
