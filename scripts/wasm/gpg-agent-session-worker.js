@@ -2,6 +2,7 @@
 
 let activeFS = null;
 let activeBridge = null;
+let activeScdaemonBridge = null;
 let activeHomedir = '/gnupg';
 let activePersistRoots = [];
 let activeSessionId = '';
@@ -274,6 +275,14 @@ function createSharedQueue(desc) {
   };
 }
 
+function createSharedQueueDescriptor(size = 262144) {
+  const normalizedSize = Number.isFinite(size) ? Math.max(1024, Number(size) | 0) : 262144;
+  return {
+    meta: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4),
+    data: new SharedArrayBuffer(normalizedSize),
+  };
+}
+
 function queueNotify(queue) {
   const { ctrl } = queue;
   Atomics.add(ctrl, 3, 1);
@@ -340,6 +349,10 @@ function queuePopByte(queue, shouldBlock = false) {
 function queueClose(queue) {
   Atomics.store(queue.ctrl, 2, 1);
   queueNotify(queue);
+}
+
+function queueHasData(queue) {
+  return Atomics.load(queue.ctrl, 0) !== Atomics.load(queue.ctrl, 1);
 }
 
 function summarizeQueue(queue) {
@@ -588,7 +601,11 @@ function finishSession(sessionId, exitCode, errorMessage) {
     queueClose(activeBridge.gpgToAgent);
     queueClose(activeBridge.agentToGpg);
   }
+  if (activeScdaemonBridge) {
+    void activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
+  }
   activeBridge = null;
+  activeScdaemonBridge = null;
   activeSessionId = '';
   activeStderrBuffer = [];
   bridgeMetrics = createBridgeMetrics();
@@ -663,9 +680,27 @@ async function handleRunSession(message) {
 
   const homedir = normalizePath(message.homedir, '/gnupg');
   activeHomedir = homedir;
+  const gpgScdaemonWorkerUrl = typeof message.gpgScdaemonWorkerUrl === 'string'
+    ? message.gpgScdaemonWorkerUrl
+    : new URL('./gpg-scdaemon-server-worker.js', self.location.href).toString();
+  let gpgScdaemonScriptUrl = typeof message.gpgScdaemonScriptUrl === 'string'
+    ? message.gpgScdaemonScriptUrl
+    : '';
+  let gpgScdaemonWasmUrl = typeof message.gpgScdaemonWasmUrl === 'string'
+    ? message.gpgScdaemonWasmUrl
+    : '';
   const incomingFsState = message.fsState && typeof message.fsState === 'object'
     ? message.fsState
     : null;
+
+  if (!gpgScdaemonScriptUrl && message.gpgAgentScriptUrl) {
+    gpgScdaemonScriptUrl = String(message.gpgAgentScriptUrl)
+      .replace(/gpg-agent(?:\.js)?(?=(?:[?#].*)?$)/, 'scdaemon.js');
+  }
+  if (!gpgScdaemonWasmUrl && message.gpgAgentWasmUrl) {
+    gpgScdaemonWasmUrl = String(message.gpgAgentWasmUrl)
+      .replace(/gpg-agent\.wasm(?=(?:[?#].*)?$)/, 'scdaemon.wasm');
+  }
 
   activePersistRoots = normalizePersistRoots(
     message.persistRoots,
@@ -683,6 +718,197 @@ async function handleRunSession(message) {
     persistRoots: activePersistRoots,
     hasIncomingFsState: Boolean(incomingFsState),
   });
+
+  const createScdaemonBridge = () => {
+    const worker = new Worker(gpgScdaemonWorkerUrl);
+    let daemonDone = false;
+    let resolveResult;
+    let rejectResult;
+    const resultPromise = new Promise((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+    let resolveReady;
+    let rejectReady;
+    const readyPromise = new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+
+    const agentToScdaemonDesc = createSharedQueueDescriptor();
+    const scdaemonToAgentDesc = createSharedQueueDescriptor();
+    const agentToScdaemon = createSharedQueue(agentToScdaemonDesc);
+    const scdaemonToAgent = createSharedQueue(scdaemonToAgentDesc);
+    const readableHandlers = [];
+    let readableWatcherId = null;
+    let lastReadableState = false;
+    let lastClosedState = false;
+
+    const notifyReadableHandlers = (mask) => {
+      while (readableHandlers.length > 0) {
+        const handler = readableHandlers.shift();
+        try {
+          handler(mask);
+        } catch {
+          /* Ignore runtime poll callback errors. */
+        }
+      }
+    };
+
+    const ensureReadableWatcher = () => {
+      if (readableWatcherId !== null) {
+        return;
+      }
+      readableWatcherId = setInterval(() => {
+        const hasData = queueHasData(scdaemonToAgent);
+        const closed = Atomics.load(scdaemonToAgent.ctrl, 2) !== 0;
+        const becameReadable = hasData && !lastReadableState;
+        const becameClosed = closed && !lastClosedState;
+        lastReadableState = hasData;
+        lastClosedState = closed;
+        if (becameReadable || becameClosed) {
+          const POLLIN = 0x001;
+          const POLLHUP = 0x010;
+          let mask = 0;
+          if (hasData) {
+            mask |= POLLIN;
+          }
+          if (closed) {
+            mask |= POLLHUP;
+          }
+          if (mask !== 0) {
+            notifyReadableHandlers(mask);
+          }
+        }
+      }, 10);
+    };
+
+    worker.addEventListener('message', (event) => {
+      const messageData = event.data;
+      if (!messageData || typeof messageData !== 'object') {
+        return;
+      }
+      if (messageData.type === 'debug') {
+        postDebug(`scdaemon.${messageData.step || 'unknown'}`, messageData.data || null);
+        return;
+      }
+      if (messageData.type === 'ready') {
+        resolveReady(true);
+        return;
+      }
+      if (messageData.type === 'error') {
+        postDebug('scdaemon.error', { message: String(messageData.message || 'unknown worker error') });
+        return;
+      }
+      if (messageData.type === 'result') {
+        daemonDone = true;
+        resolveResult(messageData);
+      }
+    });
+
+    worker.addEventListener('error', (event) => {
+      const text = event && event.message ? event.message : 'scdaemon worker failed';
+      rejectReady(new Error(text));
+      rejectResult(new Error(text));
+    });
+
+    worker.postMessage({
+      type: 'start',
+      scdaemonScriptUrl: gpgScdaemonScriptUrl,
+      scdaemonWasmUrl: gpgScdaemonWasmUrl,
+      homedir,
+      bridge: {
+        agentToScdaemon: agentToScdaemonDesc,
+        scdaemonToAgent: scdaemonToAgentDesc,
+      },
+    });
+
+    return {
+      readAvailableByte() {
+        return queuePopByte(scdaemonToAgent, false);
+      },
+      hasReadableData() {
+        return queueHasData(scdaemonToAgent);
+      },
+      isReadableClosed() {
+        return Atomics.load(scdaemonToAgent.ctrl, 2) !== 0;
+      },
+      registerReadableHandler(callback) {
+        if (typeof callback !== 'function') {
+          return;
+        }
+        readableHandlers.push(callback);
+        ensureReadableWatcher();
+      },
+      writeByte(ch) {
+        if (ch === null || ch === undefined) {
+          return;
+        }
+        queuePushByte(agentToScdaemon, ch, true);
+      },
+      async awaitReady(timeoutMs) {
+        let timeoutId = null;
+        const timeoutPromise = new Promise((resolve) => {
+          timeoutId = setTimeout(() => resolve(false), timeoutMs);
+        });
+        try {
+          const ready = await Promise.race([readyPromise, timeoutPromise]);
+          if (timeoutId !== null) {
+            clearTimeout(timeoutId);
+          }
+          return Boolean(ready);
+        } catch {
+          if (timeoutId !== null) {
+            clearTimeout(timeoutId);
+          }
+          return false;
+        }
+      },
+      async shutdownAndWait(timeoutMs) {
+        if (!daemonDone) {
+          for (const byteValue of [66, 89, 69, 10]) {
+            queuePushByte(agentToScdaemon, byteValue, false);
+          }
+        }
+        queueClose(agentToScdaemon);
+
+        let timeoutId = null;
+        const timeoutPromise = new Promise((resolve) => {
+          timeoutId = setTimeout(() => resolve(null), timeoutMs);
+        });
+        const result = await Promise.race([resultPromise, timeoutPromise]).catch(() => null);
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+        if (readableWatcherId !== null) {
+          clearInterval(readableWatcherId);
+          readableWatcherId = null;
+        }
+        queueClose(scdaemonToAgent);
+        worker.terminate();
+        return result;
+      },
+    };
+  };
+
+  try {
+    activeScdaemonBridge = createScdaemonBridge();
+    const scdReady = await activeScdaemonBridge.awaitReady(12000);
+    postDebug('scdaemon.ready', {
+      sessionId,
+      scdReady,
+      gpgScdaemonWorkerUrl,
+      gpgScdaemonScriptUrl,
+      gpgScdaemonWasmUrl,
+    });
+    if (!scdReady) {
+      finishSession(sessionId, 2, 'scdaemon worker did not report ready within timeout');
+      return;
+    }
+  } catch (error) {
+    finishSession(sessionId, 2, `failed to create scdaemon bridge: ${formatError(error)}`);
+    return;
+  }
 
   try {
     if (incomingFsState) {
@@ -706,9 +932,87 @@ async function handleRunSession(message) {
 
   const finalArgs = [
     '--server',
-    '--disable-scdaemon',
     '--homedir', homedir,
   ];
+
+  try {
+    const envObj = self.ENV || (self.Module && self.Module.ENV);
+    const FS = activeFS;
+    if (!FS || !envObj) {
+      throw new Error('runtime FS/ENV unavailable for scdaemon bridge');
+    }
+    if (!FS.registerDevice || !FS.mkdev || !FS.makedev) {
+      throw new Error('FS device registration APIs are unavailable');
+    }
+
+    const devName = `gnupg-scd-bridge-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+    const devPath = `/dev/${devName}`;
+    const major = 64;
+    const minor = ((Date.now() + 29) % 200) + Math.floor(Math.random() * 50);
+    const dev = FS.makedev(major, minor);
+    const POLLIN = 0x001;
+    const POLLOUT = 0x004;
+    const POLLHUP = 0x010;
+    const errnoCodes = self.ERRNO_CODES || (self.Module && self.Module.ERRNO_CODES) || null;
+    const EAGAIN = errnoCodes && Number.isFinite(errnoCodes.EAGAIN)
+      ? Number(errnoCodes.EAGAIN)
+      : 6;
+
+    FS.registerDevice(dev, {
+      read(stream, buffer, offset, length) {
+        let count = 0;
+        while (count < length) {
+          const byteValue = activeScdaemonBridge.readAvailableByte();
+          if (byteValue === undefined || byteValue === null) {
+            break;
+          }
+          buffer[offset + count] = byteValue;
+          count += 1;
+          if (!activeScdaemonBridge.hasReadableData()) {
+            break;
+          }
+        }
+
+        if (count === 0 && !activeScdaemonBridge.isReadableClosed()) {
+          throw new FS.ErrnoError(EAGAIN);
+        }
+        return count;
+      },
+      write(stream, buffer, offset, length) {
+        let count = 0;
+        while (count < length) {
+          activeScdaemonBridge.writeByte(buffer[offset + count]);
+          count += 1;
+        }
+        return count;
+      },
+      poll(stream, timeout, notifyCallback) {
+        let mask = POLLOUT;
+        if (activeScdaemonBridge.hasReadableData()) {
+          mask |= POLLIN;
+        }
+        if (activeScdaemonBridge.isReadableClosed()) {
+          mask |= POLLHUP;
+        }
+        if (mask === POLLOUT && typeof notifyCallback === 'function') {
+          activeScdaemonBridge.registerReadableHandler(notifyCallback);
+        }
+        return mask;
+      },
+    });
+
+    FS.mkdev(devPath, 0o600, dev);
+    const stream = FS.open(devPath, 'r+');
+    envObj.GNUPG_WASM_SCDAEMON_FD = String(stream.fd);
+    postDebug('session.scdaemon-fd', {
+      sessionId,
+      devPath,
+      fd: stream.fd,
+    });
+  } catch (error) {
+    finishSession(sessionId, 2, `failed to create scdaemon bridge fd: ${formatError(error)}`);
+    return;
+  }
 
   try {
     const rc = callMainWith(finalArgs.slice());
@@ -740,6 +1044,10 @@ self.addEventListener('message', (event) => {
     if (activeBridge) {
       queueClose(activeBridge.gpgToAgent);
       queueClose(activeBridge.agentToGpg);
+    }
+    if (activeScdaemonBridge) {
+      void activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
+      activeScdaemonBridge = null;
     }
     postMessage({ type: 'shutdown-complete' });
     setTimeout(() => {

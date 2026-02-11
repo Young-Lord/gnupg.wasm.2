@@ -106,6 +106,11 @@ install_wasm_sidecars() {
     if [[ -f "$WASM_PREFIX/bin/$stem" ]]; then
       cp -f "$wasm" "$WASM_PREFIX/bin/"
       ((copied += 1))
+      continue
+    fi
+    if [[ -f "$WASM_PREFIX/libexec/$stem" ]]; then
+      cp -f "$wasm" "$WASM_PREFIX/libexec/"
+      ((copied += 1))
     fi
   done
   shopt -u globstar nullglob
@@ -208,15 +213,14 @@ GNUPG_CONFIGURE_FLAGS=(
   "--prefix=$WASM_PREFIX"
   "--enable-static"
   "--disable-shared"
+  "--enable-ccid-driver"
   "--disable-gpgsm"
-  "--disable-scdaemon"
   "--disable-dirmngr"
   "--disable-keyboxd"
   "--disable-tpm2d"
   "--disable-g13"
   "--disable-gpgtar"
   "--disable-wks-tools"
-  "--disable-card-support"
   "--disable-libdns"
   "--disable-ldap"
   "--disable-sqlite"
@@ -243,6 +247,9 @@ if [[ "$TARGET" == "browser" ]]; then
 else
   GNUPG_LDFLAGS="$(wasm_append_flags "$LDFLAGS" "$WASM_NODE_LDFLAGS")"
 fi
+
+# libusb WebUSB backend uses Embind async helpers.
+GNUPG_LDFLAGS="$(wasm_append_flags "$GNUPG_LDFLAGS" "--bind -sASYNCIFY")"
 
 if [[ "$TARGET" == "browser" ]] && is_truthy "${WASM_KEEP_SYMBOLS:-0}"; then
   GNUPG_CFLAGS="$(wasm_append_flags "$GNUPG_CFLAGS" "$WASM_KEEP_SYMBOLS_CFLAGS")"

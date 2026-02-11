@@ -12,7 +12,8 @@ Interactive browser demo for the wasm gpg build.
 - Public-key encryption/decryption
 - Clear-sign and verify
 - Raw gpg command runner
-- Loopback pinentry callback via Worker message protocol
+- Stdin preset per run plus on-demand stdin prompt when gpg requests input
+- Loopback pinentry callback via status-driven stdin (`GET_HIDDEN`) dialog
 - Experimental browser agent bridge via side Worker (`gpg-agent --server`)
 - Browser keyserver bridge via fetch-backed dirmngr shim Worker
 
@@ -22,6 +23,8 @@ Notes for keyserver in browser:
   and exposes a dirmngr-compatible Assuan bridge to gpg.
 - Keyserver endpoints must allow browser fetch (CORS). If a server blocks CORS, keyserver
   commands may fail in browser even when they work in native gpg.
+- For commands that ask on stdin (for example selecting a key from `--search-keys`), use the
+  demo stdin preset textarea (e.g. `1` on one line) before running the command.
 
 ## Run locally
 

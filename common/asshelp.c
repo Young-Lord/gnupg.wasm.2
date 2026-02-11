@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
 #ifdef HAVE_LOCALE_H
@@ -463,13 +464,111 @@ wasm_connect_preopened_service (assuan_context_t ctx,
 
   *r_have_env = 1;
 
-  errno = 0;
-  fdno = strtol (value, &endp, 10);
-  if (errno || !endp || *endp || fdno < 0)
-    {
-      log_error ("invalid value for %s: '%s'\n", envname, value);
-      return gpg_error (GPG_ERR_INV_VALUE);
-    }
+  {
+    static unsigned int next_agent_fd_slot;
+    static unsigned int next_dirmngr_fd_slot;
+    static unsigned int next_keyboxd_fd_slot;
+    unsigned int *next_slot;
+    const char *p;
+    const char *tok_start;
+    size_t tok_len = 0;
+    unsigned int tok_idx;
+    unsigned int token_count = 0;
+    unsigned int want_idx = 0;
+    unsigned int pick_idx = 0;
+    char numbuf[64];
+
+    switch (module_name_id)
+      {
+      case GNUPG_MODULE_NAME_AGENT:
+        next_slot = &next_agent_fd_slot;
+        break;
+      case GNUPG_MODULE_NAME_DIRMNGR:
+        next_slot = &next_dirmngr_fd_slot;
+        break;
+      case GNUPG_MODULE_NAME_KEYBOXD:
+        next_slot = &next_keyboxd_fd_slot;
+        break;
+      default:
+        next_slot = &next_dirmngr_fd_slot;
+        break;
+      }
+
+    want_idx = *next_slot;
+
+    /* Count tokens in VALUE.  We accept comma and whitespace as
+     * separators so that multiple pre-opened fds can be passed as a
+     * simple list like "4,5,6".  */
+    p = value;
+    while (*p)
+      {
+        while (*p && (isspace ((unsigned char)*p) || *p == ','))
+          p++;
+        if (!*p)
+          break;
+        while (*p && !isspace ((unsigned char)*p) && *p != ',')
+          p++;
+        token_count++;
+      }
+
+    if (!token_count)
+      {
+        log_error ("invalid value for %s: '%s'\n", envname, value);
+        return gpg_error (GPG_ERR_INV_VALUE);
+      }
+
+    pick_idx = want_idx % token_count;
+    tok_start = NULL;
+    tok_idx = 0;
+    p = value;
+    while (*p)
+      {
+        while (*p && (isspace ((unsigned char)*p) || *p == ','))
+          p++;
+        if (!*p)
+          break;
+        if (tok_idx == pick_idx)
+          {
+            tok_start = p;
+            while (*p && !isspace ((unsigned char)*p) && *p != ',')
+              p++;
+            tok_len = (size_t)(p - tok_start);
+            break;
+          }
+        while (*p && !isspace ((unsigned char)*p) && *p != ',')
+          p++;
+        tok_idx++;
+      }
+
+    if (!tok_start || !tok_len)
+      {
+        log_error ("invalid value for %s: '%s'\n", envname, value);
+        return gpg_error (GPG_ERR_INV_VALUE);
+      }
+
+    if (tok_len >= sizeof numbuf)
+      {
+        log_error ("invalid value for %s: '%s'\n", envname, value);
+        return gpg_error (GPG_ERR_INV_VALUE);
+      }
+
+    memcpy (numbuf, tok_start, tok_len);
+    numbuf[tok_len] = 0;
+
+    errno = 0;
+    fdno = strtol (numbuf, &endp, 10);
+    if (errno || !endp || *endp || fdno < 0)
+      {
+        log_error ("invalid value for %s: '%s'\n", envname, value);
+        return gpg_error (GPG_ERR_INV_VALUE);
+      }
+
+    *next_slot = (pick_idx + 1) % token_count;
+
+    if (wasm_trace_enabled ())
+      log_info ("[wasm-trace] %s: selected %s slot=%u fd=%ld\n",
+                printed_name, envname, pick_idx, fdno);
+  }
 
   if (wasm_trace_enabled ())
     log_info ("[wasm-trace] %s: attempting assuan_socket_connect_fd fd=%ld flags=0x%x\n",

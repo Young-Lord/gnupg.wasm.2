@@ -23,11 +23,13 @@ function usage() {
       '  --node PATH           Explicit node binary for wasm launchers',
       '  --agent PATH          Explicit gpg-agent launcher path',
       '  --dirmngr-shim PATH   Explicit dirmngr fetch shim script path',
+      '  --scdaemon PATH       Explicit scdaemon launcher path',
       '  --keyserver URI       Default keyserver for dirmngr shim',
       '  --homedir PATH        Explicit GNUPGHOME for this invocation',
       '  --raw                 Do not inject default gpg flags',
       '  --no-agent-bridge     Disable GNUPG_WASM_AGENT_FD bridge',
       '  --no-dirmngr-bridge   Disable GNUPG_WASM_DIRMNGR_FD bridge',
+      '  --no-scdaemon-bridge  Disable GNUPG_WASM_SCDAEMON_FD bridge',
       '  --help                Show this help text',
       '',
       'Default injected gpg flags (unless --raw):',
@@ -43,11 +45,13 @@ function parseArgs(argv, defaults) {
     gpgBin: defaults.gpgBin,
     agentBin: defaults.agentBin,
     dirmngrShim: defaults.dirmngrShim,
+    scdaemonBin: defaults.scdaemonBin,
     homedir: defaults.homedir,
     keyserver: process.env.GNUPG_WASM_KEYSERVER || 'hkps://keys.openpgp.org',
     rawMode: false,
     useAgentBridge: true,
     useDirmngrBridge: true,
+    useScdaemonBridge: true,
     gpgArgs: [],
   };
 
@@ -83,6 +87,10 @@ function parseArgs(argv, defaults) {
         out.dirmngrShim = argv[i + 1] || '';
         i += 2;
         break;
+      case '--scdaemon':
+        out.scdaemonBin = argv[i + 1] || '';
+        i += 2;
+        break;
       case '--keyserver':
         out.keyserver = argv[i + 1] || out.keyserver;
         i += 2;
@@ -101,6 +109,10 @@ function parseArgs(argv, defaults) {
         break;
       case '--no-dirmngr-bridge':
         out.useDirmngrBridge = false;
+        i += 1;
+        break;
+      case '--no-scdaemon-bridge':
+        out.useScdaemonBridge = false;
         i += 1;
         break;
       case '--help':
@@ -189,6 +201,7 @@ async function main() {
     gpgBin: process.env.GPG_BIN || path.join(wasmPrefix, 'bin', 'gpg'),
     agentBin: process.env.GPG_AGENT_BIN || path.join(wasmPrefix, 'bin', 'gpg-agent'),
     dirmngrShim: process.env.GPG_DIRMNGR_SHIM || path.join(scriptDir, 'dirmngr-fetch-shim.mjs'),
+    scdaemonBin: process.env.SCDAEMON_BIN || path.join(wasmPrefix, 'libexec', 'scdaemon'),
     homedir: process.env.GPG_CLI_HOME || path.join(wasmBuildDir, 'cli-node', 'gnupghome'),
   };
 
@@ -205,11 +218,17 @@ async function main() {
   if (!existsSync(options.gpgBin)) {
     throw new Error(`Given gpg path does not exist: ${options.gpgBin}`);
   }
+  if (!options.useAgentBridge) {
+    options.useScdaemonBridge = false;
+  }
   if (options.useAgentBridge && !existsSync(options.agentBin)) {
     throw new Error(`Given gpg-agent path does not exist: ${options.agentBin}`);
   }
   if (options.useDirmngrBridge && !existsSync(options.dirmngrShim)) {
     throw new Error(`Given dirmngr shim path does not exist: ${options.dirmngrShim}`);
+  }
+  if (options.useScdaemonBridge && !existsSync(options.scdaemonBin)) {
+    throw new Error(`Given scdaemon path does not exist: ${options.scdaemonBin}`);
   }
 
   mkdirSync(options.homedir, { recursive: true });
@@ -237,6 +256,13 @@ async function main() {
   if (options.useAgentBridge) {
     gpgStdio.push('pipe');
     env.GNUPG_WASM_AGENT_FD = String(nextFd);
+    extraFds.push(nextFd);
+    nextFd += 1;
+  }
+
+  if (options.useScdaemonBridge) {
+    gpgStdio.push('pipe');
+    env.GNUPG_WASM_SCDAEMON_FD = String(nextFd);
     extraFds.push(nextFd);
     nextFd += 1;
   }
@@ -280,7 +306,6 @@ async function main() {
         options.agentBin,
         '--server',
         '--homedir', options.homedir,
-        '--disable-scdaemon',
       ],
       {
         stdio: ['pipe', 'pipe', 'inherit'],
@@ -294,6 +319,34 @@ async function main() {
     bridgeStreamToChild(agentBridge, agentProc);
     bridgeStreams.push(agentBridge);
     serviceProcesses.push(agentProc);
+    bridgeFd += 1;
+  }
+
+  if (options.useScdaemonBridge) {
+    const scdaemonBridge = gpgProc.stdio[bridgeFd];
+    if (!scdaemonBridge) {
+      throw new Error(`Missing bridge stream for fd ${bridgeFd}`);
+    }
+
+    const scdaemonProc = spawn(
+      options.nodeBin,
+      [
+        options.scdaemonBin,
+        '--multi-server',
+        '--homedir', options.homedir,
+      ],
+      {
+        stdio: ['pipe', 'pipe', 'inherit'],
+        env: {
+          ...process.env,
+          GNUPGHOME: options.homedir,
+        },
+      }
+    );
+
+    bridgeStreamToChild(scdaemonBridge, scdaemonProc);
+    bridgeStreams.push(scdaemonBridge);
+    serviceProcesses.push(scdaemonProc);
     bridgeFd += 1;
   }
 

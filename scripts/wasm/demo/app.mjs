@@ -28,6 +28,7 @@ const el = {
   keyserverQuery: document.querySelector('#keyserverQuery'),
 
   rawCommand: document.querySelector('#rawCommand'),
+  stdinPreset: document.querySelector('#stdinPreset'),
   console: document.querySelector('#console'),
 
   btnPing: document.querySelector('#btnPing'),
@@ -58,11 +59,18 @@ const el = {
   pinentryInput: document.querySelector('#pinentryInput'),
   pinentryCancel: document.querySelector('#pinentryCancel'),
   pinentrySubmit: document.querySelector('#pinentrySubmit'),
+
+  stdinDialog: document.querySelector('#stdinDialog'),
+  stdinMeta: document.querySelector('#stdinMeta'),
+  stdinInput: document.querySelector('#stdinInput'),
+  stdinCancel: document.querySelector('#stdinCancel'),
+  stdinSubmit: document.querySelector('#stdinSubmit'),
 };
 
 let fsState = null;
 let running = false;
 let pinentryResolver = null;
+let stdinResolver = null;
 let gpgClient = null;
 let gpgClientKey = '';
 
@@ -498,6 +506,77 @@ function parseArgLine(line) {
   return out;
 }
 
+function readStdinPresetText() {
+  if (!el.stdinPreset || typeof el.stdinPreset.value !== 'string') {
+    return '';
+  }
+  const value = el.stdinPreset.value;
+  if (!value) {
+    return '';
+  }
+  return value.endsWith('\n') ? value : `${value}\n`;
+}
+
+function promptStdinText(request) {
+  return new Promise((resolve) => {
+    if (stdinResolver) {
+      stdinResolver({ eof: true });
+      stdinResolver = null;
+    }
+
+    stdinResolver = resolve;
+    const details = [];
+    if (request && typeof request.id === 'string' && request.id) {
+      details.push(`id=${request.id}`);
+    }
+    if (request && typeof request.prompt === 'string' && request.prompt) {
+      details.push(request.prompt);
+    }
+    if (request && Array.isArray(request.args) && request.args.length) {
+      details.push(`gpg ${request.args.join(' ')}`);
+    }
+    el.stdinMeta.textContent = details.join(' | ');
+    el.stdinInput.value = '';
+
+    if (!el.stdinDialog.open) {
+      el.stdinDialog.showModal();
+    }
+
+    appendConsole('note', '[stdin] waiting for manual input in dialog');
+    el.stdinInput.focus();
+    el.stdinInput.select();
+  });
+}
+
+function settleStdin(ok) {
+  if (!stdinResolver) {
+    if (el.stdinDialog.open) {
+      el.stdinDialog.close();
+    }
+    return;
+  }
+
+  const resolve = stdinResolver;
+  stdinResolver = null;
+
+  if (!ok) {
+    appendConsole('note', '[stdin] user sent EOF');
+    if (el.stdinDialog.open) {
+      el.stdinDialog.close();
+    }
+    resolve({ eof: true });
+    return;
+  }
+
+  const raw = el.stdinInput.value;
+  const line = raw.endsWith('\n') ? raw : `${raw}\n`;
+  appendConsole('note', `[stdin] user input submitted (${line.length} chars)`);
+  if (el.stdinDialog.open) {
+    el.stdinDialog.close();
+  }
+  resolve(line);
+}
+
 function setRunningUi(isRunning) {
   running = isRunning;
   const runButtons = document.querySelectorAll('.run-action');
@@ -542,7 +621,7 @@ async function promptPinentry(request) {
 
   appendConsole(
     'note',
-    `[pinentry] request id=${request.id} op=${request.op} auto=${String(autoEnabled)} defaultPassphrase=${defaultPassphrase ? 'set' : 'empty'}`
+    `[pinentry] request id=${request.id} op=${request.op} prompt=${request.prompt || 'passphrase.enter'} auto=${String(autoEnabled)} defaultPassphrase=${defaultPassphrase ? 'set' : 'empty'}`
   );
 
   if (autoEnabled) {
@@ -560,6 +639,7 @@ async function promptPinentry(request) {
     pinentryResolver = resolve;
     const details = [
       `op=${request.op || 'passphrase'}`,
+      `prompt=${request.prompt || 'passphrase.enter'}`,
       `uid=${request.uidHint || '-'}`,
       `key=${request.keyHint || '-'}`,
     ];
@@ -705,6 +785,14 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
       emitStatus: true,
       debug: true,
       runTimeoutMs,
+      onInputRequest: (request) => {
+        const preset = readStdinPresetText();
+        if (preset) {
+          appendConsole('note', `[stdin] feeding preset (${preset.length} chars)`);
+          return preset;
+        }
+        return promptStdinText(request);
+      },
       onStdout: (line) => {
         appendConsole('stdout', `[stdout] ${String(line ?? '')}`);
       },
@@ -1158,6 +1246,26 @@ function bindEvents() {
   el.pinentryDialog.addEventListener('cancel', (event) => {
     event.preventDefault();
     settlePinentry(false);
+  });
+
+  el.stdinSubmit.addEventListener('click', () => {
+    settleStdin(true);
+  });
+
+  el.stdinCancel.addEventListener('click', () => {
+    settleStdin(false);
+  });
+
+  el.stdinInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      settleStdin(true);
+    }
+  });
+
+  el.stdinDialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    settleStdin(false);
   });
 }
 

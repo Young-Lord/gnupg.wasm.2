@@ -11,7 +11,7 @@ usage() {
 Usage: scripts/wasm/build-deps.sh [options]
 
 Build wasm dependency stack into PLAY/wasm-prefix:
-  libgpg-error -> npth -> libgcrypt -> libassuan -> libksba
+  libusb -> libgpg-error -> npth -> libgcrypt -> libassuan -> libksba
 
 Options:
   --clean          Remove dependency build directories and rebuild.
@@ -101,11 +101,13 @@ if [[ "$CLEAN" -eq 1 ]]; then
   wasm_info "Cleaning dependency build directories"
   rm -rf \
     "$WASM_BUILD_DIR/libgpg-error" \
+    "$WASM_BUILD_DIR/libusb" \
     "$WASM_BUILD_DIR/npth" \
     "$WASM_BUILD_DIR/libgcrypt" \
     "$WASM_BUILD_DIR/libassuan" \
     "$WASM_BUILD_DIR/libksba" \
     "$STAMP_DIR/libgpg-error" \
+    "$STAMP_DIR/libusb" \
     "$STAMP_DIR/npth" \
     "$STAMP_DIR/libgcrypt" \
     "$STAMP_DIR/libassuan" \
@@ -166,7 +168,56 @@ build_autotools_pkg() {
   touch "$stamp_file"
 }
 
+build_libusb() {
+  local pkg="libusb"
+  local src_dir="$GNUPG_WASM_REPO_ROOT/../libusb-1.0.29"
+  local build_dir="$WASM_BUILD_DIR/$pkg"
+  local log_file="$WASM_LOG_DIR/$pkg.log"
+  local stamp_file="$STAMP_DIR/$pkg"
+
+  if [[ ! -d "$src_dir" ]]; then
+    wasm_die "Missing libusb source directory: $src_dir"
+  fi
+
+  if [[ ! -x "$src_dir/configure" ]]; then
+    wasm_die "Missing configure script for libusb at $src_dir/configure"
+  fi
+
+  if [[ "$FORCE" -eq 0 && -f "$stamp_file" ]]; then
+    wasm_info "Skipping libusb (already built; use --force to rebuild)"
+    return
+  fi
+
+  rm -rf "$build_dir"
+  mkdir -p "$build_dir"
+
+  wasm_info "Configuring libusb"
+  {
+    echo "== configure libusb =="
+    (
+      cd "$build_dir"
+      emconfigure "$src_dir/configure" \
+        --host="$WASM_HOST" \
+        --build="$WASM_BUILD_TRIPLET" \
+        --prefix="$WASM_PREFIX" \
+        --enable-static \
+        --disable-shared \
+        --disable-udev
+    )
+
+    echo "== build libusb =="
+    emmake make -C "$build_dir" -j"$WASM_JOBS"
+
+    echo "== install libusb =="
+    emmake make -C "$build_dir" install
+  } 2>&1 | tee "$log_file"
+
+  touch "$stamp_file"
+}
+
 ensure_libgpg_error_lock_header
+
+build_libusb
 
 build_autotools_pkg \
   libgpg-error \

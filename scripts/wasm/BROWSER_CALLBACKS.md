@@ -20,7 +20,8 @@ COOP/COEP headers (`Cross-Origin-Opener-Policy: same-origin`,
   - `scripts/wasm/gpg-browser-client.mjs`
 - Loopback pinentry callback model (no external pinentry process):
   - enforced flags: `--batch --no-tty --pinentry-mode loopback`
-  - passphrase injection via temporary MEMFS file (`--passphrase-file`)
+  - always uses `--command-fd 0`
+  - passphrase is supplied on demand via stdin callback flow (status-driven `GET_HIDDEN`)
 - Output callbacks:
   - `onStdout(data)`
   - `onStderr(data)`
@@ -43,10 +44,13 @@ COOP/COEP headers (`Cross-Origin-Opener-Policy: same-origin`,
 
 ## Pinentry callback protocol
 
-- Request from worker:
-  - `{ type: 'pinentry-request', id, op, uidHint, keyHint }`
-- Response from host:
-  - `{ type: 'pinentry-response', id, ok, passphrase }`
+- Worker emits `stdin-request` with prompt hint from status lines (for example
+  `GET_HIDDEN passphrase.enter`).
+- `WasmGpgBrowserClient` routes `GET_HIDDEN` requests to `onPinentry(request)` when provided.
+- Callback reply is written back into the shared stdin queue:
+  - `ok: true` -> passphrase + newline
+  - `ok: false` -> cancel with EOF (`Ctrl-D`)
+- This mirrors CLI loopback flow and allows GnuPG to control retry/repeat behavior.
 
 ## Example
 

@@ -66,7 +66,6 @@ Date: 2026-02-11
     - in-memory multi-command persistence via `fsState` snapshot roundtrip
 
 - Known caveats:
-  - `scdaemon` is still unavailable in this wasm profile (smartcard paths log warnings)
   - keyserver behavior depends on selected server and key availability
   - browser worker path is currently baseline transport only (agent/dirmngr browser channels pending)
   - browser persistence is host-memory only (`fsState` snapshot), no IDBFS persistence yet
@@ -74,7 +73,7 @@ Date: 2026-02-11
 ## Important profile limits
 
 - The wasm configure profile still disables native daemons/components:
-  - `dirmngr`, `keyboxd`, `scdaemon`, `tpm2d`, `gpgsm`, `g13`
+  - `dirmngr`, `keyboxd`, `tpm2d`, `gpgsm`, `g13`
   - LDAP/libdns/TLS native dirmngr stack
   - several optional compression/helper features
 - Current strategy is to provide Node-side bridge/shim services for missing runtime IPC features.

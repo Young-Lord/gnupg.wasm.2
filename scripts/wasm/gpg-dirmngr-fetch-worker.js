@@ -2,9 +2,35 @@
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+let debugEnabled = false;
+let traceCounter = 0;
+let activeSession = null;
 
 function postError(message) {
   postMessage({ type: 'error', message: String(message || 'unknown dirmngr worker error') });
+}
+
+function shortText(value, limit = 260) {
+  const text = String(value || '').replace(/\s+/g, ' ');
+  if (text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, limit)}...`;
+}
+
+function postDebug(step, data = null) {
+  if (!debugEnabled) {
+    return;
+  }
+  traceCounter += 1;
+  postMessage({
+    type: 'debug',
+    step,
+    data: {
+      seq: traceCounter,
+      ...(data && typeof data === 'object' ? data : { value: data }),
+    },
+  });
 }
 
 function normalizeKeyserver(input) {
@@ -224,7 +250,18 @@ function createProtocol(bridge) {
 
 async function fetchLookup(server, op, search) {
   const url = makeLookupUrl(server, op, normalizeLegacySearchTerm(search));
+  postDebug('fetch.lookup.begin', {
+    op,
+    search: shortText(search, 120),
+    url,
+  });
   const response = await fetch(url, { redirect: 'follow' });
+  postDebug('fetch.lookup.response', {
+    op,
+    status: response.status,
+    statusText: response.statusText,
+    url,
+  });
   if (!response.ok) {
     let detail = '';
     try {
@@ -238,20 +275,46 @@ async function fetchLookup(server, op, search) {
     const hint = response.status === 400
       ? ' (bad request: query may be invalid for this keyserver)'
       : '';
+    postDebug('fetch.lookup.error', {
+      op,
+      status: response.status,
+      statusText: response.statusText,
+      detail,
+      url,
+    });
     throw new Error(`${op} failed: ${response.status} ${response.statusText}${hint}${detail ? `: ${detail}` : ''}`);
   }
-  return new Uint8Array(await response.arrayBuffer());
+  const body = new Uint8Array(await response.arrayBuffer());
+  postDebug('fetch.lookup.done', {
+    op,
+    bytes: body.length,
+    url,
+  });
+  return body;
 }
 
 async function fetchDirect(urlValue) {
   const url = decodePercentPlus(urlValue);
+  postDebug('fetch.direct.begin', {
+    url,
+  });
   const response = await fetch(url, { redirect: 'follow' });
+  postDebug('fetch.direct.response', {
+    status: response.status,
+    statusText: response.statusText,
+    url,
+  });
   if (!response.ok) {
     throw new Error(`fetch failed: ${response.status} ${response.statusText}`);
   }
+  const body = new Uint8Array(await response.arrayBuffer());
+  postDebug('fetch.direct.done', {
+    bytes: body.length,
+    url,
+  });
   return {
     source: url,
-    body: new Uint8Array(await response.arrayBuffer()),
+    body,
   };
 }
 
@@ -259,14 +322,19 @@ async function processCommand(line, state, proto) {
   const splitAt = line.indexOf(' ');
   const command = (splitAt === -1 ? line : line.slice(0, splitAt)).toUpperCase();
   const argText = splitAt === -1 ? '' : line.slice(splitAt + 1).trim();
+  postDebug('assuan.command', {
+    command,
+    arg: shortText(argText, 160),
+  });
 
   if (command === 'BYE') {
     proto.sendOk('closing connection');
-    return { close: true };
+    postDebug('assuan.bye', {});
+    return { resetSession: true };
   }
   if (command === 'RESET' || command === 'OPTION') {
     proto.sendOk();
-    return { close: false };
+    return { resetSession: false };
   }
   if (command === 'GETINFO') {
     const key = argText.toLowerCase();
@@ -279,13 +347,13 @@ async function processCommand(line, state, proto) {
     } else {
       proto.sendErr('Unknown GETINFO key');
     }
-    return { close: false };
+    return { resetSession: false };
   }
   if (command === 'KEYSERVER') {
     if (!argText) {
       proto.sendStatus('KEYSERVER', state.keyservers[0]);
       proto.sendOk();
-      return { close: false };
+      return { resetSession: false };
     }
     const tokens = splitTokens(argText);
     const clearIdx = tokens.indexOf('--clear');
@@ -299,29 +367,40 @@ async function processCommand(line, state, proto) {
     if (!state.keyservers.length) {
       state.keyservers.push('https://keys.openpgp.org');
     }
+    postDebug('keyserver.set', {
+      keyservers: state.keyservers.slice(),
+    });
     proto.sendOk();
-    return { close: false };
+    return { resetSession: false };
   }
   if (command === 'KS_SEARCH') {
     const { values } = parseDelimitedArgs(argText);
     if (!values.length) {
       proto.sendErr('KS_SEARCH requires a query');
-      return { close: false };
+      return { resetSession: false };
     }
     const source = state.keyservers[0];
+    postDebug('ks.search', {
+      source,
+      query: shortText(values.join(' '), 140),
+    });
     const body = await fetchLookup(source, 'index', values.join(' '));
     proto.sendStatus('SOURCE', source);
     proto.sendDataBuffer(body);
     proto.sendOk();
-    return { close: false };
+    return { resetSession: false };
   }
   if (command === 'KS_GET') {
     const { values } = parseDelimitedArgs(argText);
     if (!values.length) {
       proto.sendErr('KS_GET requires at least one pattern');
-      return { close: false };
+      return { resetSession: false };
     }
     const source = state.keyservers[0];
+    postDebug('ks.get', {
+      source,
+      patterns: values.map((value) => shortText(value, 80)),
+    });
     proto.sendStatus('SOURCE', source);
     const blocks = [];
     for (const pattern of values) {
@@ -340,42 +419,67 @@ async function processCommand(line, state, proto) {
     }
     proto.sendDataBuffer(out);
     proto.sendOk();
-    return { close: false };
+    return { resetSession: false };
   }
   if (command === 'KS_FETCH') {
     const { values } = parseDelimitedArgs(argText);
     if (!values.length) {
       proto.sendErr('KS_FETCH requires a URL');
-      return { close: false };
+      return { resetSession: false };
     }
     const result = await fetchDirect(values.join(' '));
+    postDebug('ks.fetch', {
+      source: result.source,
+      bytes: result.body.length,
+    });
     proto.sendStatus('SOURCE', result.source);
     proto.sendDataBuffer(result.body);
     proto.sendOk();
-    return { close: false };
+    return { resetSession: false };
   }
 
   proto.sendErr(`Unsupported command: ${command}`);
-  return { close: false };
+  postDebug('assuan.unsupported', {
+    command,
+    arg: shortText(argText, 160),
+  });
+  return { resetSession: false };
 }
 
 async function runBridge(message) {
+  debugEnabled = Boolean(message && message.debug === true);
+  traceCounter = 0;
   const bridge = {
     gpgToDirmngr: createSharedQueue(message.bridge && message.bridge.gpgToDirmngr),
     dirmngrToGpg: createSharedQueue(message.bridge && message.bridge.dirmngrToGpg),
   };
+  postDebug('bridge.start', {
+    gpgToDirmngrSize: bridge.gpgToDirmngr.data.length,
+    dirmngrToGpgSize: bridge.dirmngrToGpg.data.length,
+  });
   const proto = createProtocol(bridge);
   const state = {
     keyservers: [normalizeKeyserver('hkps://keys.openpgp.org')],
   };
 
-  proto.sendOk('Dirmngr fetch shim ready');
+  const sendGreeting = () => {
+    postDebug('assuan.greeting', {
+      keyserver: state.keyservers[0],
+    });
+    proto.sendOk('Dirmngr fetch shim ready');
+  };
+
+  activeSession = {
+    sendGreeting,
+    state,
+  };
+
+  sendGreeting();
   postMessage({ type: 'ready' });
 
-  let closed = false;
   let lineBytes = [];
 
-  while (!closed) {
+  while (true) {
     const byteValue = queuePopByte(bridge.gpgToDirmngr, true);
     if (byteValue === null) {
       break;
@@ -396,15 +500,27 @@ async function runBridge(message) {
     if (!line) {
       continue;
     }
+    postDebug('assuan.rx-line', {
+      line: shortText(line, 180),
+    });
 
     try {
       const result = await processCommand(line, state, proto);
-      closed = Boolean(result && result.close);
+      if (result && result.resetSession) {
+        postDebug('assuan.session-reset', {});
+        sendGreeting();
+      }
     } catch (error) {
+      postDebug('assuan.command-error', {
+        error: error instanceof Error ? error.message : String(error),
+        line: shortText(line, 180),
+      });
       proto.sendErr(error instanceof Error ? error.message : String(error));
     }
   }
 
+  postDebug('bridge.stop', {});
+  activeSession = null;
   queueClose(bridge.gpgToDirmngr);
   queueClose(bridge.dirmngrToGpg);
   postMessage({ type: 'result', exitCode: 0 });
@@ -415,8 +531,21 @@ self.addEventListener('message', (event) => {
   if (!message || typeof message !== 'object') {
     return;
   }
+  if (message.type === 'session-reset') {
+    if (activeSession && typeof activeSession.sendGreeting === 'function') {
+      postDebug('assuan.session-reset.external', {
+        reason: shortText(message.reason || 'external-reset', 80),
+      });
+      activeSession.sendGreeting();
+    }
+    return;
+  }
   if (message.type === 'start') {
     void runBridge(message).catch((error) => {
+      activeSession = null;
+      postDebug('bridge.fatal', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       postError(error instanceof Error ? error.message : String(error));
       postMessage({ type: 'result', exitCode: 1, error: error instanceof Error ? error.message : String(error) });
       self.close();

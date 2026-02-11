@@ -2,9 +2,7 @@
 
 const STATUS_PREFIX = '[GNUPG:]';
 let runInProgress = false;
-let pinentryCounter = 0;
-const pendingPinentry = new Map();
-const PINENTRY_TIMEOUT_MS = 120000;
+let stdinPromptHint = '';
 const SUPPRESSED_DEBUG_STEPS = new Set([
   'run.finish',
   'run.callMain.return',
@@ -127,15 +125,6 @@ function splitAtOptionTerminator(args) {
   };
 }
 
-function hasOption(args, optionName) {
-  for (const arg of args) {
-    if (arg === optionName || arg.startsWith(`${optionName}=`)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function removeOption(args, optionName, expectsValue) {
   const out = [];
   for (let i = 0; i < args.length; i += 1) {
@@ -154,14 +143,6 @@ function removeOption(args, optionName, expectsValue) {
   return out;
 }
 
-function hasAnyPassphraseOption(args) {
-  return [
-    '--passphrase',
-    '--passphrase-file',
-    '--passphrase-fd',
-  ].some((name) => hasOption(args, name));
-}
-
 function includesAnyOption(args, optionNames) {
   for (const arg of args) {
     for (const optionName of optionNames) {
@@ -171,53 +152,6 @@ function includesAnyOption(args, optionNames) {
     }
   }
   return false;
-}
-
-function findOptionValue(args, optionNames) {
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    for (const optionName of optionNames) {
-      if (arg === optionName) {
-        return i + 1 < args.length ? args[i + 1] : '';
-      }
-      if (arg.startsWith(`${optionName}=`)) {
-        return arg.slice(optionName.length + 1);
-      }
-    }
-  }
-  return '';
-}
-
-function inferPinentryOperation(args) {
-  if (includesAnyOption(args, ['--quick-generate-key', '--quick-gen-key', '--generate-key', '--gen-key', '--full-generate-key'])) {
-    return 'generate-key';
-  }
-  if (includesAnyOption(args, ['--sign', '--clearsign', '--detach-sign'])) {
-    return 'sign';
-  }
-  if (includesAnyOption(args, ['--decrypt'])) {
-    return 'decrypt';
-  }
-  if (includesAnyOption(args, ['--symmetric'])) {
-    return 'symmetric';
-  }
-  return 'passphrase';
-}
-
-function inferPinentryHints(args, pinentryConfig) {
-  const uidHint =
-    (typeof pinentryConfig.uidHint === 'string' && pinentryConfig.uidHint)
-      || findOptionValue(args, ['--local-user', '--default-key']);
-  const keyHint =
-    (typeof pinentryConfig.keyHint === 'string' && pinentryConfig.keyHint)
-      || findOptionValue(args, ['--default-key', '--local-user']);
-  return {
-    op:
-      (typeof pinentryConfig.op === 'string' && pinentryConfig.op)
-      || inferPinentryOperation(args),
-    uidHint: uidHint || '',
-    keyHint: keyHint || '',
-  };
 }
 
 function operationLikelyNeedsPinentry(args) {
@@ -236,65 +170,6 @@ function operationLikelyNeedsPinentry(args) {
     '--symmetric',
     '--decrypt',
   ]);
-}
-
-function shouldRequestPinentry(args, pinentryConfig) {
-  if (!pinentryConfig || pinentryConfig.enabled === false) {
-    return false;
-  }
-  if (pinentryConfig.always === true) {
-    return true;
-  }
-  return operationLikelyNeedsPinentry(args);
-}
-
-function pinentryRequestCount(args) {
-  if (includesAnyOption(args, ['--symmetric'])) {
-    return 2;
-  }
-  return 1;
-}
-
-function requestPinentry(args, pinentryConfig, overrides = null) {
-  const id = `pinentry-${Date.now()}-${(pinentryCounter += 1)}`;
-  const hints = inferPinentryHints(args, pinentryConfig);
-  if (overrides && typeof overrides === 'object') {
-    if (typeof overrides.op === 'string' && overrides.op) {
-      hints.op = overrides.op;
-    }
-    if (typeof overrides.uidHint === 'string') {
-      hints.uidHint = overrides.uidHint;
-    }
-    if (typeof overrides.keyHint === 'string') {
-      hints.keyHint = overrides.keyHint;
-    }
-  }
-  postDebug('run.pinentry.request', {
-    id,
-    op: hints.op,
-    uidHint: hints.uidHint,
-    keyHint: hints.keyHint,
-  });
-  postMessage({
-    type: 'pinentry-request',
-    id,
-    op: hints.op,
-    uidHint: hints.uidHint,
-    keyHint: hints.keyHint,
-  });
-
-  return new Promise((resolve) => {
-    const timeoutId = setTimeout(() => {
-      pendingPinentry.delete(id);
-      postDebug('run.pinentry.timeout', { id, timeoutMs: PINENTRY_TIMEOUT_MS });
-      resolve({ ok: false, passphrase: '' });
-    }, PINENTRY_TIMEOUT_MS);
-
-    pendingPinentry.set(id, (value) => {
-      clearTimeout(timeoutId);
-      resolve(value);
-    });
-  });
 }
 
 function parentDirectory(pathValue) {
@@ -320,30 +195,6 @@ function ensureDirectory(FS, dirPath) {
         throw new Error(`unable to create directory: ${current}`);
       }
     }
-  }
-}
-
-function writePassphraseFile(FS, filePath, passphrase) {
-  ensureDirectory(FS, parentDirectory(filePath));
-  FS.writeFile(filePath, `${passphrase}\n`);
-  try {
-    FS.chmod(filePath, 0o600);
-  } catch {
-    /* Best-effort permission fixup. */
-  }
-}
-
-function scrubPassphraseFile(FS, filePath) {
-  if (!filePath) {
-    return;
-  }
-  try {
-    if (FS.analyzePath(filePath).exists) {
-      FS.writeFile(filePath, '\n');
-      FS.unlink(filePath);
-    }
-  } catch {
-    /* Best effort cleanup. */
   }
 }
 
@@ -497,6 +348,9 @@ function buildFinalArgs(inputArgs, options) {
   if (options.emitStatus) {
     base = removeOption(base, '--status-fd', true);
   }
+  if (options.commandFdStdin) {
+    base = removeOption(base, '--command-fd', true);
+  }
 
   const enforced = [];
 
@@ -504,20 +358,30 @@ function buildFinalArgs(inputArgs, options) {
     enforced.push('--homedir', options.homedir);
   }
 
-  enforced.push('--batch', '--no-tty', '--pinentry-mode', 'loopback', '--no-autostart');
+  if (options.forceBatch !== false) {
+    enforced.push('--batch', '--no-tty');
+  }
+  enforced.push('--pinentry-mode', 'loopback', '--no-autostart');
 
   if (options.emitStatus) {
     enforced.push('--status-fd', '2');
   }
-
-  if (options.passphraseFile && !hasAnyPassphraseOption(base)) {
-    enforced.push('--passphrase-file', options.passphraseFile);
-    if (!hasOption(base, '--passphrase-repeat')) {
-      enforced.push('--passphrase-repeat', '0');
-    }
+  if (options.commandFdStdin) {
+    enforced.push('--command-fd', '0');
   }
 
   return [...enforced, ...base, ...tail];
+}
+
+function shouldForceBatchMode(args) {
+  if (includesAnyOption(args, ['--search-keys', '--search-key', '--edit-key', '--card-edit'])) {
+    return false;
+  }
+  return true;
+}
+
+function shouldUseCommandFd() {
+  return true;
 }
 
 function emitStderrAndStatus(line) {
@@ -533,6 +397,19 @@ function emitStderrAndStatus(line) {
     return;
   }
   const statusLine = text.slice(idx + STATUS_PREFIX.length).trimStart();
+  const firstSpaceIdx = statusLine.indexOf(' ');
+  const statusKeyword = firstSpaceIdx === -1 ? statusLine : statusLine.slice(0, firstSpaceIdx);
+  if (statusKeyword === 'GET_HIDDEN' || statusKeyword === 'GET_LINE' || statusKeyword === 'GET_BOOL') {
+    stdinPromptHint = statusLine;
+  } else if (
+    statusKeyword === 'GOT_IT'
+    || statusKeyword === 'GOOD_PASSPHRASE'
+    || statusKeyword === 'BAD_PASSPHRASE'
+    || statusKeyword === 'MISSING_PASSPHRASE'
+    || statusKeyword === 'CANCELED_BY_USER'
+  ) {
+    stdinPromptHint = '';
+  }
   if (self.__gnupg_stream_capture) {
     self.__gnupg_stream_capture.status.push(statusLine);
     self.__gnupg_stream_capture.metrics.statusLivePosted += 1;
@@ -811,6 +688,35 @@ async function handleRun(message) {
   runInProgress = true;
 
   const args = normalizeArgs(message.args);
+  const stdinText = typeof message.stdinText === 'string' ? message.stdinText : '';
+  const stdinBytes = new TextEncoder().encode(stdinText);
+  let stdinOffset = 0;
+  const stdinQueueDesc = message.stdinQueue && typeof message.stdinQueue === 'object'
+    ? message.stdinQueue
+    : null;
+  const stdinQueue = stdinQueueDesc ? createSharedQueue(stdinQueueDesc) : null;
+  stdinPromptHint = '';
+  let stdinRequestCounter = 0;
+  let stdinRequestPending = false;
+  const requestStdin = () => {
+    if (!stdinQueue || stdinRequestPending) {
+      return;
+    }
+    stdinRequestPending = true;
+    stdinRequestCounter += 1;
+    const prompt = stdinPromptHint || 'gpg is waiting for stdin';
+    postMessage({
+      type: 'stdin-request',
+      id: `stdin-${stdinRequestCounter}`,
+      prompt,
+      args,
+    });
+  };
+  if (stdinQueue && stdinBytes.length > 0) {
+    for (const value of stdinBytes) {
+      queuePushByte(stdinQueue, value, true);
+    }
+  }
   const homedir = normalizePath(message.homedir, '/gnupg');
   const emitStatus = message.emitStatus !== false;
   const gpgScriptUrl = typeof message.gpgScriptUrl === 'string' ? message.gpgScriptUrl : '';
@@ -818,6 +724,9 @@ async function handleRun(message) {
   const gpgAgentWorkerUrl = typeof message.gpgAgentWorkerUrl === 'string'
     ? message.gpgAgentWorkerUrl
     : new URL('./gpg-agent-server-worker.js', self.location.href).toString();
+  const gpgScdaemonWorkerUrl = typeof message.gpgScdaemonWorkerUrl === 'string'
+    ? message.gpgScdaemonWorkerUrl
+    : new URL('./gpg-scdaemon-server-worker.js', self.location.href).toString();
   const gpgDirmngrWorkerUrl = typeof message.gpgDirmngrWorkerUrl === 'string'
     ? message.gpgDirmngrWorkerUrl
     : new URL('./gpg-dirmngr-fetch-worker.js', self.location.href).toString();
@@ -827,12 +736,24 @@ async function handleRun(message) {
   let gpgAgentWasmUrl = typeof message.gpgAgentWasmUrl === 'string'
     ? message.gpgAgentWasmUrl
     : '';
+  let gpgScdaemonScriptUrl = typeof message.gpgScdaemonScriptUrl === 'string'
+    ? message.gpgScdaemonScriptUrl
+    : '';
+  let gpgScdaemonWasmUrl = typeof message.gpgScdaemonWasmUrl === 'string'
+    ? message.gpgScdaemonWasmUrl
+    : '';
 
   if (!gpgAgentScriptUrl && gpgScriptUrl) {
     gpgAgentScriptUrl = gpgScriptUrl.replace(/gpg(?:\.js)?(?=(?:[?#].*)?$)/, 'gpg-agent.js');
   }
   if (!gpgAgentWasmUrl && gpgWasmUrl) {
     gpgAgentWasmUrl = gpgWasmUrl.replace(/gpg\.wasm(?=(?:[?#].*)?$)/, 'gpg-agent.wasm');
+  }
+  if (!gpgScdaemonScriptUrl && gpgScriptUrl) {
+    gpgScdaemonScriptUrl = gpgScriptUrl.replace(/gpg(?:\.js)?(?=(?:[?#].*)?$)/, 'scdaemon.js');
+  }
+  if (!gpgScdaemonWasmUrl && gpgWasmUrl) {
+    gpgScdaemonWasmUrl = gpgWasmUrl.replace(/gpg\.wasm(?=(?:[?#].*)?$)/, 'scdaemon.wasm');
   }
 
   const debugEnabled = message.debug === true;
@@ -888,13 +809,18 @@ async function handleRun(message) {
   }
   postDebug('run.begin', {
     args,
+    stdinBytes: stdinBytes.length,
+    hasStdinQueue: Boolean(stdinQueue),
     homedir,
     emitStatus,
     gpgScriptUrl,
     gpgWasmUrl,
     gpgAgentWorkerUrl,
+    gpgScdaemonWorkerUrl,
     gpgAgentScriptUrl,
     gpgAgentWasmUrl,
+    gpgScdaemonScriptUrl,
+    gpgScdaemonWasmUrl,
     crossOriginIsolated: Boolean(self.crossOriginIsolated),
     hasSharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
   });
@@ -965,9 +891,6 @@ async function handleRun(message) {
     message.pinentry && typeof message.pinentry === 'object'
       ? message.pinentry
       : null;
-
-  let passphraseFile = '';
-  let passphraseValue = '';
   const stdoutWriter = makeFsLineWriter((line) => {
     streamCapture.stdout.push(line);
     streamCapture.metrics.stdoutLivePosted += 1;
@@ -978,12 +901,15 @@ async function handleRun(message) {
   }, 'fsStderrChars', 'fsStderrFlushes');
 
   const enableAgentBridge = message.enableAgentBridge !== false;
+  const dirmngrBridgePoolSize = Number.isFinite(message.dirmngrBridgePoolSize)
+    ? Math.max(1, Math.min(12, Number(message.dirmngrBridgePoolSize) | 0))
+    : 4;
   const sharedAgentBridge =
     message.sharedAgentBridge && typeof message.sharedAgentBridge === 'object'
       ? message.sharedAgentBridge
       : null;
   let agentBridge = null;
-  let dirmngrBridge = null;
+  let dirmngrBridges = [];
   let agentHeartbeatId = null;
 
   const createAgentBridge = () => {
@@ -1112,6 +1038,9 @@ async function handleRun(message) {
       type: 'start',
       gpgAgentScriptUrl,
       gpgAgentWasmUrl,
+      gpgScdaemonWorkerUrl,
+      gpgScdaemonScriptUrl,
+      gpgScdaemonWasmUrl,
       homedir,
       fsState: incomingFsState,
       persistRoots,
@@ -1449,6 +1378,23 @@ async function handleRun(message) {
       if (!messageData || typeof messageData !== 'object') {
         return;
       }
+      if (messageData.type === 'debug') {
+        const step = typeof messageData.step === 'string' ? messageData.step : 'unknown';
+        const data = messageData.data && typeof messageData.data === 'object'
+          ? messageData.data
+          : null;
+        postDebug(`dirmngr.${step}`, data);
+        if (debugEnabled) {
+          let text = '';
+          try {
+            text = data ? JSON.stringify(data) : '';
+          } catch {
+            text = '';
+          }
+          emitStderrAndStatus(`[dirmngr-trace] ${step}${text ? ` ${text}` : ''}`);
+        }
+        return;
+      }
       if (messageData.type === 'ready') {
         resolveReady(true);
         return;
@@ -1471,6 +1417,7 @@ async function handleRun(message) {
 
     worker.postMessage({
       type: 'start',
+      debug: debugEnabled,
       bridge: {
         gpgToDirmngr: gpgToDirmngrDesc,
         dirmngrToGpg: dirmngrToGpgDesc,
@@ -1499,6 +1446,13 @@ async function handleRun(message) {
           return;
         }
         queuePushByte(gpgToDirmngr, ch, true);
+      },
+      notifySessionReset(reason = 'fd-close') {
+        try {
+          worker.postMessage({ type: 'session-reset', reason });
+        } catch {
+          /* Worker may already be terminating. */
+        }
       },
       async awaitReady(timeoutMs) {
         let timeoutId = null;
@@ -1537,93 +1491,10 @@ async function handleRun(message) {
     };
   };
 
-  if (shouldRequestPinentry(args, pinentryConfig)) {
-    postDebug('run.pinentry.await', {
-      mode: pinentryConfig && pinentryConfig.always === true ? 'always' : 'heuristic',
-    });
-    const responses = [];
-    const requestCount = pinentryRequestCount(args);
-    for (let i = 0; i < requestCount; i += 1) {
-      const response = await requestPinentry(args, pinentryConfig, requestCount > 1
-        ? { op: i === 0 ? 'symmetric-passphrase' : 'symmetric-confirm' }
-        : null);
-      responses.push(response);
-    }
-    const response = responses[0] || { ok: false, passphrase: '' };
-    postDebug('run.pinentry.response', {
-      ok: Boolean(response && response.ok === true),
-      hasPassphrase: Boolean(response && typeof response.passphrase === 'string' && response.passphrase.length > 0),
-      responses: responses.length,
-    });
-    const ok = responses.every((item) => item && item.ok === true);
-    if (!ok) {
-      emitStderrAndStatus('[wasm] pinentry was cancelled by user callback');
-      postDebug('run.pinentry-cancelled', {});
-      postMessage({
-        type: 'result',
-        exitCode: 1,
-        fsState: incomingFsState,
-        stdoutLines: streamCapture.stdout,
-        stderrLines: streamCapture.stderr,
-        statusLines: streamCapture.status,
-        debugInfo: {
-          phase: 'pinentry-cancelled',
-          args,
-          homedir,
-          gpgScriptUrl,
-          gpgWasmUrl,
-          persistRoots,
-          streamMetrics: { ...streamCapture.metrics },
-        },
-      });
-      restoreConsole();
-      delete self.__gnupg_stream_capture;
-      delete self.__gnupg_debug_enabled;
-      self.close();
-      runInProgress = false;
-      return;
-    }
-
-    if (responses.length > 1) {
-      const first = typeof responses[0].passphrase === 'string'
-        ? responses[0].passphrase
-        : String(responses[0].passphrase ?? '');
-      const second = typeof responses[1].passphrase === 'string'
-        ? responses[1].passphrase
-        : String(responses[1].passphrase ?? '');
-      if (first !== second) {
-        emitStderrAndStatus('[wasm] pinentry mismatch: passphrase confirmation does not match');
-        postMessage({
-          type: 'result',
-          exitCode: 1,
-          fsState: incomingFsState,
-          stdoutLines: streamCapture.stdout,
-          stderrLines: streamCapture.stderr,
-          statusLines: streamCapture.status,
-          debugInfo: {
-            phase: 'pinentry-mismatch',
-            args,
-            homedir,
-            gpgScriptUrl,
-            gpgWasmUrl,
-            persistRoots,
-            streamMetrics: { ...streamCapture.metrics },
-          },
-        });
-        restoreConsole();
-        delete self.__gnupg_stream_capture;
-        delete self.__gnupg_debug_enabled;
-        self.close();
-        runInProgress = false;
-        return;
-      }
-    }
-
-    passphraseValue = typeof response.passphrase === 'string'
-      ? response.passphrase
-      : String(response.passphrase ?? '');
-    passphraseFile = `/tmp/.gnupg-pinentry-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}.txt`;
-  }
+  postDebug('run.pinentry.mode', {
+    enabled: Boolean(pinentryConfig && pinentryConfig.enabled !== false),
+    model: 'status-driven-stdin-callback',
+  });
 
   if (enableAgentBridge) {
     if (sharedAgentBridge) {
@@ -1641,8 +1512,11 @@ async function handleRun(message) {
       postDebug('run.agent.start', {
         mode: 'spawn',
         gpgAgentWorkerUrl,
+        gpgScdaemonWorkerUrl,
         gpgAgentScriptUrl,
         gpgAgentWasmUrl,
+        gpgScdaemonScriptUrl,
+        gpgScdaemonWasmUrl,
       });
       agentBridge = createAgentBridge();
     }
@@ -1666,20 +1540,40 @@ async function handleRun(message) {
   }
 
   try {
-    dirmngrBridge = createDirmngrBridge();
-    const dirmngrReady = await dirmngrBridge.awaitReady(8000);
-    postDebug('run.dirmngr.ready', { dirmngrReady });
-    if (!dirmngrReady) {
-      emitStderrAndStatus('[dirmngr] worker did not report ready within timeout');
+    const readyBridges = [];
+    for (let i = 0; i < dirmngrBridgePoolSize; i += 1) {
+      const bridge = createDirmngrBridge();
+      const dirmngrReady = await bridge.awaitReady(8000);
+      postDebug('run.dirmngr.ready', {
+        index: i,
+        dirmngrReady,
+      });
+      if (!dirmngrReady) {
+        emitStderrAndStatus(`[dirmngr] bridge[${i}] did not report ready within timeout`);
+        void bridge.shutdownAndWait(200).catch(() => null);
+        continue;
+      }
+      readyBridges.push(bridge);
+    }
+    dirmngrBridges = readyBridges;
+    if (!dirmngrBridges.length) {
+      emitStderrAndStatus('[dirmngr] no ready bridge; keyserver commands may hang or fail');
     }
   } catch (error) {
     postError(`failed to create dirmngr bridge: ${formatError(error)}`);
   }
 
+  const commandFdStdin = shouldUseCommandFd();
+  postDebug('run.command-fd.mode', {
+    enabled: commandFdStdin,
+    reason: 'forced-always',
+  });
+
   const finalArgs = buildFinalArgs(args, {
     homedir,
     emitStatus,
-    passphraseFile,
+    forceBatch: shouldForceBatchMode(args),
+    commandFdStdin,
   });
   postDebug('run.final-args', { finalArgs });
   const runTimeoutMs = Number.isFinite(message.runTimeoutMs)
@@ -1701,8 +1595,11 @@ async function handleRun(message) {
     gpgScriptUrl,
     gpgWasmUrl,
     gpgAgentWorkerUrl,
+    gpgScdaemonWorkerUrl,
     gpgAgentScriptUrl,
     gpgAgentWasmUrl,
+    gpgScdaemonScriptUrl,
+    gpgScdaemonWasmUrl,
     enableAgentBridge,
     agentBridgeActive: Boolean(agentBridge),
     persistRoots,
@@ -1828,21 +1725,7 @@ async function handleRun(message) {
     void postResult();
   };
 
-  const cleanupSecrets = () => {
-    if (!passphraseFile) {
-      return;
-    }
-    try {
-      const fs = getActiveFS();
-      if (fs) {
-        scrubPassphraseFile(fs, passphraseFile);
-      }
-    } catch {
-      /* Ignore cleanup errors. */
-    }
-    passphraseValue = '';
-    passphraseFile = '';
-  };
+  const cleanupSecrets = () => {};
 
   const handleGlobalError = (event) => {
     const reason = formatError(
@@ -1945,7 +1828,31 @@ async function handleRun(message) {
         }
 
         FS.init(
-          () => null,
+          () => {
+            if (stdinQueue) {
+              const immediate = queuePopByte(stdinQueue, false);
+              if (immediate !== undefined) {
+                if (immediate !== null) {
+                  stdinRequestPending = false;
+                  stdinPromptHint = '';
+                }
+                return immediate;
+              }
+              requestStdin();
+              const waited = queuePopByte(stdinQueue, true);
+              if (waited !== null) {
+                stdinRequestPending = false;
+                stdinPromptHint = '';
+              }
+              return waited;
+            }
+            if (stdinOffset >= stdinBytes.length) {
+              return null;
+            }
+            const value = stdinBytes[stdinOffset];
+            stdinOffset += 1;
+            return value;
+          },
           (ch) => stdoutWriter.write(ch),
           (ch) => stderrWriter.write(ch)
         );
@@ -2100,17 +2007,12 @@ async function handleRun(message) {
           delete envObj.GNUPG_WASM_AGENT_FD;
         }
 
-        if (dirmngrBridge && envObj) {
-          const devName = `gnupg-dirmngr-bridge-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
-          const devPath = `/dev/${devName}`;
+        if (dirmngrBridges.length && envObj) {
           try {
             if (!FS.registerDevice || !FS.mkdev || !FS.makedev) {
               throw new Error('FS device registration APIs are unavailable');
             }
 
-            const major = 64;
-            const minor = ((Date.now() + 17) % 200) + Math.floor(Math.random() * 50);
-            const dev = FS.makedev(major, minor);
             const POLLIN = 0x001;
             const POLLOUT = 0x004;
             const POLLHUP = 0x010;
@@ -2118,61 +2020,76 @@ async function handleRun(message) {
             const EAGAIN = errnoCodes && Number.isFinite(errnoCodes.EAGAIN)
               ? Number(errnoCodes.EAGAIN)
               : 6;
+            const fdList = [];
 
-            FS.registerDevice(dev, {
-              read(stream, buffer, offset, length) {
-                let count = 0;
-                while (count < length) {
-                  const byteValue = dirmngrBridge.readAvailableByte();
-                  if (byteValue === undefined || byteValue === null) {
-                    break;
+            for (let i = 0; i < dirmngrBridges.length; i += 1) {
+              const bridge = dirmngrBridges[i];
+              const devName = `gnupg-dirmngr-bridge-${i}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+              const devPath = `/dev/${devName}`;
+              const major = 65;
+              const minor = ((Date.now() + 17 + (i * 19)) % 220) + i;
+              const dev = FS.makedev(major, minor);
+
+              FS.registerDevice(dev, {
+                read(stream, buffer, offset, length) {
+                  let count = 0;
+                  while (count < length) {
+                    const byteValue = bridge.readAvailableByte();
+                    if (byteValue === undefined || byteValue === null) {
+                      break;
+                    }
+                    buffer[offset + count] = byteValue;
+                    count += 1;
+                    if (!bridge.hasReadableData()) {
+                      break;
+                    }
                   }
-                  buffer[offset + count] = byteValue;
-                  count += 1;
-                  if (!dirmngrBridge.hasReadableData()) {
-                    break;
+
+                  if (count === 0 && !bridge.isReadableClosed()) {
+                    throw new FS.ErrnoError(EAGAIN);
                   }
-                }
+                  return count;
+                },
+                write(stream, buffer, offset, length) {
+                  let count = 0;
+                  while (count < length) {
+                    bridge.writeByte(buffer[offset + count]);
+                    count += 1;
+                  }
+                  return count;
+                },
+                poll(stream, timeout, notifyCallback) {
+                  let mask = POLLOUT;
+                  if (bridge.hasReadableData()) {
+                    mask |= POLLIN;
+                  }
+                  if (bridge.isReadableClosed()) {
+                    mask |= POLLHUP;
+                  }
+                  if (mask === POLLOUT && typeof notifyCallback === 'function') {
+                    bridge.registerReadableHandler(notifyCallback);
+                  }
+                  return mask;
+                },
+                close() {
+                  bridge.notifySessionReset('fd-close');
+                },
+              });
 
-                if (count === 0 && !dirmngrBridge.isReadableClosed()) {
-                  throw new FS.ErrnoError(EAGAIN);
-                }
-                return count;
-              },
-              write(stream, buffer, offset, length) {
-                let count = 0;
-                while (count < length) {
-                  dirmngrBridge.writeByte(buffer[offset + count]);
-                  count += 1;
-                }
-                return count;
-              },
-              poll(stream, timeout, notifyCallback) {
-                let mask = POLLOUT;
-                if (dirmngrBridge.hasReadableData()) {
-                  mask |= POLLIN;
-                }
-                if (dirmngrBridge.isReadableClosed()) {
-                  mask |= POLLHUP;
-                }
-                if (mask === POLLOUT && typeof notifyCallback === 'function') {
-                  dirmngrBridge.registerReadableHandler(notifyCallback);
-                }
-                return mask;
-              },
-            });
+              FS.mkdev(devPath, 0o600, dev);
+              const stream = FS.open(devPath, 'r+');
+              fdList.push(stream.fd);
+            }
 
-            FS.mkdev(devPath, 0o600, dev);
-            const stream = FS.open(devPath, 'r+');
-            envObj.GNUPG_WASM_DIRMNGR_FD = String(stream.fd);
+            envObj.GNUPG_WASM_DIRMNGR_FD = fdList.join(',');
             postDebug('run.preRun.dirmngr-fd', {
-              devPath,
-              fd: stream.fd,
+              fds: fdList,
+              count: fdList.length,
             });
           } catch (error) {
             postError(`failed to create dirmngr bridge fd: ${formatError(error)}`);
           }
-        } else if (dirmngrBridge && !envObj) {
+        } else if (dirmngrBridges.length && !envObj) {
           postError('dirmngr bridge requested but ENV object is unavailable in runtime');
         } else if (envObj && envObj.GNUPG_WASM_DIRMNGR_FD) {
           delete envObj.GNUPG_WASM_DIRMNGR_FD;
@@ -2187,9 +2104,6 @@ async function handleRun(message) {
           FS.chmod(homedir, 0o700);
         } catch {
           /* Best-effort permission fixup. */
-        }
-        if (passphraseFile) {
-          writePassphraseFile(FS, passphraseFile, passphraseValue);
         }
       },
     ],
@@ -2243,18 +2157,17 @@ async function handleRun(message) {
     if (agentBridge && !didFinish) {
       void agentBridge.shutdownAndWait(300).catch(() => null);
     }
-    if (dirmngrBridge && !didFinish) {
-      void dirmngrBridge.shutdownAndWait(300).catch(() => null);
+    if (dirmngrBridges.length && !didFinish) {
+      for (const bridge of dirmngrBridges) {
+        void bridge.shutdownAndWait(300).catch(() => null);
+      }
     }
     self.removeEventListener('error', handleGlobalError);
     self.removeEventListener('unhandledrejection', handleUnhandledRejection);
     restoreConsole();
     delete self.__gnupg_stream_capture;
     delete self.__gnupg_debug_enabled;
-    for (const resolve of pendingPinentry.values()) {
-      resolve({ ok: false, passphrase: '' });
-    }
-    pendingPinentry.clear();
+    stdinPromptHint = '';
     runInProgress = false;
   }
 }
@@ -2266,20 +2179,9 @@ self.addEventListener('message', (event) => {
   }
 
   if (message.type === 'pinentry-response') {
-    postDebug('run.pinentry.response-message', {
+    postDebug('run.pinentry.response-message.ignored', {
       id: message.id,
-      ok: message.ok === true,
-      hasPassphrase: typeof message.passphrase === 'string' && message.passphrase.length > 0,
-    });
-    const resolve = pendingPinentry.get(message.id);
-    if (!resolve) {
-      postDebug('run.pinentry.response-unmatched', { id: message.id });
-      return;
-    }
-    pendingPinentry.delete(message.id);
-    resolve({
-      ok: message.ok === true,
-      passphrase: typeof message.passphrase === 'string' ? message.passphrase : '',
+      reason: 'pinentry is handled through status-driven stdin callbacks',
     });
     return;
   }

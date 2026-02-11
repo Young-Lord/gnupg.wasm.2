@@ -170,12 +170,19 @@
         <input id="rawCommand" type="text" value="--list-keys --keyid-format long" spellcheck="false">
         <button id="btnRunRaw" class="run-action">Run Raw Command</button>
       </div>
+      <label>
+        Stdin preset (optional)
+        <textarea id="stdinPreset" rows="4" spellcheck="false" placeholder="lines to feed into stdin, e.g.\n1\n"></textarea>
+      </label>
       <div class="chip-row">
         <button class="chip" data-cmd="--list-keys --keyid-format long">list keys</button>
         <button class="chip" data-cmd="--list-secret-keys --keyid-format long">list secret keys</button>
         <button class="chip" data-cmd="--check-trustdb">check trustdb</button>
         <button class="chip" data-cmd="--armor --export">export all pubkeys</button>
       </div>
+      <p class="hint">
+        If preset is empty and gpg asks for stdin, demo shows an in-page stdin callback dialog.
+      </p>
     </section>
 
     <section class="panel reveal" style="--delay: 0.28s;">
@@ -198,6 +205,21 @@
       <div class="row">
         <button type="button" id="pinentryCancel">Cancel</button>
         <button type="button" id="pinentrySubmit">Submit</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="stdinDialog" class="pinentry-dialog">
+    <form method="dialog" id="stdinDialogForm">
+      <h3>Stdin Callback</h3>
+      <p id="stdinMeta"></p>
+      <label>
+        Input line
+        <input id="stdinInput" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. 1">
+      </label>
+      <div class="row">
+        <button type="button" id="stdinCancel">Send EOF</button>
+        <button type="button" id="stdinSubmit">Submit Line</button>
       </div>
     </form>
   </dialog>

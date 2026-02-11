@@ -37,6 +37,125 @@ function normalizePinentryReply(reply) {
   };
 }
 
+function parseStatusLine(line) {
+  const text = String(line ?? '').trim();
+  if (!text) {
+    return {
+      keyword: '',
+      payload: '',
+    };
+  }
+  const idx = text.indexOf(' ');
+  if (idx === -1) {
+    return {
+      keyword: text,
+      payload: '',
+    };
+  }
+  return {
+    keyword: text.slice(0, idx),
+    payload: text.slice(idx + 1).trimStart(),
+  };
+}
+
+function decodeStatusField(text) {
+  const raw = String(text ?? '');
+  if (!raw) {
+    return '';
+  }
+  const plusAsSpace = raw.replace(/\+/g, ' ');
+  try {
+    return decodeURIComponent(plusAsSpace);
+  } catch {
+    return plusAsSpace;
+  }
+}
+
+function includesAnyOption(args, optionNames) {
+  for (const arg of args) {
+    for (const optionName of optionNames) {
+      if (arg === optionName || arg.startsWith(`${optionName}=`)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function findOptionValue(args, optionNames) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    for (const optionName of optionNames) {
+      if (arg === optionName) {
+        return i + 1 < args.length ? args[i + 1] : '';
+      }
+      if (arg.startsWith(`${optionName}=`)) {
+        return arg.slice(optionName.length + 1);
+      }
+    }
+  }
+  return '';
+}
+
+function inferPinentryOperation(args) {
+  if (includesAnyOption(args, ['--quick-generate-key', '--quick-gen-key', '--generate-key', '--gen-key', '--full-generate-key'])) {
+    return 'generate-key';
+  }
+  if (includesAnyOption(args, ['--sign', '--clearsign', '--detach-sign'])) {
+    return 'sign';
+  }
+  if (includesAnyOption(args, ['--decrypt'])) {
+    return 'decrypt';
+  }
+  if (includesAnyOption(args, ['--symmetric'])) {
+    return 'symmetric';
+  }
+  return 'passphrase';
+}
+
+function inferPinentryHints(args, pinentryRequest) {
+  const request = pinentryRequest && typeof pinentryRequest === 'object'
+    ? pinentryRequest
+    : {};
+  const uidHint =
+    (typeof request.uidHint === 'string' && request.uidHint)
+    || findOptionValue(args, ['--local-user', '--default-key']);
+  const keyHint =
+    (typeof request.keyHint === 'string' && request.keyHint)
+    || findOptionValue(args, ['--default-key', '--local-user']);
+  return {
+    op:
+      (typeof request.op === 'string' && request.op)
+      || inferPinentryOperation(args),
+    uidHint: uidHint || '',
+    keyHint: keyHint || '',
+  };
+}
+
+function parsePromptHint(prompt) {
+  const text = String(prompt ?? '').trim();
+  if (!text) {
+    return {
+      statusKeyword: '',
+      keyword: '',
+      raw: '',
+    };
+  }
+  const idx = text.indexOf(' ');
+  if (idx === -1) {
+    return {
+      statusKeyword: text,
+      keyword: '',
+      raw: text,
+    };
+  }
+  return {
+    statusKeyword: text.slice(0, idx),
+    keyword: text.slice(idx + 1).trimStart(),
+    raw: text,
+  };
+}
+
 function safeInvoke(handler, payload) {
   if (typeof handler !== 'function') {
     return;
@@ -55,12 +174,97 @@ function normalizeStringArray(value) {
   return value.map((item) => String(item));
 }
 
+function normalizeStdinText(value) {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).join('');
+  }
+  if (value && typeof value === 'object') {
+    if (typeof value.text === 'string') {
+      return value.text;
+    }
+    if (Array.isArray(value.lines)) {
+      const out = value.lines.map((line) => String(line));
+      return out.join('\n') + (out.length ? '\n' : '');
+    }
+  }
+  return '';
+}
+
+function normalizeStdinReply(value) {
+  if (value && typeof value === 'object' && value.eof === true) {
+    return {
+      text: '',
+      eof: true,
+    };
+  }
+  return {
+    text: normalizeStdinText(value),
+    eof: false,
+  };
+}
+
 function createSharedQueueDescriptor(size = 262144) {
   const normalizedSize = Number.isFinite(size) ? Math.max(1024, Number(size) | 0) : 262144;
   return {
     meta: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4),
     data: new SharedArrayBuffer(normalizedSize),
   };
+}
+
+function createSharedQueue(desc) {
+  if (!desc || !desc.meta || !desc.data) {
+    throw new Error('invalid shared queue descriptor');
+  }
+  return {
+    ctrl: new Int32Array(desc.meta),
+    data: new Uint8Array(desc.data),
+  };
+}
+
+function queueNotify(queue) {
+  const { ctrl } = queue;
+  Atomics.add(ctrl, 3, 1);
+  Atomics.notify(ctrl, 3);
+}
+
+function queuePushByte(queue, byteValue, shouldBlock = true) {
+  const { ctrl, data } = queue;
+  const size = data.length;
+  const value = Number(byteValue) & 0xff;
+
+  while (true) {
+    const head = Atomics.load(ctrl, 0);
+    const tail = Atomics.load(ctrl, 1);
+    const next = (head + 1) % size;
+    if (next !== tail) {
+      data[head] = value;
+      Atomics.store(ctrl, 0, next);
+      queueNotify(queue);
+      return true;
+    }
+    if (Atomics.load(ctrl, 2) !== 0) {
+      return false;
+    }
+    if (!shouldBlock) {
+      return false;
+    }
+    const stamp = Atomics.load(ctrl, 3);
+    Atomics.wait(ctrl, 3, stamp, 10);
+  }
+}
+
+function queuePushText(queue, text) {
+  if (!text) {
+    return;
+  }
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(String(text));
+  for (const value of bytes) {
+    queuePushByte(queue, value, true);
+  }
 }
 
 function queueCloseDescriptor(desc) {
@@ -162,6 +366,9 @@ export class WasmGpgBrowserClient {
     this.gpgAgentWorkerUrl = config.gpgAgentWorkerUrl
       ? toUrlString(config.gpgAgentWorkerUrl, baseUrl)
       : toUrlString(new URL('./gpg-agent-server-worker.js', baseUrl), baseUrl);
+    this.gpgScdaemonWorkerUrl = config.gpgScdaemonWorkerUrl
+      ? toUrlString(config.gpgScdaemonWorkerUrl, baseUrl)
+      : toUrlString(new URL('./gpg-scdaemon-server-worker.js', baseUrl), baseUrl);
     this.gpgDirmngrWorkerUrl = config.gpgDirmngrWorkerUrl
       ? toUrlString(config.gpgDirmngrWorkerUrl, baseUrl)
       : toUrlString(new URL('./gpg-dirmngr-fetch-worker.js', baseUrl), baseUrl);
@@ -170,6 +377,8 @@ export class WasmGpgBrowserClient {
       : toUrlString(new URL('./gpg-agent-session-worker.js', baseUrl), baseUrl);
     this.gpgAgentScriptUrl = toUrlString(config.gpgAgentScriptUrl, baseUrl);
     this.gpgAgentWasmUrl = toUrlString(config.gpgAgentWasmUrl, baseUrl);
+    this.gpgScdaemonScriptUrl = toUrlString(config.gpgScdaemonScriptUrl, baseUrl);
+    this.gpgScdaemonWasmUrl = toUrlString(config.gpgScdaemonWasmUrl, baseUrl);
     this.homedir = typeof config.homedir === 'string' && config.homedir
       ? config.homedir
       : '/gnupg';
@@ -193,6 +402,9 @@ export class WasmGpgBrowserClient {
       this.gpgAgentSessionWorkerUrl,
       this.gpgAgentScriptUrl,
       this.gpgAgentWasmUrl,
+      this.gpgScdaemonWorkerUrl,
+      this.gpgScdaemonScriptUrl,
+      this.gpgScdaemonWasmUrl,
       this.homedir,
     ].join('\n');
   }
@@ -350,6 +562,9 @@ export class WasmGpgBrowserClient {
         sessionId,
         gpgAgentScriptUrl: this.gpgAgentScriptUrl,
         gpgAgentWasmUrl: this.gpgAgentWasmUrl,
+        gpgScdaemonWorkerUrl: this.gpgScdaemonWorkerUrl,
+        gpgScdaemonScriptUrl: this.gpgScdaemonScriptUrl,
+        gpgScdaemonWasmUrl: this.gpgScdaemonWasmUrl,
         homedir: this.homedir,
         fsState,
         persistRoots,
@@ -412,6 +627,29 @@ export class WasmGpgBrowserClient {
       const pinentryRequest = callbacks.pinentryRequest && typeof callbacks.pinentryRequest === 'object'
         ? callbacks.pinentryRequest
         : {};
+      const pinentryHints = inferPinentryHints(argv, pinentryRequest);
+      const pinentryContext = {
+        op: pinentryHints.op,
+        uidHint: pinentryHints.uidHint,
+        keyHint: pinentryHints.keyHint,
+        inquireMaxLen: null,
+        needPassphrase: '',
+        needPassphraseSym: '',
+      };
+      let pinentryRequestCounter = 0;
+      let stdinText = '';
+      if (callbacks.stdinText !== undefined) {
+        stdinText = normalizeStdinText(callbacks.stdinText);
+      }
+      const wantsInteractiveStdin = typeof callbacks.onInputRequest === 'function';
+      const wantsPinentryStdin = typeof onPinentry === 'function';
+      const stdinQueueDesc = (wantsInteractiveStdin || stdinText || wantsPinentryStdin)
+        ? createSharedQueueDescriptor()
+        : null;
+      const stdinQueue = stdinQueueDesc ? createSharedQueue(stdinQueueDesc) : null;
+      if (stdinQueue && stdinText) {
+        queuePushText(stdinQueue, stdinText);
+      }
 
       const emitStatus = callbacks.emitStatus !== undefined
         ? callbacks.emitStatus !== false
@@ -473,6 +711,9 @@ export class WasmGpgBrowserClient {
           setTimeout(() => {
             worker.terminate();
           }, 80);
+          if (stdinQueueDesc) {
+            queueCloseDescriptor(stdinQueueDesc);
+          }
           resolve(value);
         };
 
@@ -483,8 +724,122 @@ export class WasmGpgBrowserClient {
           settled = true;
           clearWatchdog();
           closePersistentBridge();
+          if (stdinQueueDesc) {
+            queueCloseDescriptor(stdinQueueDesc);
+          }
           worker.terminate();
           reject(error);
+        };
+
+        const updatePinentryContextFromStatus = (line) => {
+          const { keyword, payload } = parseStatusLine(line);
+          if (keyword === 'USERID_HINT') {
+            const hint = decodeStatusField(payload);
+            if (hint) {
+              pinentryContext.uidHint = hint;
+            }
+            return;
+          }
+          if (keyword === 'NEED_PASSPHRASE') {
+            pinentryContext.needPassphrase = payload;
+            const keyid = payload.split(/\s+/).filter(Boolean)[0] || '';
+            if (keyid) {
+              pinentryContext.keyHint = keyid;
+            }
+            return;
+          }
+          if (keyword === 'NEED_PASSPHRASE_SYM') {
+            pinentryContext.needPassphraseSym = payload;
+            if (!pinentryRequest.op) {
+              pinentryContext.op = 'symmetric';
+            }
+            return;
+          }
+          if (keyword === 'INQUIRE_MAXLEN') {
+            const maxLen = Number.parseInt(payload, 10);
+            if (Number.isFinite(maxLen) && maxLen > 0) {
+              pinentryContext.inquireMaxLen = maxLen;
+            }
+          }
+        };
+
+        const pushPinentryReplyToQueue = (normalized) => {
+          if (!stdinQueue || !stdinQueueDesc) {
+            return;
+          }
+          if (!normalized.ok) {
+            queuePushByte(stdinQueue, 0x04, true);
+            return;
+          }
+          const passphrase = typeof normalized.passphrase === 'string'
+            ? normalized.passphrase
+            : String(normalized.passphrase ?? '');
+          if (passphrase) {
+            queuePushText(stdinQueue, passphrase);
+          }
+          if (!passphrase.endsWith('\n')) {
+            queuePushByte(stdinQueue, 0x0a, true);
+          }
+        };
+
+        const handlePinentryViaStdinRequest = (request, promptInfo) => {
+          if (!stdinQueue || !stdinQueueDesc || typeof onPinentry !== 'function') {
+            if (stdinQueueDesc) {
+              queueCloseDescriptor(stdinQueueDesc);
+            }
+            return;
+          }
+
+          pinentryRequestCounter += 1;
+          const req = {
+            id: `pinentry-stdin-${pinentryRequestCounter}`,
+            op: pinentryContext.op || 'passphrase',
+            uidHint: pinentryContext.uidHint || '',
+            keyHint: pinentryContext.keyHint || '',
+            prompt: promptInfo.keyword || request.prompt || '',
+            inquireMaxLen: Number.isFinite(pinentryContext.inquireMaxLen)
+              ? pinentryContext.inquireMaxLen
+              : null,
+            needPassphrase: pinentryContext.needPassphrase || '',
+            needPassphraseSym: pinentryContext.needPassphraseSym || '',
+          };
+
+          safeInvoke(onDebug, {
+            step: 'client.pinentry.request',
+            data: {
+              id: req.id,
+              op: req.op,
+              uidHint: req.uidHint,
+              keyHint: req.keyHint,
+              prompt: req.prompt,
+              inquireMaxLen: req.inquireMaxLen,
+            },
+          });
+
+          Promise.resolve(onPinentry(req))
+            .then((reply) => {
+              const normalized = normalizePinentryReply(reply);
+              safeInvoke(onDebug, {
+                step: 'client.pinentry.reply',
+                data: {
+                  id: req.id,
+                  ok: normalized.ok,
+                  hasPassphrase: typeof normalized.passphrase === 'string' && normalized.passphrase.length > 0,
+                },
+              });
+              pushPinentryReplyToQueue(normalized);
+            })
+            .catch((error) => {
+              safeInvoke(onDebug, {
+                step: 'client.pinentry.error',
+                data: {
+                  id: req.id,
+                  error: error instanceof Error ? error.message : String(error),
+                },
+              });
+              safeInvoke(onStderr, `[wasm] pinentry callback failed: ${error instanceof Error ? error.message : String(error)}`);
+              pushPinentryReplyToQueue({ ok: false, passphrase: '' });
+            });
         };
 
         if (runTimeoutMs > 0) {
@@ -518,7 +873,11 @@ export class WasmGpgBrowserClient {
 
           if (message.type === 'status') {
             statusCount += 1;
-            safeInvoke(onStatus, message.line);
+            const statusLine = typeof message.line === 'string'
+              ? message.line
+              : String(message.line ?? '');
+            updatePinentryContextFromStatus(statusLine);
+            safeInvoke(onStatus, statusLine);
             return;
           }
 
@@ -594,6 +953,44 @@ export class WasmGpgBrowserClient {
                   ok: false,
                   passphrase: '',
                 });
+              });
+            return;
+          }
+
+          if (message.type === 'stdin-request') {
+            const request = {
+              id: typeof message.id === 'string' ? message.id : '',
+              prompt: typeof message.prompt === 'string' ? message.prompt : '',
+              args: Array.isArray(message.args) ? message.args.map((item) => String(item)) : argv.slice(),
+            };
+
+            const promptInfo = parsePromptHint(request.prompt);
+            if (promptInfo.statusKeyword === 'GET_HIDDEN' && typeof onPinentry === 'function') {
+              handlePinentryViaStdinRequest(request, promptInfo);
+              return;
+            }
+
+            if (!stdinQueue || typeof callbacks.onInputRequest !== 'function') {
+              if (stdinQueueDesc) {
+                queueCloseDescriptor(stdinQueueDesc);
+              }
+              return;
+            }
+
+            Promise.resolve(callbacks.onInputRequest(request))
+              .then((reply) => {
+                const normalized = normalizeStdinReply(reply);
+                if (normalized.eof) {
+                  queueCloseDescriptor(stdinQueueDesc);
+                  return;
+                }
+                if (normalized.text) {
+                  queuePushText(stdinQueue, normalized.text);
+                }
+              })
+              .catch((error) => {
+                safeInvoke(onStderr, `[wasm] input callback failed: ${error instanceof Error ? error.message : String(error)}`);
+                queueCloseDescriptor(stdinQueueDesc);
               });
             return;
           }
@@ -705,9 +1102,12 @@ export class WasmGpgBrowserClient {
             gpgScriptUrl: this.gpgScriptUrl,
             gpgWasmUrl: this.gpgWasmUrl,
             gpgAgentWorkerUrl: this.gpgAgentWorkerUrl,
+            gpgScdaemonWorkerUrl: this.gpgScdaemonWorkerUrl,
             gpgDirmngrWorkerUrl: this.gpgDirmngrWorkerUrl,
             gpgAgentScriptUrl: this.gpgAgentScriptUrl,
             gpgAgentWasmUrl: this.gpgAgentWasmUrl,
+            gpgScdaemonScriptUrl: this.gpgScdaemonScriptUrl,
+            gpgScdaemonWasmUrl: this.gpgScdaemonWasmUrl,
             homedir: this.homedir,
             emitStatus,
             fsState,
@@ -729,6 +1129,8 @@ export class WasmGpgBrowserClient {
               : {
                   enabled: false,
                 },
+            stdinText,
+            stdinQueue: stdinQueueDesc,
           });
         } catch (error) {
           finishReject(error instanceof Error ? error : new Error(String(error)));
