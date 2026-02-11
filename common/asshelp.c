@@ -385,6 +385,80 @@ wait_for_sock (int secs, int module_name_id, const char *sockname,
 }
 
 
+#ifdef __EMSCRIPTEN__
+/* Return the environment variable used to pass a pre-opened Assuan
+ * transport file descriptor for MODULE_NAME_ID.  */
+static const char *
+wasm_service_fd_envname (int module_name_id)
+{
+  switch (module_name_id)
+    {
+    case GNUPG_MODULE_NAME_AGENT:
+      return "GNUPG_WASM_AGENT_FD";
+    case GNUPG_MODULE_NAME_DIRMNGR:
+      return "GNUPG_WASM_DIRMNGR_FD";
+    case GNUPG_MODULE_NAME_KEYBOXD:
+      return "GNUPG_WASM_KEYBOXD_FD";
+    default:
+      return NULL;
+    }
+}
+
+
+/* Try to connect CTX using a pre-opened fd from the environment.
+ * Returns:
+ *   - 0 on success
+ *   - GPG_ERR_NOT_FOUND if no fd env var is set
+ *   - another error code for parse/connect failures
+ * R_HAVE_ENV is set when an env var was present (even if invalid).  */
+static gpg_error_t
+wasm_connect_preopened_service (assuan_context_t ctx,
+                                int module_name_id,
+                                unsigned int connect_flags,
+                                const char *printed_name,
+                                int *r_have_env)
+{
+  const char *envname;
+  const char *value;
+  char *endp;
+  long fdno;
+  gpg_error_t err;
+
+  *r_have_env = 0;
+
+  envname = wasm_service_fd_envname (module_name_id);
+  if (!envname)
+    return gpg_error (GPG_ERR_INV_VALUE);
+
+  value = getenv (envname);
+  if (!value || !*value)
+    return gpg_error (GPG_ERR_NOT_FOUND);
+
+  *r_have_env = 1;
+
+  errno = 0;
+  fdno = strtol (value, &endp, 10);
+  if (errno || !endp || *endp || fdno < 0)
+    {
+      log_error ("invalid value for %s: '%s'\n", envname, value);
+      return gpg_error (GPG_ERR_INV_VALUE);
+    }
+
+  /* There is no fd passing in this transport mode.  */
+  connect_flags &= ~ASSUAN_SOCKET_CONNECT_FDPASSING;
+
+  err = assuan_socket_connect_fd (ctx,
+                                  assuan_fd_from_posix_fd ((int)fdno),
+                                  connect_flags);
+  if (err)
+    log_error ("can't connect to %s via %s: %s\n",
+               printed_name, envname, gpg_strerror (err));
+
+  return err;
+}
+#endif /*__EMSCRIPTEN__*/
+
+
 /* Try to connect to a new service via socket or start it if it is not
  * running and AUTOSTART is set.  Handle the server's initial
  * greeting.  Returns a new assuan context at R_CTX or an error code.
@@ -416,6 +490,9 @@ start_new_service (assuan_context_t *r_ctx,
   int seconds_to_wait;
   unsigned int connect_flags = 0;
   const char *argv[6];
+#ifdef __EMSCRIPTEN__
+  int have_wasm_service_env = 0;
+#endif
 
   *r_ctx = NULL;
 
@@ -459,9 +536,26 @@ start_new_service (assuan_context_t *r_ctx,
       return err;
     }
 
+  err = 0;
+#ifdef __EMSCRIPTEN__
+  err = wasm_connect_preopened_service (ctx, module_name_id,
+                                        connect_flags, printed_name,
+                                        &have_wasm_service_env);
+  if (gpg_err_code (err) == GPG_ERR_NOT_FOUND)
+    err = assuan_socket_connect (ctx, sockname, 0, connect_flags);
+#else
   err = assuan_socket_connect (ctx, sockname, 0, connect_flags);
+#endif
   if (err && (flags & ASSHELP_FLAG_AUTOSTART))
     {
+#ifdef __EMSCRIPTEN__
+      if (have_wasm_service_env)
+        {
+          xfree (sockname);
+          assuan_release (ctx);
+          return gpg_err_make (errsource, no_service_err);
+        }
+#endif
       char *abs_homedir;
       lock_spawn_t lock;
       char *program = NULL;

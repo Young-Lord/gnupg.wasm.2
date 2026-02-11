@@ -87,9 +87,27 @@ from pathlib import Path
 import sys
 
 prefix = Path(sys.argv[1])
-needle = 'if(stream.stream_ops.poll){'
-replacement = 'if(stream.stream_ops&&stream.stream_ops.poll){'
-count = 0
+poll_needle = 'if(stream.stream_ops.poll){'
+poll_replacement = 'if(stream.stream_ops&&stream.stream_ops.poll){'
+
+extra_fd_needle = (
+    'createStandardStreams(){FS.createStream({nfd:0,position:0,path:"/dev/stdin",'
+    'flags:0,tty:true,seekable:false},0);var paths=[,"/dev/stdout","/dev/stderr"];'
+    'for(var i=1;i<3;i++){FS.createStream({nfd:i,position:0,path:paths[i],flags:577,'
+    'tty:true,seekable:false},i)}}'
+)
+extra_fd_replacement = (
+    'createStandardStreams(){FS.createStream({nfd:0,position:0,path:"/dev/stdin",'
+    'flags:0,tty:true,seekable:false},0);var paths=[,"/dev/stdout","/dev/stderr"];'
+    'for(var i=1;i<3;i++){FS.createStream({nfd:i,position:0,path:paths[i],flags:577,'
+    'tty:true,seekable:false},i)}var extra=(typeof process!="undefined"&&process&&process.env)'
+    '?process.env.GNUPG_WASM_EXTRA_FDS:undefined;if(extra){for(var fdstr of extra.split(","))'
+    '{var nfd=Number(fdstr);if(Number.isInteger(nfd)&&nfd>2&&!FS.streams[nfd]){FS.createStream('
+    '{nfd:nfd,position:0,path:"/dev/fd/"+nfd,flags:2,seekable:false},nfd)}}}}'
+)
+
+poll_count = 0
+fd_count = 0
 
 for sub in ('bin', 'libexec'):
     root = prefix / sub
@@ -102,15 +120,28 @@ for sub in ('bin', 'libexec'):
             data = path.read_text(encoding='utf-8', errors='ignore')
         except OSError:
             continue
-        if needle not in data:
-            continue
-        path.write_text(data.replace(needle, replacement), encoding='utf-8')
-        count += 1
 
-print(count)
+        updated = data
+        replaced = False
+
+        if poll_needle in updated:
+            updated = updated.replace(poll_needle, poll_replacement)
+            poll_count += 1
+            replaced = True
+
+        if extra_fd_needle in updated:
+            updated = updated.replace(extra_fd_needle, extra_fd_replacement)
+            fd_count += 1
+            replaced = True
+
+        if not replaced:
+            continue
+        path.write_text(updated, encoding='utf-8')
+
+print(f'poll={poll_count} extra_fds={fd_count}')
 PY
 )"
-  wasm_info "Patched launcher poll guards: $patched"
+  wasm_info "Patched wasm launchers: $patched"
 }
 
 STAMP_DIR="$WASM_BUILD_DIR/stamps"
