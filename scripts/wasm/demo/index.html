@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GnuPG WASM Browser Lab</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="atmo atmo-a" aria-hidden="true"></div>
+  <div class="atmo atmo-b" aria-hidden="true"></div>
+
+  <main class="app-shell">
+    <section class="hero reveal" style="--delay: 0.04s;">
+      <p class="kicker">GnuPG WASM / Browser Playground</p>
+      <h1>Interactive GPG Lab</h1>
+      <p>
+        This page runs the wasm gpg binary in a Worker and keeps a virtual
+        session state so you can generate keys, import/export, encrypt/decrypt,
+        sign/verify, and run raw commands.
+      </p>
+    </section>
+
+    <section class="panel reveal" style="--delay: 0.1s;">
+      <h2>Runtime Setup</h2>
+      <div class="field-grid two">
+        <label>
+          GPG launcher URL
+          <input id="gpgScriptUrl" type="text" spellcheck="false">
+        </label>
+        <label>
+          GPG wasm URL
+          <input id="gpgWasmUrl" type="text" spellcheck="false">
+        </label>
+        <label>
+          GNUPGHOME (virtual FS)
+          <input id="homedir" type="text" value="/gnupg" spellcheck="false">
+        </label>
+        <label>
+          Default passphrase
+          <input id="defaultPassphrase" type="password" placeholder="used by pinentry callback">
+        </label>
+      </div>
+
+      <div class="row wrap">
+        <label class="toggle-label">
+          <input id="autoPinentry" type="checkbox" checked>
+          Auto-answer pinentry with default passphrase
+        </label>
+        <button id="btnPing" class="run-action">Run --version</button>
+        <button id="btnResetSession">Reset Session State</button>
+      </div>
+
+      <p id="sessionInfo" class="session-info">Session state is ready (in-memory).</p>
+    </section>
+
+    <div class="split reveal" style="--delay: 0.16s;">
+      <section class="panel">
+        <h2>File Workspace</h2>
+        <div class="field-grid two">
+          <label>
+            Active file path
+            <input id="filePath" type="text" value="/work/note.txt" spellcheck="false">
+          </label>
+          <label>
+            Source path (crypto actions)
+            <input id="sourcePath" type="text" value="/work/input.txt" spellcheck="false">
+          </label>
+          <label>
+            Output path (crypto actions)
+            <input id="outputPath" type="text" value="/work/output.asc" spellcheck="false">
+          </label>
+          <label>
+            Recipient / key selector
+            <input id="recipient" type="text" value="" placeholder="fingerprint, keyid, or uid" spellcheck="false">
+          </label>
+        </div>
+
+        <textarea id="fileContent" rows="14" spellcheck="false" placeholder="edit file content here"></textarea>
+
+        <div class="row wrap">
+          <button id="btnSaveFile">Save File</button>
+          <button id="btnLoadFile">Load File</button>
+          <button id="btnDeleteFile">Delete File</button>
+          <button id="btnCopyOutputToEditor">Load Output Path into Editor</button>
+        </div>
+
+        <pre id="fileTree" class="file-tree"></pre>
+      </section>
+
+      <section class="panel">
+        <h2>Keyring and Crypto Actions</h2>
+        <div class="field-grid two">
+          <label>
+            Name
+            <input id="keyName" type="text" value="Browser Demo User" spellcheck="false">
+          </label>
+          <label>
+            Email
+            <input id="keyEmail" type="email" value="browser-demo@example.test" spellcheck="false">
+          </label>
+          <label>
+            Expire
+            <input id="keyExpire" type="text" value="1y" spellcheck="false">
+          </label>
+          <label>
+            Export selector
+            <input id="exportSelector" type="text" placeholder="uid, keyid, or fingerprint" spellcheck="false">
+          </label>
+        </div>
+
+        <div class="row wrap">
+          <button id="btnGenerateKey" class="run-action">Generate Key</button>
+          <button id="btnListPub" class="run-action">List Public Keys</button>
+          <button id="btnListSec" class="run-action">List Secret Keys</button>
+          <button id="btnExportPub" class="run-action">Export Public Key</button>
+          <button id="btnImportFromEditor" class="run-action">Import Key from Editor</button>
+        </div>
+
+        <div class="row wrap">
+          <button id="btnSymmetricEncrypt" class="run-action">Symmetric Encrypt</button>
+          <button id="btnPublicEncrypt" class="run-action">Public-Key Encrypt</button>
+          <button id="btnDecrypt" class="run-action">Decrypt</button>
+          <button id="btnClearSign" class="run-action">Clearsign</button>
+          <button id="btnVerify" class="run-action">Verify</button>
+        </div>
+
+        <p class="hint">
+          Crypto buttons write editor content into the configured source path,
+          run gpg, and then load output file content back to the editor when applicable.
+        </p>
+      </section>
+    </div>
+
+    <section class="panel reveal" style="--delay: 0.22s;">
+      <h2>Raw Command Runner</h2>
+      <p class="hint">
+        Enter gpg args only (do not include the gpg binary). Quotes are supported.
+      </p>
+      <div class="row">
+        <input id="rawCommand" type="text" value="--list-keys --keyid-format long" spellcheck="false">
+        <button id="btnRunRaw" class="run-action">Run Raw Command</button>
+      </div>
+      <div class="chip-row">
+        <button class="chip" data-cmd="--list-keys --keyid-format long">list keys</button>
+        <button class="chip" data-cmd="--list-secret-keys --keyid-format long">list secret keys</button>
+        <button class="chip" data-cmd="--check-trustdb">check trustdb</button>
+        <button class="chip" data-cmd="--armor --export">export all pubkeys</button>
+      </div>
+    </section>
+
+    <section class="panel reveal" style="--delay: 0.28s;">
+      <h2>Console</h2>
+      <div id="console" class="console"></div>
+      <div class="row">
+        <button id="btnClearConsole">Clear Console</button>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="pinentryDialog" class="pinentry-dialog">
+    <form method="dialog" id="pinentryForm">
+      <h3>Pinentry Callback</h3>
+      <p id="pinentryMeta"></p>
+      <label>
+        Passphrase
+        <input id="pinentryInput" type="password" autocomplete="off">
+      </label>
+      <div class="row">
+        <button type="button" id="pinentryCancel">Cancel</button>
+        <button type="button" id="pinentrySubmit">Submit</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="./app.mjs"></script>
+</body>
+</html>

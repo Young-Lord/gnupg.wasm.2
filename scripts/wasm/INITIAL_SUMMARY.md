@@ -24,6 +24,19 @@ Date: 2026-02-11
   - supports `GETINFO`, `OPTION`, `KEYSERVER`, `KS_GET`, `KS_SEARCH`, `KS_FETCH`, `WKD_GET`
 - Added integrated feature smoke:
   - `scripts/wasm/run-node-agent-dirmngr-smoke.sh`
+- Added browser callback transport baseline:
+  - `scripts/wasm/gpg-browser-worker.js`
+  - `scripts/wasm/gpg-browser-client.mjs`
+  - `scripts/wasm/gpg-agent-server-worker.js`
+  - `scripts/wasm/BROWSER_CALLBACKS.md`
+  - loopback pinentry callback protocol (`pinentry-request`/`pinentry-response`)
+- Added interactive browser demo:
+  - `scripts/wasm/demo/index.html`
+  - `scripts/wasm/demo/app.mjs`
+  - `scripts/wasm/demo/styles.css`
+  - `scripts/wasm/demo/README.md`
+  - `scripts/wasm/prepare-browser-assets.sh` (creates `PLAY/wasm-prefix/bin/gpg.js`)
+  - `scripts/wasm/build-gnupg-browser.sh` (builds browser-target launcher under `PLAY/wasm-prefix-browser`)
 
 ## Build and validation status
 
@@ -46,10 +59,17 @@ Date: 2026-02-11
   - Key generation (`--quick-generate-key`) via bridged wasm `gpg-agent --server`
   - Signing (`--sign`) via bridged wasm `gpg-agent --server` with loopback pinentry
   - Keyserver receive (`--recv-keys`) via fetch-backed dirmngr shim
+  - Browser worker callback path for:
+    - stdout/stderr callback forwarding
+    - optional status callback (`[GNUPG:]` lines)
+    - loopback pinentry callback injection (`--passphrase-file` in MEMFS)
+    - in-memory multi-command persistence via `fsState` snapshot roundtrip
 
 - Known caveats:
   - `scdaemon` is still unavailable in this wasm profile (smartcard paths log warnings)
   - keyserver behavior depends on selected server and key availability
+  - browser worker path is currently baseline transport only (agent/dirmngr browser channels pending)
+  - browser persistence is host-memory only (`fsState` snapshot), no IDBFS persistence yet
 
 ## Important profile limits
 

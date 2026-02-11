@@ -16,7 +16,10 @@ PLAY/wasm-prefix.
 Options:
   --clean            Remove gnupg build directory before configure.
   --force            Rebuild even when stamp exists.
+  --reconfigure      Force rerun configure before build.
   --configure-only   Run configure only.
+  --target NAME      Build target: node (default) or browser.
+  --browser          Shortcut for --target browser.
   --help             Show this help text.
 EOF
 }
@@ -31,6 +34,8 @@ require_tool() {
 CLEAN=0
 FORCE=0
 CONFIGURE_ONLY=0
+RECONFIGURE=0
+TARGET="node"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -46,6 +51,19 @@ while [[ $# -gt 0 ]]; do
       CONFIGURE_ONLY=1
       shift
       ;;
+    --reconfigure)
+      RECONFIGURE=1
+      shift
+      ;;
+    --target)
+      [[ $# -ge 2 ]] || wasm_die "--target expects node or browser"
+      TARGET="$2"
+      shift 2
+      ;;
+    --browser)
+      TARGET="browser"
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -55,6 +73,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$TARGET" != "node" && "$TARGET" != "browser" ]]; then
+  wasm_die "Unsupported --target value: $TARGET (expected node or browser)"
+fi
 
 require_tool emconfigure
 require_tool emmake
@@ -162,6 +184,13 @@ fi
 
 mkdir -p "$BUILD_DIR"
 
+CONFIGURE_REQUIRED=0
+if [[ ! -f "$BUILD_DIR/Makefile" ]]; then
+  CONFIGURE_REQUIRED=1
+elif [[ "$CLEAN" -eq 1 || "$CONFIGURE_ONLY" -eq 1 || "$RECONFIGURE" -eq 1 ]]; then
+  CONFIGURE_REQUIRED=1
+fi
+
 GNUPG_CONFIGURE_FLAGS=(
   "--host=$WASM_HOST"
   "--build=$WASM_BUILD_TRIPLET"
@@ -198,20 +227,29 @@ GNUPG_CONFIGURE_FLAGS=(
 GNUPG_CPPFLAGS="$CPPFLAGS"
 GNUPG_CFLAGS="$CFLAGS"
 GNUPG_CXXFLAGS="$CXXFLAGS"
-GNUPG_LDFLAGS="$(wasm_append_flags "$LDFLAGS" "$WASM_NODE_LDFLAGS")"
+if [[ "$TARGET" == "browser" ]]; then
+  GNUPG_LDFLAGS="$(wasm_append_flags "$LDFLAGS" "$WASM_BROWSER_LDFLAGS")"
+else
+  GNUPG_LDFLAGS="$(wasm_append_flags "$LDFLAGS" "$WASM_NODE_LDFLAGS")"
+fi
 
 wasm_info "Configuring gnupg"
+wasm_info "Target: $TARGET"
 {
-  echo "== configure gnupg =="
-  (
-    cd "$BUILD_DIR"
-    CONFIG_SITE="$SCRIPT_DIR/config.site" \
-      CPPFLAGS="$GNUPG_CPPFLAGS" \
-      CFLAGS="$GNUPG_CFLAGS" \
-      CXXFLAGS="$GNUPG_CXXFLAGS" \
-      LDFLAGS="$GNUPG_LDFLAGS" \
-      emconfigure "$GNUPG_WASM_REPO_ROOT/configure" "${GNUPG_CONFIGURE_FLAGS[@]}"
-  )
+  if [[ "$CONFIGURE_REQUIRED" -eq 1 ]]; then
+    echo "== configure gnupg =="
+    (
+      cd "$BUILD_DIR"
+      CONFIG_SITE="$SCRIPT_DIR/config.site" \
+        CPPFLAGS="$GNUPG_CPPFLAGS" \
+        CFLAGS="$GNUPG_CFLAGS" \
+        CXXFLAGS="$GNUPG_CXXFLAGS" \
+        LDFLAGS="$GNUPG_LDFLAGS" \
+        emconfigure "$GNUPG_WASM_REPO_ROOT/configure" "${GNUPG_CONFIGURE_FLAGS[@]}"
+    )
+  else
+    echo "== reuse existing configure =="
+  fi
 
   if [[ "$CONFIGURE_ONLY" -eq 0 ]]; then
     echo "== build gnupg =="
