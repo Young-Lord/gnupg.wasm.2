@@ -80,31 +80,6 @@ static const struct {
  * calibration has not yet been done or needs to be done again.  */
 static unsigned int s2k_calibration_time = AGENT_S2K_CALIBRATION;
 static unsigned long s2k_calibrated_count;
-static int s2k_probe_logged;
-
-#ifdef __EMSCRIPTEN__
-static int
-s2k_trace_verbose_enabled (void)
-{
-  static int initialized;
-  static int enabled;
-
-  if (!initialized)
-    {
-      const char *s = getenv ("GNUPG_WASM_S2K_TRACE_VERBOSE");
-      enabled = (s && *s && strcmp (s, "0"));
-      initialized = 1;
-    }
-
-  return enabled;
-}
-#else
-static int
-s2k_trace_verbose_enabled (void)
-{
-  return 0;
-}
-#endif
 
 
 /* A helper object for time measurement.  */
@@ -232,10 +207,6 @@ calibrate_s2k_count (void)
   unsigned long count;
   unsigned long ms;
 
-  if (s2k_trace_verbose_enabled ())
-    log_info ("[wasm-s2k] enter calibrate_s2k_count target_ms=%u\n",
-              s2k_calibration_time);
-
   for (count = 65536; count; count *= 2)
     {
       ms = calibrate_s2k_count_one (count);
@@ -262,9 +233,6 @@ calibrate_s2k_count (void)
       log_info ("S2K calibration: %lu -> %lums\n", count, ms);
     }
 
-  if (s2k_trace_verbose_enabled ())
-    log_info ("[wasm-s2k] leave calibrate_s2k_count raw_count=%lu\n", count);
-
   return count;
 }
 
@@ -284,7 +252,6 @@ set_s2k_calibration_time (unsigned int milliseconds)
 
   s2k_calibration_time = milliseconds;
   s2k_calibrated_count = 0;  /* Force re-calibration.  */
-  s2k_probe_logged = 0;
 }
 
 
@@ -293,33 +260,11 @@ set_s2k_calibration_time (unsigned int milliseconds)
 unsigned long
 get_calibrated_s2k_count (void)
 {
-  unsigned long effective_count;
-  int did_calibrate = 0;
-
   if (!s2k_calibrated_count)
-    {
-      did_calibrate = 1;
-      if (s2k_trace_verbose_enabled ())
-        log_info ("[wasm-s2k] enter get_calibrated_s2k_count cached=0\n");
-      s2k_calibrated_count = calibrate_s2k_count ();
-    }
-
-  effective_count = s2k_calibrated_count < 65536 ? 65536 : s2k_calibrated_count;
-
-  if (!s2k_probe_logged)
-    {
-      unsigned long ms = calibrate_s2k_count_one (effective_count);
-      log_info ("[wasm-s2k] probe calibrated raw_count=%lu effective_count=%lu s2k_time_ms=%lu\n",
-                s2k_calibrated_count, effective_count, ms);
-      s2k_probe_logged = 1;
-    }
-
-  if (did_calibrate && s2k_trace_verbose_enabled ())
-    log_info ("[wasm-s2k] leave get_calibrated_s2k_count effective=%lu\n",
-              effective_count);
+    s2k_calibrated_count = calibrate_s2k_count ();
 
   /* Enforce a lower limit.  */
-  return effective_count;
+  return s2k_calibrated_count < 65536 ? 65536 : s2k_calibrated_count;
 }
 
 
@@ -328,22 +273,12 @@ unsigned long
 get_standard_s2k_count (void)
 {
   if (opt.s2k_count)
-    {
-      unsigned long count = opt.s2k_count < 65536 ? 65536 : opt.s2k_count;
-      if (s2k_trace_verbose_enabled ())
-        log_info ("[wasm-s2k] leave get_standard_s2k_count explicit=%lu\n", count);
-      return count;
-    }
+    return opt.s2k_count < 65536 ? 65536 : opt.s2k_count;
 
   if (s2k_calibrated_count)
     return s2k_calibrated_count < 65536 ? 65536 : s2k_calibrated_count;
 
-  {
-    unsigned long count = get_calibrated_s2k_count ();
-    if (s2k_trace_verbose_enabled ())
-      log_info ("[wasm-s2k] leave get_standard_s2k_count calibrated=%lu\n", count);
-    return count;
-  }
+  return get_calibrated_s2k_count ();
 }
 
 
@@ -352,17 +287,7 @@ get_standard_s2k_count (void)
 unsigned long
 get_standard_s2k_time (void)
 {
-  unsigned long count;
-  unsigned long ms;
-
-  if (s2k_trace_verbose_enabled ())
-    log_info ("[wasm-s2k] enter get_standard_s2k_time\n");
-  count = get_standard_s2k_count ();
-  ms = calibrate_s2k_count_one (count);
-  if (s2k_trace_verbose_enabled ())
-    log_info ("[wasm-s2k] leave get_standard_s2k_time count=%lu ms=%lu\n",
-              count, ms);
-  return ms;
+  return calibrate_s2k_count_one (get_standard_s2k_count ());
 }
 
 

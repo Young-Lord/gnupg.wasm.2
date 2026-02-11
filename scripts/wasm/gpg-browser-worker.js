@@ -520,48 +520,8 @@ function buildFinalArgs(inputArgs, options) {
   return [...enforced, ...base, ...tail];
 }
 
-function emitS2kDebugFromStderr(text) {
-  const line = String(text || '');
-  if (!line.includes('[wasm-s2k]')) {
-    return;
-  }
-
-  let match = line.match(/\[wasm-s2k\]\s+gpg\s+s2k-count\s+encoded=(\d+)\s+decoded=(\d+)\s+source=([^\s]+)/);
-  if (match) {
-    postDebug('run.s2k.actual', {
-      encodedCount: Number.parseInt(match[1], 10),
-      decodedCount: Number.parseInt(match[2], 10),
-      source: String(match[3] || ''),
-    });
-    return;
-  }
-
-  match = line.match(/\[wasm-s2k\]\s+probe\s+calibrated\s+raw_count=(\d+)\s+effective_count=(\d+)\s+s2k_time_ms=(\d+)/);
-  if (match) {
-    postDebug('run.s2k.agent-probe', {
-      rawCount: Number.parseInt(match[1], 10),
-      effectiveCount: Number.parseInt(match[2], 10),
-      s2kTimeMs: Number.parseInt(match[3], 10),
-    });
-    return;
-  }
-
-  match = line.match(/\[wasm-s2k\]\s+(enter|leave)\s+([a-zA-Z0-9_]+)/);
-  if (match) {
-    postDebug('run.s2k.agent-fn', {
-      phase: String(match[1]),
-      fn: String(match[2]),
-      line,
-    });
-    return;
-  }
-
-  postDebug('run.s2k.raw-log', { line });
- }
-
 function emitStderrAndStatus(line) {
   const text = String(line ?? '');
-  emitS2kDebugFromStderr(text);
   if (self.__gnupg_stream_capture) {
     self.__gnupg_stream_capture.stderr.push(text);
     self.__gnupg_stream_capture.metrics.stderrLivePosted += 1;

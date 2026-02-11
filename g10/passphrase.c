@@ -317,22 +317,13 @@ passphrase_to_dek (int cipher_algo, STRING2KEY *s2k,
       gcry_create_nonce (s2k->salt, 8);
       if ( s2k->mode == 3 )
         {
-          int s2k_count_from_agent = 0;
-
           /* We delay the encoding until it is really needed.  This is
              if we are going to dynamically calibrate it, we need to
              call out to gpg-agent and that should not be done during
              option processing in main().  */
           if (!opt.s2k_count)
-            {
-              opt.s2k_count = encode_s2k_iterations (agent_get_s2k_count ());
-              s2k_count_from_agent = 1;
-            }
+            opt.s2k_count = encode_s2k_iterations (agent_get_s2k_count ());
           s2k->count = opt.s2k_count;
-          log_info ("[wasm-s2k] gpg s2k-count encoded=%u decoded=%lu source=%s\n",
-                    (unsigned int)s2k->count,
-                    (unsigned long)S2K_DECODE_COUNT (s2k->count),
-                    s2k_count_from_agent ? "agent-default" : "explicit-option");
         }
     }
 
