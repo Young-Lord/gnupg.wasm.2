@@ -818,6 +818,9 @@ async function handleRun(message) {
   const gpgAgentWorkerUrl = typeof message.gpgAgentWorkerUrl === 'string'
     ? message.gpgAgentWorkerUrl
     : new URL('./gpg-agent-server-worker.js', self.location.href).toString();
+  const gpgDirmngrWorkerUrl = typeof message.gpgDirmngrWorkerUrl === 'string'
+    ? message.gpgDirmngrWorkerUrl
+    : new URL('./gpg-dirmngr-fetch-worker.js', self.location.href).toString();
   let gpgAgentScriptUrl = typeof message.gpgAgentScriptUrl === 'string'
     ? message.gpgAgentScriptUrl
     : '';
@@ -980,6 +983,7 @@ async function handleRun(message) {
       ? message.sharedAgentBridge
       : null;
   let agentBridge = null;
+  let dirmngrBridge = null;
   let agentHeartbeatId = null;
 
   const createAgentBridge = () => {
@@ -1381,6 +1385,158 @@ async function handleRun(message) {
     };
   };
 
+  const createDirmngrBridge = () => {
+    const worker = new Worker(gpgDirmngrWorkerUrl);
+    let dirmngrDone = false;
+    let resolveResult;
+    const resultPromise = new Promise((resolve) => {
+      resolveResult = resolve;
+    });
+    let resolveReady;
+    const readyPromise = new Promise((resolve) => {
+      resolveReady = resolve;
+    });
+    const gpgToDirmngrDesc = createSharedQueueDescriptor();
+    const dirmngrToGpgDesc = createSharedQueueDescriptor();
+    const gpgToDirmngr = createSharedQueue(gpgToDirmngrDesc);
+    const dirmngrToGpg = createSharedQueue(dirmngrToGpgDesc);
+    const readableHandlers = [];
+    let readableWatcherId = null;
+    let lastReadableState = false;
+    let lastClosedState = false;
+
+    const notifyReadableHandlers = (mask) => {
+      while (readableHandlers.length > 0) {
+        const handler = readableHandlers.shift();
+        try {
+          handler(mask);
+        } catch {
+          /* Ignore callback failures from runtime polling layer. */
+        }
+      }
+    };
+
+    const ensureReadableWatcher = () => {
+      if (readableWatcherId !== null) {
+        return;
+      }
+      readableWatcherId = setInterval(() => {
+        const hasData = queueHasData(dirmngrToGpg);
+        const closed = Atomics.load(dirmngrToGpg.ctrl, 2) !== 0;
+        const becameReadable = hasData && !lastReadableState;
+        const becameClosed = closed && !lastClosedState;
+        lastReadableState = hasData;
+        lastClosedState = closed;
+        if (becameReadable || becameClosed) {
+          const POLLIN = 0x001;
+          const POLLHUP = 0x010;
+          let mask = 0;
+          if (hasData) {
+            mask |= POLLIN;
+          }
+          if (closed) {
+            mask |= POLLHUP;
+          }
+          if (mask !== 0) {
+            notifyReadableHandlers(mask);
+          }
+        }
+      }, 10);
+    };
+
+    worker.addEventListener('message', (event) => {
+      const messageData = event.data;
+      if (!messageData || typeof messageData !== 'object') {
+        return;
+      }
+      if (messageData.type === 'ready') {
+        resolveReady(true);
+        return;
+      }
+      if (messageData.type === 'error') {
+        emitStderrAndStatus(`[dirmngr] ${messageData.message || 'unknown worker error'}`);
+        return;
+      }
+      if (messageData.type === 'result') {
+        dirmngrDone = true;
+        resolveResult(messageData);
+      }
+    });
+
+    worker.addEventListener('error', (event) => {
+      emitStderrAndStatus(`[dirmngr] ${event && event.message ? event.message : 'worker failed'}`);
+      resolveReady(false);
+      resolveResult(null);
+    });
+
+    worker.postMessage({
+      type: 'start',
+      bridge: {
+        gpgToDirmngr: gpgToDirmngrDesc,
+        dirmngrToGpg: dirmngrToGpgDesc,
+      },
+    });
+
+    return {
+      readAvailableByte() {
+        return queuePopByte(dirmngrToGpg, false);
+      },
+      hasReadableData() {
+        return queueHasData(dirmngrToGpg);
+      },
+      isReadableClosed() {
+        return Atomics.load(dirmngrToGpg.ctrl, 2) !== 0;
+      },
+      registerReadableHandler(callback) {
+        if (typeof callback !== 'function') {
+          return;
+        }
+        readableHandlers.push(callback);
+        ensureReadableWatcher();
+      },
+      writeByte(ch) {
+        if (ch === null || ch === undefined) {
+          return;
+        }
+        queuePushByte(gpgToDirmngr, ch, true);
+      },
+      async awaitReady(timeoutMs) {
+        let timeoutId = null;
+        const timeoutPromise = new Promise((resolve) => {
+          timeoutId = setTimeout(() => resolve(false), timeoutMs);
+        });
+        const ready = await Promise.race([readyPromise, timeoutPromise]);
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+        return Boolean(ready);
+      },
+      async shutdownAndWait(timeoutMs) {
+        if (!dirmngrDone) {
+          for (const byteValue of [66, 89, 69, 10]) {
+            queuePushByte(gpgToDirmngr, byteValue, false);
+          }
+        }
+        queueClose(gpgToDirmngr);
+        let timeoutId = null;
+        const timeoutPromise = new Promise((resolve) => {
+          timeoutId = setTimeout(() => resolve(null), timeoutMs);
+        });
+        const result = await Promise.race([resultPromise, timeoutPromise]).catch(() => null);
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+        if (readableWatcherId !== null) {
+          clearInterval(readableWatcherId);
+          readableWatcherId = null;
+        }
+        queueClose(dirmngrToGpg);
+        worker.terminate();
+        return result;
+      },
+    };
+  };
+
   if (shouldRequestPinentry(args, pinentryConfig)) {
     postDebug('run.pinentry.await', {
       mode: pinentryConfig && pinentryConfig.always === true ? 'always' : 'heuristic',
@@ -1507,6 +1663,17 @@ async function handleRun(message) {
         postDebug('run.agent.heartbeat', agentBridge.getStats());
       }, 2000);
     }
+  }
+
+  try {
+    dirmngrBridge = createDirmngrBridge();
+    const dirmngrReady = await dirmngrBridge.awaitReady(8000);
+    postDebug('run.dirmngr.ready', { dirmngrReady });
+    if (!dirmngrReady) {
+      emitStderrAndStatus('[dirmngr] worker did not report ready within timeout');
+    }
+  } catch (error) {
+    postError(`failed to create dirmngr bridge: ${formatError(error)}`);
   }
 
   const finalArgs = buildFinalArgs(args, {
@@ -1933,6 +2100,84 @@ async function handleRun(message) {
           delete envObj.GNUPG_WASM_AGENT_FD;
         }
 
+        if (dirmngrBridge && envObj) {
+          const devName = `gnupg-dirmngr-bridge-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+          const devPath = `/dev/${devName}`;
+          try {
+            if (!FS.registerDevice || !FS.mkdev || !FS.makedev) {
+              throw new Error('FS device registration APIs are unavailable');
+            }
+
+            const major = 64;
+            const minor = ((Date.now() + 17) % 200) + Math.floor(Math.random() * 50);
+            const dev = FS.makedev(major, minor);
+            const POLLIN = 0x001;
+            const POLLOUT = 0x004;
+            const POLLHUP = 0x010;
+            const errnoCodes = self.ERRNO_CODES || (self.Module && self.Module.ERRNO_CODES) || null;
+            const EAGAIN = errnoCodes && Number.isFinite(errnoCodes.EAGAIN)
+              ? Number(errnoCodes.EAGAIN)
+              : 6;
+
+            FS.registerDevice(dev, {
+              read(stream, buffer, offset, length) {
+                let count = 0;
+                while (count < length) {
+                  const byteValue = dirmngrBridge.readAvailableByte();
+                  if (byteValue === undefined || byteValue === null) {
+                    break;
+                  }
+                  buffer[offset + count] = byteValue;
+                  count += 1;
+                  if (!dirmngrBridge.hasReadableData()) {
+                    break;
+                  }
+                }
+
+                if (count === 0 && !dirmngrBridge.isReadableClosed()) {
+                  throw new FS.ErrnoError(EAGAIN);
+                }
+                return count;
+              },
+              write(stream, buffer, offset, length) {
+                let count = 0;
+                while (count < length) {
+                  dirmngrBridge.writeByte(buffer[offset + count]);
+                  count += 1;
+                }
+                return count;
+              },
+              poll(stream, timeout, notifyCallback) {
+                let mask = POLLOUT;
+                if (dirmngrBridge.hasReadableData()) {
+                  mask |= POLLIN;
+                }
+                if (dirmngrBridge.isReadableClosed()) {
+                  mask |= POLLHUP;
+                }
+                if (mask === POLLOUT && typeof notifyCallback === 'function') {
+                  dirmngrBridge.registerReadableHandler(notifyCallback);
+                }
+                return mask;
+              },
+            });
+
+            FS.mkdev(devPath, 0o600, dev);
+            const stream = FS.open(devPath, 'r+');
+            envObj.GNUPG_WASM_DIRMNGR_FD = String(stream.fd);
+            postDebug('run.preRun.dirmngr-fd', {
+              devPath,
+              fd: stream.fd,
+            });
+          } catch (error) {
+            postError(`failed to create dirmngr bridge fd: ${formatError(error)}`);
+          }
+        } else if (dirmngrBridge && !envObj) {
+          postError('dirmngr bridge requested but ENV object is unavailable in runtime');
+        } else if (envObj && envObj.GNUPG_WASM_DIRMNGR_FD) {
+          delete envObj.GNUPG_WASM_DIRMNGR_FD;
+        }
+
         for (const root of persistRoots) {
           ensureDirectory(FS, root);
         }
@@ -1997,6 +2242,9 @@ async function handleRun(message) {
     }
     if (agentBridge && !didFinish) {
       void agentBridge.shutdownAndWait(300).catch(() => null);
+    }
+    if (dirmngrBridge && !didFinish) {
+      void dirmngrBridge.shutdownAndWait(300).catch(() => null);
     }
     self.removeEventListener('error', handleGlobalError);
     self.removeEventListener('unhandledrejection', handleUnhandledRejection);

@@ -107,6 +107,14 @@
             Export selector
             <input id="exportSelector" type="text" placeholder="uid, keyid, or fingerprint" spellcheck="false">
           </label>
+          <label>
+            Keyserver
+            <input id="keyserverUrl" type="text" value="hkps://keys.openpgp.org" placeholder="hkps://keys.openpgp.org" spellcheck="false">
+          </label>
+          <label>
+            Keyserver query / key id
+            <input id="keyserverQuery" type="text" placeholder="email, uid, keyid, or fingerprint" spellcheck="false">
+          </label>
         </div>
 
         <div class="row wrap">
@@ -115,6 +123,13 @@
           <button id="btnListSec" class="run-action">List Secret Keys</button>
           <button id="btnExportPub" class="run-action">Export Public Key</button>
           <button id="btnImportFromEditor" class="run-action">Import Key from Editor</button>
+        </div>
+
+        <div class="row wrap">
+          <button id="btnKeyserverSearch" class="run-action">Search Keyserver</button>
+          <button id="btnKeyserverRecv" class="run-action">Receive Key</button>
+          <button id="btnKeyserverSend" class="run-action">Send Key</button>
+          <button id="btnKeyserverRefresh" class="run-action">Refresh Keys</button>
         </div>
 
         <div class="row wrap">
@@ -138,6 +153,10 @@
         <p class="hint">
           Crypto buttons write editor content into the configured source path,
           run gpg, and then load output file content back to the editor when applicable.
+        </p>
+        <p class="hint">
+          Keyserver actions use the configured keyserver URL and query/key selector. For best
+          compatibility in browsers, prefer hkps keyservers.
         </p>
       </section>
     </div>

@@ -162,6 +162,9 @@ export class WasmGpgBrowserClient {
     this.gpgAgentWorkerUrl = config.gpgAgentWorkerUrl
       ? toUrlString(config.gpgAgentWorkerUrl, baseUrl)
       : toUrlString(new URL('./gpg-agent-server-worker.js', baseUrl), baseUrl);
+    this.gpgDirmngrWorkerUrl = config.gpgDirmngrWorkerUrl
+      ? toUrlString(config.gpgDirmngrWorkerUrl, baseUrl)
+      : toUrlString(new URL('./gpg-dirmngr-fetch-worker.js', baseUrl), baseUrl);
     this.gpgAgentSessionWorkerUrl = config.gpgAgentSessionWorkerUrl
       ? toUrlString(config.gpgAgentSessionWorkerUrl, baseUrl)
       : toUrlString(new URL('./gpg-agent-session-worker.js', baseUrl), baseUrl);
@@ -702,6 +705,7 @@ export class WasmGpgBrowserClient {
             gpgScriptUrl: this.gpgScriptUrl,
             gpgWasmUrl: this.gpgWasmUrl,
             gpgAgentWorkerUrl: this.gpgAgentWorkerUrl,
+            gpgDirmngrWorkerUrl: this.gpgDirmngrWorkerUrl,
             gpgAgentScriptUrl: this.gpgAgentScriptUrl,
             gpgAgentWasmUrl: this.gpgAgentWasmUrl,
             homedir: this.homedir,

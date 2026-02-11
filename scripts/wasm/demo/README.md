@@ -7,12 +7,21 @@ Interactive browser demo for the wasm gpg build.
 - Key generation (`--quick-generate-key`)
 - Public/secret key listing
 - Key import/export (ASCII armor)
+- Keyserver operations (search / recv / send / refresh)
 - Symmetric encryption/decryption
 - Public-key encryption/decryption
 - Clear-sign and verify
 - Raw gpg command runner
 - Loopback pinentry callback via Worker message protocol
 - Experimental browser agent bridge via side Worker (`gpg-agent --server`)
+- Browser keyserver bridge via fetch-backed dirmngr shim Worker
+
+Notes for keyserver in browser:
+
+- Browser demo routes keyserver commands through `scripts/wasm/gpg-dirmngr-fetch-worker.js`
+  and exposes a dirmngr-compatible Assuan bridge to gpg.
+- Keyserver endpoints must allow browser fetch (CORS). If a server blocks CORS, keyserver
+  commands may fail in browser even when they work in native gpg.
 
 ## Run locally
 

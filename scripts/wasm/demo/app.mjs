@@ -24,6 +24,8 @@ const el = {
   keyEmail: document.querySelector('#keyEmail'),
   keyExpire: document.querySelector('#keyExpire'),
   exportSelector: document.querySelector('#exportSelector'),
+  keyserverUrl: document.querySelector('#keyserverUrl'),
+  keyserverQuery: document.querySelector('#keyserverQuery'),
 
   rawCommand: document.querySelector('#rawCommand'),
   console: document.querySelector('#console'),
@@ -39,6 +41,10 @@ const el = {
   btnListSec: document.querySelector('#btnListSec'),
   btnExportPub: document.querySelector('#btnExportPub'),
   btnImportFromEditor: document.querySelector('#btnImportFromEditor'),
+  btnKeyserverSearch: document.querySelector('#btnKeyserverSearch'),
+  btnKeyserverRecv: document.querySelector('#btnKeyserverRecv'),
+  btnKeyserverSend: document.querySelector('#btnKeyserverSend'),
+  btnKeyserverRefresh: document.querySelector('#btnKeyserverRefresh'),
   btnSymmetricEncrypt: document.querySelector('#btnSymmetricEncrypt'),
   btnPublicEncrypt: document.querySelector('#btnPublicEncrypt'),
   btnDecrypt: document.querySelector('#btnDecrypt'),
@@ -822,6 +828,73 @@ async function handleImportFromEditor() {
   await runGpg(['--import', source]);
 }
 
+function readKeyserverUrl() {
+  const value = (el.keyserverUrl && typeof el.keyserverUrl.value === 'string')
+    ? el.keyserverUrl.value.trim()
+    : '';
+  if (!value) {
+    return 'hkps://keys.openpgp.org';
+  }
+  if (!/^hkps?:\/\//i.test(value)) {
+    return `hkps://${value}`;
+  }
+  return value;
+}
+
+function readKeyserverQuery() {
+  return (el.keyserverQuery && typeof el.keyserverQuery.value === 'string')
+    ? el.keyserverQuery.value.trim()
+    : '';
+}
+
+async function handleKeyserverSearch() {
+  const keyserver = readKeyserverUrl();
+  const query = readKeyserverQuery() || el.recipient.value.trim() || el.exportSelector.value.trim();
+  el.keyserverUrl.value = keyserver;
+  if (!query) {
+    appendConsole('error', 'set keyserver query, recipient, or export selector first');
+    return;
+  }
+
+  await runGpg(['--keyserver', keyserver, '--search-keys', query]);
+}
+
+async function handleKeyserverReceive() {
+  const keyserver = readKeyserverUrl();
+  const selector = readKeyserverQuery() || el.recipient.value.trim() || el.exportSelector.value.trim();
+  el.keyserverUrl.value = keyserver;
+  if (!selector) {
+    appendConsole('error', 'set key id or fingerprint in keyserver query/selector field first');
+    return;
+  }
+
+  await runGpg(['--keyserver', keyserver, '--recv-keys', selector]);
+}
+
+async function handleKeyserverSend() {
+  const keyserver = readKeyserverUrl();
+  const selector = readKeyserverQuery() || el.exportSelector.value.trim() || el.recipient.value.trim();
+  el.keyserverUrl.value = keyserver;
+  if (!selector) {
+    appendConsole('error', 'set key selector for send-keys first');
+    return;
+  }
+
+  await runGpg(['--keyserver', keyserver, '--send-keys', selector]);
+}
+
+async function handleKeyserverRefresh() {
+  const keyserver = readKeyserverUrl();
+  const selector = readKeyserverQuery() || el.exportSelector.value.trim() || el.recipient.value.trim();
+  el.keyserverUrl.value = keyserver;
+
+  const args = ['--keyserver', keyserver, '--refresh-keys'];
+  if (selector) {
+    args.push(selector);
+  }
+  await runGpg(args);
+}
+
 async function handleSymmetricEncrypt() {
   const source = normalizePath(el.sourcePath.value, '/work/input.txt');
   const output = normalizePath(el.outputPath.value, '/work/output.asc');
@@ -1019,6 +1092,22 @@ function bindEvents() {
 
   el.btnImportFromEditor.addEventListener('click', async () => {
     await handleImportFromEditor();
+  });
+
+  el.btnKeyserverSearch.addEventListener('click', async () => {
+    await handleKeyserverSearch();
+  });
+
+  el.btnKeyserverRecv.addEventListener('click', async () => {
+    await handleKeyserverReceive();
+  });
+
+  el.btnKeyserverSend.addEventListener('click', async () => {
+    await handleKeyserverSend();
+  });
+
+  el.btnKeyserverRefresh.addEventListener('click', async () => {
+    await handleKeyserverRefresh();
   });
 
   el.btnSymmetricEncrypt.addEventListener('click', async () => {
