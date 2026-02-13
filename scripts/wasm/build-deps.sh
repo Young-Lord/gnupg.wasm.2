@@ -215,6 +215,109 @@ build_libusb() {
   touch "$stamp_file"
 }
 
+patch_libgcrypt_rndoldlinux() {
+  # Emscripten's /dev/urandom is backed by crypto.getRandomValues() and is
+  # always immediately readable.  The two poll() calls in rndoldlinux.c
+  # trigger Asyncify unwinds through the deep gcry_pk_genkey call stack,
+  # which Emscripten's automatic analysis does not fully instrument —
+  # causing callMain to return prematurely and killing the agent mid-keygen.
+  local src="$GNUPG_WASM_REPO_ROOT/PLAY/src/libgcrypt/random/rndoldlinux.c"
+  if [[ ! -f "$src" ]]; then
+    wasm_die "Cannot find rndoldlinux.c at $src"
+  fi
+  if grep -q '__EMSCRIPTEN__' "$src"; then
+    wasm_info "rndoldlinux.c already patched for Emscripten"
+    return
+  fi
+  wasm_info "Patching rndoldlinux.c: skip poll() under Emscripten"
+  python3 - "$src" <<'PY'
+import sys, re
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    src = f.read()
+
+# Patch 1: open_device() — replace `poll (NULL, 0, 5000);` with usleep
+src = src.replace(
+    '      poll (NULL, 0, 5000);',
+    '      /* Avoid poll() under Emscripten — see comment in gather_random. */\n'
+    '#ifdef __EMSCRIPTEN__\n'
+    '      usleep (100000);  /* 100 ms */\n'
+    '#else\n'
+    '      poll (NULL, 0, 5000);\n'
+    '#endif',
+    1
+)
+
+# Patch 2: gather_random() — wrap the entire poll() block (including the
+# _gcry_pre/post_syscall wrappers and error handling) in #ifdef __EMSCRIPTEN__.
+# Under Emscripten we just set rc = 1 (data ready) and skip straight to read().
+old_block = (
+    '      pfd.fd = fd;\n'
+    '      pfd.events = POLLIN;\n'
+    '\n'
+    '      _gcry_pre_syscall ();\n'
+    '      rc = poll (&pfd, 1, delay);\n'
+    '      _gcry_post_syscall ();\n'
+    '      if (!rc)\n'
+    '        {\n'
+    '          any_need_entropy = 1;\n'
+    '          delay = 3000; /* Use 3 seconds henceforth.  */\n'
+    '          continue;\n'
+    '        }\n'
+    '      else if( rc == -1 )\n'
+    '        {\n'
+    '          log_error ("poll() error: %s\\n", strerror (errno));\n'
+    '          if (!delay)\n'
+    '            delay = 1000; /* Use 1 second if we encounter an error before\n'
+    '                             we have ever blocked.  */\n'
+    '          continue;\n'
+    '        }'
+)
+new_block = (
+    '#ifdef __EMSCRIPTEN__\n'
+    '      /* Emscripten\'s /dev/urandom is backed by crypto.getRandomValues()\n'
+    '         and is always immediately readable.  Calling poll() here would\n'
+    '         trigger an Asyncify unwind through the deep gcry_pk_genkey call\n'
+    '         stack, which Emscripten\'s automatic Asyncify analysis does not\n'
+    '         fully instrument — causing callMain to return prematurely and\n'
+    '         killing the agent mid-keygen.  Skip poll entirely.  */\n'
+    '      rc = 1;\n'
+    '#else\n'
+    '      pfd.fd = fd;\n'
+    '      pfd.events = POLLIN;\n'
+    '\n'
+    '      _gcry_pre_syscall ();\n'
+    '      rc = poll (&pfd, 1, delay);\n'
+    '      _gcry_post_syscall ();\n'
+    '      if (!rc)\n'
+    '        {\n'
+    '          any_need_entropy = 1;\n'
+    '          delay = 3000; /* Use 3 seconds henceforth.  */\n'
+    '          continue;\n'
+    '        }\n'
+    '      else if( rc == -1 )\n'
+    '        {\n'
+    '          log_error ("poll() error: %s\\n", strerror (errno));\n'
+    '          if (!delay)\n'
+    '            delay = 1000; /* Use 1 second if we encounter an error before\n'
+    '                             we have ever blocked.  */\n'
+    '          continue;\n'
+    '        }\n'
+    '#endif'
+)
+if old_block not in src:
+    print("WARNING: could not find poll(&pfd) block to patch", file=sys.stderr)
+else:
+    src = src.replace(old_block, new_block, 1)
+
+with open(path, 'w') as f:
+    f.write(src)
+
+print("rndoldlinux.c patched OK")
+PY
+}
+
 ensure_libgpg_error_lock_header
 
 build_libusb
@@ -232,6 +335,8 @@ build_autotools_pkg \
   --enable-static \
   --disable-shared \
   --disable-tests
+
+patch_libgcrypt_rndoldlinux
 
 build_autotools_pkg \
   libgcrypt \

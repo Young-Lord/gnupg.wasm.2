@@ -85,7 +85,12 @@ open_device (const char *name, int retry)
   if (fd == -1 && retry)
     {
       _gcry_random_progress ("wait_dev_random", 'X', 0, 5);
+      /* Avoid poll() under Emscripten — see comment in gather_random. */
+#ifdef __EMSCRIPTEN__
+      usleep (100000);  /* 100 ms */
+#else
       poll (NULL, 0, 5000);
+#endif
       goto again;
     }
   if (fd == -1)
@@ -301,6 +306,15 @@ _gcry_rndoldlinux_gather_random (void (*add)(const void*, size_t,
           any_need_entropy = 1;
         }
 
+#ifdef __EMSCRIPTEN__
+      /* Emscripten's /dev/urandom is backed by crypto.getRandomValues()
+         and is always immediately readable.  Calling poll() here would
+         trigger an Asyncify unwind through the deep gcry_pk_genkey call
+         stack, which Emscripten's automatic Asyncify analysis does not
+         fully instrument — causing callMain to return prematurely and
+         killing the agent mid-keygen.  Skip poll entirely.  */
+      rc = 1;
+#else
       pfd.fd = fd;
       pfd.events = POLLIN;
 
@@ -321,6 +335,7 @@ _gcry_rndoldlinux_gather_random (void (*add)(const void*, size_t,
                              we have ever blocked.  */
           continue;
         }
+#endif
 
       do
         {
