@@ -144,8 +144,36 @@ extra_fd_replacement = (
     '{nfd:nfd,position:0,path:"/dev/fd/"+nfd,flags:2,seekable:false},nfd)}}}}'
 )
 
+## ── Trusted Types: wrap bare new Worker(pthreadMainJs,...) in allocateUnusedWorker ──
+## Emscripten (with or without -sTRUSTED_TYPES=1) may emit a bare:
+##   worker = new Worker(pthreadMainJs, { ... });
+## which violates Trusted Types in IWA context.
+## Fix: wrap pthreadMainJs through a cached TrustedScriptURL policy.
+import re
+
+# Match: worker = new Worker(pthreadMainJs, {
+# (with optional whitespace variations)
+# We replace just the URL argument, keeping everything else intact.
+trusted_re = re.compile(
+    r'(worker\s*=\s*new\s+Worker\s*\()pthreadMainJs(\s*,)'
+)
+
+trusted_replacement_str = (
+    r'\1function(){'
+    r'if(!globalThis.__emWorkerPolicy){'
+    r'try{if(globalThis.trustedTypes&&trustedTypes.createPolicy){'
+    r'globalThis.__emWorkerPolicy=trustedTypes.createPolicy('
+    r'"emscripten#workerPolicy2",{createScriptURL:function(s){return s}})'
+    r'}}catch(e){}}'
+    r'return globalThis.__emWorkerPolicy'
+    r'?globalThis.__emWorkerPolicy.createScriptURL(pthreadMainJs)'
+    r':pthreadMainJs'
+    r'}()\2'
+)
+
 poll_count = 0
 fd_count = 0
+tt_count = 0
 
 for sub in ('bin', 'libexec'):
     root = prefix / sub
@@ -172,11 +200,17 @@ for sub in ('bin', 'libexec'):
             fd_count += 1
             replaced = True
 
+        new_updated, n = trusted_re.subn(trusted_replacement_str, updated)
+        if n > 0:
+            updated = new_updated
+            tt_count += n
+            replaced = True
+
         if not replaced:
             continue
         path.write_text(updated, encoding='utf-8')
 
-print(f'poll={poll_count} extra_fds={fd_count}')
+print(f'poll={poll_count} extra_fds={fd_count} trusted_types={tt_count}')
 PY
 )"
   wasm_info "Patched wasm launchers: $patched"
@@ -244,6 +278,7 @@ GNUPG_CFLAGS="$CFLAGS"
 GNUPG_CXXFLAGS="$CXXFLAGS"
 if [[ "$TARGET" == "browser" ]]; then
   GNUPG_LDFLAGS="$(wasm_append_flags "$LDFLAGS" "$WASM_BROWSER_LDFLAGS")"
+  GNUPG_LDFLAGS="$(wasm_append_flags "$GNUPG_LDFLAGS" "-sTRUSTED_TYPES=1")"
 else
   GNUPG_LDFLAGS="$(wasm_append_flags "$LDFLAGS" "$WASM_NODE_LDFLAGS")"
 fi

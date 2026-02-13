@@ -23,32 +23,38 @@
 
     <section class="panel reveal" style="--delay: 0.1s;">
       <h2>Runtime Setup</h2>
-      <div class="field-grid two">
-        <label>
-          GPG launcher URL
-          <input id="gpgScriptUrl" type="text" spellcheck="false">
-        </label>
-        <label>
-          GPG wasm URL
-          <input id="gpgWasmUrl" type="text" spellcheck="false">
-        </label>
-        <label>
-          GNUPGHOME (virtual FS)
-          <input id="homedir" type="text" value="/gnupg" spellcheck="false">
-        </label>
-        <label>
-          Default passphrase
-          <input id="defaultPassphrase" type="password" placeholder="used by pinentry callback">
-        </label>
+      <div class="category-group">
+        <p class="category-title">Runtime Paths</p>
+        <div class="field-grid two">
+          <label>
+            GPG launcher URL
+            <input id="gpgScriptUrl" type="text" spellcheck="false">
+          </label>
+          <label>
+            GPG wasm URL
+            <input id="gpgWasmUrl" type="text" spellcheck="false">
+          </label>
+          <label>
+            GNUPGHOME (virtual FS)
+            <input id="homedir" type="text" value="/gnupg" spellcheck="false">
+          </label>
+          <label>
+            Default passphrase
+            <input id="defaultPassphrase" type="password" placeholder="used by pinentry callback">
+          </label>
+        </div>
       </div>
 
-      <div class="row wrap">
-        <label class="toggle-label">
-          <input id="autoPinentry" type="checkbox" checked>
-          Auto-answer pinentry with default passphrase
-        </label>
-        <button id="btnPing" class="run-action">Run --version</button>
-        <button id="btnResetSession">Reset Session State</button>
+      <div class="category-group">
+        <p class="category-title">Session Controls</p>
+        <div class="row wrap">
+          <label class="toggle-label">
+            <input id="autoPinentry" type="checkbox" checked>
+            Auto-answer pinentry with default passphrase
+          </label>
+          <button id="btnPing" class="run-action">Run --version</button>
+          <button id="btnResetSession">Reset Session State</button>
+        </div>
       </div>
 
       <p id="sessionInfo" class="session-info">Session state is ready (in-memory).</p>
@@ -57,97 +63,111 @@
     <div class="split reveal" style="--delay: 0.16s;">
       <section class="panel">
         <h2>File Workspace</h2>
-        <div class="field-grid two">
-          <label>
-            Active file path
-            <input id="filePath" type="text" value="/work/note.txt" spellcheck="false">
-          </label>
-          <label>
-            Source path (crypto actions)
-            <input id="sourcePath" type="text" value="/work/input.txt" spellcheck="false">
-          </label>
-          <label>
-            Output path (crypto actions)
-            <input id="outputPath" type="text" value="/work/output.asc" spellcheck="false">
-          </label>
-          <label>
-            Recipient / key selector
-            <input id="recipient" type="text" value="" placeholder="fingerprint, keyid, or uid" spellcheck="false">
-          </label>
+        <div class="category-group">
+          <p class="category-title">Workspace Paths</p>
+          <div class="field-grid two">
+            <label>
+              Active file path
+              <input id="filePath" type="text" value="/work/note.txt" spellcheck="false">
+            </label>
+            <label>
+              Source path (crypto actions)
+              <input id="sourcePath" type="text" value="/work/input.txt" spellcheck="false">
+            </label>
+            <label>
+              Output path (crypto actions)
+              <input id="outputPath" type="text" value="/work/output.asc" spellcheck="false">
+            </label>
+            <label>
+              Recipient / key selector
+              <input id="recipient" type="text" value="" placeholder="fingerprint, keyid, or uid" spellcheck="false">
+            </label>
+          </div>
         </div>
 
-        <textarea id="fileContent" rows="14" spellcheck="false" placeholder="edit file content here"></textarea>
-
-        <div class="row wrap">
-          <button id="btnSaveFile">Save File</button>
-          <button id="btnLoadFile">Load File</button>
-          <button id="btnDeleteFile">Delete File</button>
-          <button id="btnCopyOutputToEditor">Load Output Path into Editor</button>
+        <div class="category-group">
+          <p class="category-title">Editor</p>
+          <textarea id="fileContent" rows="14" spellcheck="false" placeholder="edit file content here"></textarea>
         </div>
 
-        <pre id="fileTree" class="file-tree"></pre>
+        <div class="category-group">
+          <p class="category-title">File Actions</p>
+          <div class="row wrap">
+            <button id="btnSaveFile">Save File</button>
+            <button id="btnLoadFile">Load File</button>
+            <button id="btnDeleteFile">Delete File</button>
+            <button id="btnCopyOutputToEditor">Load Output Path into Editor</button>
+          </div>
+        </div>
+
+        <div class="category-group">
+          <p class="category-title">File Manager Tree</p>
+          <pre id="fileTree" class="file-tree"></pre>
+        </div>
       </section>
 
       <section class="panel">
         <h2>Keyring and Crypto Actions</h2>
-        <div class="field-grid two">
-          <label>
-            Name
-            <input id="keyName" type="text" value="Browser Demo User" spellcheck="false">
-          </label>
-          <label>
-            Email
-            <input id="keyEmail" type="email" value="browser-demo@example.test" spellcheck="false">
-          </label>
-          <label>
-            Expire
-            <input id="keyExpire" type="text" value="1y" spellcheck="false">
-          </label>
-          <label>
-            Export selector
-            <input id="exportSelector" type="text" placeholder="uid, keyid, or fingerprint" spellcheck="false">
-          </label>
-          <label>
-            Keyserver
-            <input id="keyserverUrl" type="text" value="hkps://keys.openpgp.org" placeholder="hkps://keys.openpgp.org" spellcheck="false">
-          </label>
-          <label>
-            Keyserver query / key id
-            <input id="keyserverQuery" type="text" placeholder="email, uid, keyid, or fingerprint" spellcheck="false">
-          </label>
+        <div class="category-group">
+          <p class="category-title">Key Identity and Keyserver</p>
+          <div class="field-grid two">
+            <label>
+              Name
+              <input id="keyName" type="text" value="Browser Demo User" spellcheck="false">
+            </label>
+            <label>
+              Email
+              <input id="keyEmail" type="email" value="browser-demo@example.test" spellcheck="false">
+            </label>
+            <label>
+              Expire
+              <input id="keyExpire" type="text" value="1y" spellcheck="false">
+            </label>
+            <label>
+              Export selector
+              <input id="exportSelector" type="text" placeholder="uid, keyid, or fingerprint" spellcheck="false">
+            </label>
+            <label>
+              Keyserver
+              <input id="keyserverUrl" type="text" value="hkps://keys.openpgp.org" placeholder="hkps://keys.openpgp.org" spellcheck="false">
+            </label>
+            <label>
+              Keyserver query / key id
+              <input id="keyserverQuery" type="text" placeholder="email, uid, keyid, or fingerprint" spellcheck="false">
+            </label>
+          </div>
         </div>
 
-        <div class="row wrap">
-          <button id="btnGenerateKey" class="run-action">Generate Key</button>
-          <button id="btnListPub" class="run-action">List Public Keys</button>
-          <button id="btnListSec" class="run-action">List Secret Keys</button>
-          <button id="btnExportPub" class="run-action">Export Public Key</button>
-          <button id="btnImportFromEditor" class="run-action">Import Key from Editor</button>
+        <div class="category-group">
+          <p class="category-title">Keyring Operations</p>
+          <div class="row wrap">
+            <button id="btnGenerateKey" class="run-action">Generate Key</button>
+            <button id="btnListPub" class="run-action">List Public Keys</button>
+            <button id="btnListSec" class="run-action">List Secret Keys</button>
+            <button id="btnExportPub" class="run-action">Export Public Key</button>
+            <button id="btnImportFromEditor" class="run-action">Import Key from Editor</button>
+          </div>
         </div>
 
-        <div class="row wrap">
-          <button id="btnKeyserverSearch" class="run-action">Search Keyserver</button>
-          <button id="btnKeyserverRecv" class="run-action">Receive Key</button>
-          <button id="btnKeyserverSend" class="run-action">Send Key</button>
-          <button id="btnKeyserverRefresh" class="run-action">Refresh Keys</button>
+        <div class="category-group">
+          <p class="category-title">Keyserver Operations</p>
+          <div class="row wrap">
+            <button id="btnKeyserverSearch" class="run-action">Search Keyserver</button>
+            <button id="btnKeyserverRecv" class="run-action">Receive Key</button>
+            <button id="btnKeyserverSend" class="run-action">Send Key</button>
+            <button id="btnKeyserverRefresh" class="run-action">Refresh Keys</button>
+          </div>
         </div>
 
-        <div class="row wrap">
-          <button id="btnSymmetricEncrypt" class="run-action">Symmetric Encrypt</button>
-          <button id="btnPublicEncrypt" class="run-action">Public-Key Encrypt</button>
-          <button id="btnDecrypt" class="run-action">Decrypt</button>
-          <button id="btnClearSign" class="run-action">Clearsign</button>
-          <button id="btnVerify" class="run-action">Verify</button>
-        </div>
-
-        <div class="field-grid two">
-          <label>
-            Symmetric profile
-            <select id="symmetricProfile">
-              <option value="secure" selected>Secure (default S2K)</option>
-              <option value="fast-dev">Fast Dev (--s2k-count 65536)</option>
-            </select>
-          </label>
+        <div class="category-group">
+          <p class="category-title">Crypto Operations</p>
+          <div class="row wrap">
+            <button id="btnSymmetricEncrypt" class="run-action">Symmetric Encrypt</button>
+            <button id="btnPublicEncrypt" class="run-action">Public-Key Encrypt</button>
+            <button id="btnDecrypt" class="run-action">Decrypt</button>
+            <button id="btnClearSign" class="run-action">Clearsign</button>
+            <button id="btnVerify" class="run-action">Verify</button>
+          </div>
         </div>
 
         <p class="hint">
@@ -160,6 +180,29 @@
         </p>
       </section>
     </div>
+
+    <section class="panel reveal" style="--delay: 0.19s;">
+      <h2>Card Operations</h2>
+      <div class="category-group">
+        <p class="category-title">USB Device Authorization</p>
+        <div class="row wrap">
+          <button id="btnRequestUsbDevice">Select USB Smartcard Device</button>
+          <button id="btnClearUsbDevices">Clear Selected USB Devices</button>
+        </div>
+        <pre id="usbDevices" class="file-tree"></pre>
+      </div>
+      <div class="category-group">
+        <p class="category-title">Smartcard Commands</p>
+        <div class="row wrap">
+          <button id="btnCardStatus" class="run-action">card-status</button>
+          <button id="btnEditCard" class="run-action">edit-card</button>
+        </div>
+      </div>
+      <p class="hint">
+        Card commands depend on scdaemon + WebUSB access and only use devices selected above.
+        For interactive prompts in edit-card, use the stdin preset box or dialog.
+      </p>
+    </section>
 
     <section class="panel reveal" style="--delay: 0.22s;">
       <h2>Raw Command Runner</h2>

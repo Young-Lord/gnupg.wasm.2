@@ -8,6 +8,8 @@ let activePersistRoots = [];
 let activeSessionId = '';
 let activeStderrBuffer = [];
 let sessionRunning = false;
+let persistentScdaemonFd = null;
+let debugEnabled = false;
 
 const runtimeState = {
   bootPromise: null,
@@ -16,6 +18,60 @@ const runtimeState = {
 };
 
 let bridgeMetrics = createBridgeMetrics();
+const DEBUG_BUILD_TAG = '2026-02-13-log-v2';
+
+let workerUrlPolicy = undefined;
+
+function getWorkerUrlPolicy() {
+  if (workerUrlPolicy !== undefined) {
+    return workerUrlPolicy;
+  }
+  if (!self.trustedTypes || typeof self.trustedTypes.createPolicy !== 'function') {
+    workerUrlPolicy = null;
+    return workerUrlPolicy;
+  }
+
+  const policyNames = [
+    'gnupg-wasm-worker-url',
+    'gnupg-wasm',
+    'default',
+  ];
+
+  for (const name of policyNames) {
+    try {
+      workerUrlPolicy = self.trustedTypes.createPolicy(name, {
+        createScriptURL(value) {
+          return String(value);
+        },
+      });
+      return workerUrlPolicy;
+    } catch {
+      /* Ignore policy creation failures and try next candidate. */
+    }
+  }
+
+  if (self.trustedTypes.defaultPolicy
+      && typeof self.trustedTypes.defaultPolicy.createScriptURL === 'function') {
+    workerUrlPolicy = self.trustedTypes.defaultPolicy;
+    return workerUrlPolicy;
+  }
+
+  workerUrlPolicy = null;
+  return workerUrlPolicy;
+}
+
+function asWorkerScriptUrl(value) {
+  const url = String(value);
+  const policy = getWorkerUrlPolicy();
+  if (!policy || typeof policy.createScriptURL !== 'function') {
+    return url;
+  }
+  try {
+    return policy.createScriptURL(url);
+  } catch {
+    return url;
+  }
+}
 
 function createBridgeMetrics() {
   return {
@@ -31,6 +87,9 @@ function createBridgeMetrics() {
 }
 
 function postDebug(step, data) {
+  if (!debugEnabled) {
+    return;
+  }
   postMessage({
     type: 'debug',
     step,
@@ -100,6 +159,42 @@ function normalizePersistRoots(value, fallback) {
   }
 
   return roots;
+}
+
+function normalizeUsbAuthorizedDevices(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const out = [];
+  const seen = new Set();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const vendorId = Number(entry.vendorId);
+    const productId = Number(entry.productId);
+    if (!Number.isFinite(vendorId) || !Number.isFinite(productId)) {
+      continue;
+    }
+
+    const normalizedEntry = {
+      vendorId: Math.max(0, Math.min(0xffff, vendorId | 0)),
+      productId: Math.max(0, Math.min(0xffff, productId | 0)),
+      serialNumber: typeof entry.serialNumber === 'string' ? entry.serialNumber : '',
+    };
+
+    const key = `${normalizedEntry.vendorId}:${normalizedEntry.productId}:${normalizedEntry.serialNumber}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(normalizedEntry);
+  }
+
+  return out;
 }
 
 function parentDirectory(pathValue) {
@@ -370,6 +465,98 @@ function summarizeQueue(queue) {
   };
 }
 
+function ensurePersistentScdaemonFd(FS, envObj) {
+  if (!FS || !envObj) {
+    throw new Error('runtime FS/ENV unavailable for scdaemon bridge');
+  }
+  if (!FS.registerDevice || !FS.mkdev || !FS.makedev) {
+    throw new Error('FS device registration APIs are unavailable');
+  }
+
+  if (persistentScdaemonFd !== null) {
+    envObj.GNUPG_WASM_SCDAEMON_FD = String(persistentScdaemonFd);
+    return persistentScdaemonFd;
+  }
+
+  const devName = `gnupg-scd-bridge-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+  const devPath = `/dev/${devName}`;
+  const major = 64;
+  const minor = ((Date.now() + 29) % 200) + Math.floor(Math.random() * 50);
+  const dev = FS.makedev(major, minor);
+  const POLLIN = 0x001;
+  const POLLOUT = 0x004;
+  const POLLHUP = 0x010;
+  const errnoCodes = self.ERRNO_CODES || (self.Module && self.Module.ERRNO_CODES) || null;
+  const EAGAIN = errnoCodes && Number.isFinite(errnoCodes.EAGAIN)
+    ? Number(errnoCodes.EAGAIN)
+    : 6;
+
+  FS.registerDevice(dev, {
+    read(stream, buffer, offset, length) {
+      if (!activeScdaemonBridge) {
+        throw new FS.ErrnoError(EAGAIN);
+      }
+      if (length <= 0) {
+        return 0;
+      }
+      let count = 0;
+      const firstByte = activeScdaemonBridge.readByte(true);
+      if (firstByte === null) {
+        return 0;
+      }
+      buffer[offset + count] = firstByte;
+      count += 1;
+
+      while (count < length) {
+        const byteValue = activeScdaemonBridge.readByte(false);
+        if (byteValue === undefined || byteValue === null) {
+          break;
+        }
+        buffer[offset + count] = byteValue;
+        count += 1;
+      }
+      return count;
+    },
+    write(stream, buffer, offset, length) {
+      if (!activeScdaemonBridge) {
+        throw new FS.ErrnoError(EAGAIN);
+      }
+      let count = 0;
+      while (count < length) {
+        activeScdaemonBridge.writeByte(buffer[offset + count]);
+        count += 1;
+      }
+      return count;
+    },
+    poll(stream, timeout, notifyCallback) {
+      if (!activeScdaemonBridge) {
+        return POLLOUT;
+      }
+      let mask = POLLOUT;
+      if (activeScdaemonBridge.hasReadableData()) {
+        mask |= POLLIN;
+      }
+      if (activeScdaemonBridge.isReadableClosed()) {
+        mask |= POLLHUP;
+      }
+      if (mask === POLLOUT && typeof notifyCallback === 'function') {
+        activeScdaemonBridge.registerReadableHandler(notifyCallback);
+      }
+      return mask;
+    },
+  });
+
+  FS.mkdev(devPath, 0o600, dev);
+  const stream = FS.open(devPath, 'r+');
+  persistentScdaemonFd = stream.fd;
+  envObj.GNUPG_WASM_SCDAEMON_FD = String(stream.fd);
+  postDebug('runtime.scdaemon-fd', {
+    devPath,
+    fd: stream.fd,
+  });
+  return stream.fd;
+}
+
 function writeStderrByte(ch) {
   if (ch === null || ch === undefined) {
     return;
@@ -398,7 +585,7 @@ async function importLauncherScript(scriptUrl) {
   const useFetchBlobPath = !/\.m?js(?:[?#].*)?$/i.test(scriptUrl);
 
   if (!useFetchBlobPath) {
-    importScripts(scriptUrl);
+    importScripts(asWorkerScriptUrl(scriptUrl));
     return;
   }
 
@@ -410,7 +597,7 @@ async function importLauncherScript(scriptUrl) {
   const source = await response.text();
   const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
   try {
-    importScripts(blobUrl);
+    importScripts(asWorkerScriptUrl(blobUrl));
   } finally {
     URL.revokeObjectURL(blobUrl);
   }
@@ -476,11 +663,22 @@ async function ensureRuntime(gpgAgentScriptUrl, gpgAgentWasmUrl) {
           }
           activeFS = FS;
 
-          const envObj = self.ENV || (self.Module && self.Module.ENV);
-          if (envObj) {
-            envObj.GNUPG_WASM_TRACE = '1';
-            envObj.GNUPG_WASM_PERSISTENT_AGENT = '1';
-          }
+          const envObj = (() => {
+            const base = self.ENV && typeof self.ENV === 'object' ? self.ENV : {};
+            self.ENV = base;
+            if (self.Module && typeof self.Module === 'object') {
+              self.Module.ENV = base;
+            }
+            if (debugEnabled) {
+              base.GNUPG_WASM_TRACE = '1';
+            } else if (Object.prototype.hasOwnProperty.call(base, 'GNUPG_WASM_TRACE')) {
+              delete base.GNUPG_WASM_TRACE;
+            }
+            base.GNUPG_WASM_PERSISTENT_AGENT = '1';
+            return base;
+          })();
+
+          let stdinDeliveredInRead = 0;
 
           FS.init(
             () => {
@@ -488,12 +686,16 @@ async function ensureRuntime(gpgAgentScriptUrl, gpgAgentWasmUrl) {
               if (!activeBridge) {
                 return undefined;
               }
-              const value = queuePopByte(activeBridge.gpgToAgent, false);
+              const shouldBlock = stdinDeliveredInRead === 0;
+              const value = queuePopByte(activeBridge.gpgToAgent, shouldBlock);
               if (value !== null && value !== undefined) {
+                stdinDeliveredInRead += 1;
                 bridgeMetrics.stdinRead += 1;
                 if (bridgeMetrics.stdinPreview.length < 32) {
                   bridgeMetrics.stdinPreview.push(Number(value) & 0xff);
                 }
+              } else {
+                stdinDeliveredInRead = 0;
               }
               return value;
             },
@@ -514,6 +716,8 @@ async function ensureRuntime(gpgAgentScriptUrl, gpgAgentWasmUrl) {
               writeStderrByte(ch);
             }
           );
+
+          ensurePersistentScdaemonFd(FS, envObj);
         },
       ],
       onRuntimeInitialized: () => {
@@ -613,6 +817,8 @@ function finishSession(sessionId, exitCode, errorMessage) {
 }
 
 async function handleRunSession(message) {
+  debugEnabled = Boolean(message && message.debug === true);
+
   const sessionId = typeof message.sessionId === 'string' && message.sessionId
     ? message.sessionId
     : `agent-session-${Date.now()}`;
@@ -692,6 +898,7 @@ async function handleRunSession(message) {
   const incomingFsState = message.fsState && typeof message.fsState === 'object'
     ? message.fsState
     : null;
+  const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(message.usbAuthorizedDevices);
 
   if (!gpgScdaemonScriptUrl && message.gpgAgentScriptUrl) {
     gpgScdaemonScriptUrl = String(message.gpgAgentScriptUrl)
@@ -713,14 +920,16 @@ async function handleRunSession(message) {
   }
 
   postDebug('session.start', {
+    buildTag: DEBUG_BUILD_TAG,
     sessionId,
     homedir,
     persistRoots: activePersistRoots,
+    usbAuthorizedDeviceCount: usbAuthorizedDevices.length,
     hasIncomingFsState: Boolean(incomingFsState),
   });
 
   const createScdaemonBridge = () => {
-    const worker = new Worker(gpgScdaemonWorkerUrl);
+    const worker = new Worker(asWorkerScriptUrl(gpgScdaemonWorkerUrl));
     let daemonDone = false;
     let resolveResult;
     let rejectResult;
@@ -798,10 +1007,17 @@ async function handleRunSession(message) {
       }
       if (messageData.type === 'error') {
         postDebug('scdaemon.error', { message: String(messageData.message || 'unknown worker error') });
+        resolveReady(false);
         return;
       }
       if (messageData.type === 'result') {
         daemonDone = true;
+        postDebug('scdaemon.exit', {
+          sessionId,
+          exitCode: Number.isFinite(messageData.exitCode) ? Number(messageData.exitCode) : null,
+          error: messageData.error ? String(messageData.error) : '',
+        });
+        resolveReady(false);
         resolveResult(messageData);
       }
     });
@@ -814,9 +1030,11 @@ async function handleRunSession(message) {
 
     worker.postMessage({
       type: 'start',
+      debug: debugEnabled,
       scdaemonScriptUrl: gpgScdaemonScriptUrl,
       scdaemonWasmUrl: gpgScdaemonWasmUrl,
       homedir,
+      usbAuthorizedDevices,
       bridge: {
         agentToScdaemon: agentToScdaemonDesc,
         scdaemonToAgent: scdaemonToAgentDesc,
@@ -824,6 +1042,9 @@ async function handleRunSession(message) {
     });
 
     return {
+      readByte(shouldBlock = true) {
+        return queuePopByte(scdaemonToAgent, shouldBlock);
+      },
       readAvailableByte() {
         return queuePopByte(scdaemonToAgent, false);
       },
@@ -891,23 +1112,49 @@ async function handleRunSession(message) {
     };
   };
 
-  try {
-    activeScdaemonBridge = createScdaemonBridge();
-    const scdReady = await activeScdaemonBridge.awaitReady(12000);
-    postDebug('scdaemon.ready', {
-      sessionId,
-      scdReady,
-      gpgScdaemonWorkerUrl,
-      gpgScdaemonScriptUrl,
-      gpgScdaemonWasmUrl,
-    });
-    if (!scdReady) {
-      finishSession(sessionId, 2, 'scdaemon worker did not report ready within timeout');
-      return;
+  if (usbAuthorizedDevices.length > 0) {
+    try {
+      activeScdaemonBridge = createScdaemonBridge();
+      const scdReady = await activeScdaemonBridge.awaitReady(12000);
+      postDebug('scdaemon.ready', {
+        sessionId,
+        scdReady,
+        gpgScdaemonWorkerUrl,
+        gpgScdaemonScriptUrl,
+        gpgScdaemonWasmUrl,
+      });
+      if (!scdReady) {
+        postDebug('scdaemon.unavailable', {
+          sessionId,
+          reason: 'worker did not report ready within timeout',
+          gpgScdaemonWorkerUrl,
+          gpgScdaemonScriptUrl,
+          gpgScdaemonWasmUrl,
+        });
+        if (activeScdaemonBridge) {
+          await activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
+          activeScdaemonBridge = null;
+        }
+      }
+    } catch (error) {
+      postDebug('scdaemon.unavailable', {
+        sessionId,
+        reason: 'failed to create scdaemon bridge',
+        errorMessage: formatError(error),
+        gpgScdaemonWorkerUrl,
+        gpgScdaemonScriptUrl,
+        gpgScdaemonWasmUrl,
+      });
+      if (activeScdaemonBridge) {
+        await activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
+        activeScdaemonBridge = null;
+      }
     }
-  } catch (error) {
-    finishSession(sessionId, 2, `failed to create scdaemon bridge: ${formatError(error)}`);
-    return;
+  } else {
+    postDebug('scdaemon.skip', {
+      sessionId,
+      reason: 'no authorized usb devices',
+    });
   }
 
   try {
@@ -930,85 +1177,41 @@ async function handleRunSession(message) {
 
   postMessage({ type: 'session-ready', sessionId });
 
+  const useQuickRandom = message.quickRandom !== false;
   const finalArgs = [
     '--server',
+    '--verbose',
     '--homedir', homedir,
   ];
+  if (useQuickRandom) {
+    finalArgs.push('--debug-quick-random');
+  }
+  postDebug('session.quick-random', {
+    sessionId,
+    enabled: useQuickRandom,
+  });
 
   try {
     const envObj = self.ENV || (self.Module && self.Module.ENV);
-    const FS = activeFS;
-    if (!FS || !envObj) {
-      throw new Error('runtime FS/ENV unavailable for scdaemon bridge');
+    if (!envObj) {
+      throw new Error('runtime ENV unavailable for scdaemon bridge');
     }
-    if (!FS.registerDevice || !FS.mkdev || !FS.makedev) {
-      throw new Error('FS device registration APIs are unavailable');
+    if (persistentScdaemonFd === null) {
+      throw new Error('persistent scdaemon fd is not initialized');
     }
-
-    const devName = `gnupg-scd-bridge-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
-    const devPath = `/dev/${devName}`;
-    const major = 64;
-    const minor = ((Date.now() + 29) % 200) + Math.floor(Math.random() * 50);
-    const dev = FS.makedev(major, minor);
-    const POLLIN = 0x001;
-    const POLLOUT = 0x004;
-    const POLLHUP = 0x010;
-    const errnoCodes = self.ERRNO_CODES || (self.Module && self.Module.ERRNO_CODES) || null;
-    const EAGAIN = errnoCodes && Number.isFinite(errnoCodes.EAGAIN)
-      ? Number(errnoCodes.EAGAIN)
-      : 6;
-
-    FS.registerDevice(dev, {
-      read(stream, buffer, offset, length) {
-        let count = 0;
-        while (count < length) {
-          const byteValue = activeScdaemonBridge.readAvailableByte();
-          if (byteValue === undefined || byteValue === null) {
-            break;
-          }
-          buffer[offset + count] = byteValue;
-          count += 1;
-          if (!activeScdaemonBridge.hasReadableData()) {
-            break;
-          }
-        }
-
-        if (count === 0 && !activeScdaemonBridge.isReadableClosed()) {
-          throw new FS.ErrnoError(EAGAIN);
-        }
-        return count;
-      },
-      write(stream, buffer, offset, length) {
-        let count = 0;
-        while (count < length) {
-          activeScdaemonBridge.writeByte(buffer[offset + count]);
-          count += 1;
-        }
-        return count;
-      },
-      poll(stream, timeout, notifyCallback) {
-        let mask = POLLOUT;
-        if (activeScdaemonBridge.hasReadableData()) {
-          mask |= POLLIN;
-        }
-        if (activeScdaemonBridge.isReadableClosed()) {
-          mask |= POLLHUP;
-        }
-        if (mask === POLLOUT && typeof notifyCallback === 'function') {
-          activeScdaemonBridge.registerReadableHandler(notifyCallback);
-        }
-        return mask;
-      },
-    });
-
-    FS.mkdev(devPath, 0o600, dev);
-    const stream = FS.open(devPath, 'r+');
-    envObj.GNUPG_WASM_SCDAEMON_FD = String(stream.fd);
-    postDebug('session.scdaemon-fd', {
-      sessionId,
-      devPath,
-      fd: stream.fd,
-    });
+    if (activeScdaemonBridge) {
+      envObj.GNUPG_WASM_SCDAEMON_FD = String(persistentScdaemonFd);
+      postDebug('session.scdaemon-fd', {
+        sessionId,
+        fd: persistentScdaemonFd,
+        persistent: true,
+      });
+    } else if (envObj.GNUPG_WASM_SCDAEMON_FD) {
+      delete envObj.GNUPG_WASM_SCDAEMON_FD;
+      postDebug('session.scdaemon-fd.disabled', {
+        sessionId,
+      });
+    }
   } catch (error) {
     finishSession(sessionId, 2, `failed to create scdaemon bridge fd: ${formatError(error)}`);
     return;

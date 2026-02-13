@@ -3,19 +3,72 @@
 const STATUS_PREFIX = '[GNUPG:]';
 let runInProgress = false;
 let stdinPromptHint = '';
+const DEBUG_BUILD_TAG = '2026-02-13-log-v2';
 const SUPPRESSED_DEBUG_STEPS = new Set([
   'run.finish',
   'run.callMain.return',
-  'run.agent.heartbeat',
-  'run.agent.write-chunk',
   'agent.finish',
   'agent.bridge.stdin',
   'agent.bridge.stdout',
   'agent.bridge.stdin.eagain',
   'agent.bridge.stdin.call',
-  'agent.bridge.stdin.byte',
   'agent.bridge.stdout.byte',
+  'agent.scdaemon.bridge.stdin.byte',
+  'agent.scdaemon.bridge.stdout.byte',
 ]);
+
+let workerUrlPolicy = undefined;
+
+function getWorkerUrlPolicy() {
+  if (workerUrlPolicy !== undefined) {
+    return workerUrlPolicy;
+  }
+  if (!self.trustedTypes || typeof self.trustedTypes.createPolicy !== 'function') {
+    workerUrlPolicy = null;
+    return workerUrlPolicy;
+  }
+
+  const policyNames = [
+    'gnupg-wasm-worker-url',
+    'gnupg-wasm',
+    'default',
+  ];
+
+  for (const name of policyNames) {
+    try {
+      workerUrlPolicy = self.trustedTypes.createPolicy(name, {
+        createScriptURL(value) {
+          return String(value);
+        },
+      });
+      return workerUrlPolicy;
+    } catch {
+      /* Ignore policy creation failures and try next candidate. */
+    }
+  }
+
+  if (self.trustedTypes.defaultPolicy
+      && typeof self.trustedTypes.defaultPolicy.createScriptURL === 'function') {
+    workerUrlPolicy = self.trustedTypes.defaultPolicy;
+    return workerUrlPolicy;
+  }
+
+  workerUrlPolicy = null;
+  return workerUrlPolicy;
+}
+
+function asWorkerScriptUrl(value) {
+  const url = String(value);
+  const policy = getWorkerUrlPolicy();
+  if (!policy || typeof policy.createScriptURL !== 'function') {
+    return url;
+  }
+  try {
+    return policy.createScriptURL(url);
+  } catch {
+    return url;
+  }
+}
 
 function postDebug(step, data) {
   if (!self.__gnupg_debug_enabled) {
@@ -109,6 +162,42 @@ function normalizePersistRoots(value, fallback) {
   }
 
   return roots;
+}
+
+function normalizeUsbAuthorizedDevices(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const out = [];
+  const seen = new Set();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const vendorId = Number(entry.vendorId);
+    const productId = Number(entry.productId);
+    if (!Number.isFinite(vendorId) || !Number.isFinite(productId)) {
+      continue;
+    }
+
+    const normalizedEntry = {
+      vendorId: Math.max(0, Math.min(0xffff, vendorId | 0)),
+      productId: Math.max(0, Math.min(0xffff, productId | 0)),
+      serialNumber: typeof entry.serialNumber === 'string' ? entry.serialNumber : '',
+    };
+
+    const key = `${normalizedEntry.vendorId}:${normalizedEntry.productId}:${normalizedEntry.serialNumber}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(normalizedEntry);
+  }
+
+  return out;
 }
 
 function splitAtOptionTerminator(args) {
@@ -380,8 +469,8 @@ function shouldForceBatchMode(args) {
   return true;
 }
 
-function shouldUseCommandFd() {
-  return true;
+function shouldUseCommandFd(args, hasStdinQueue) {
+  return hasStdinQueue === true && operationLikelyNeedsPinentry(args);
 }
 
 function emitStderrAndStatus(line) {
@@ -656,7 +745,7 @@ async function importLauncherScript(scriptUrl) {
   const useFetchBlobPath = !/\.m?js(?:[?#].*)?$/i.test(scriptUrl);
 
   if (!useFetchBlobPath) {
-    importScripts(scriptUrl);
+    importScripts(asWorkerScriptUrl(scriptUrl));
     return;
   }
 
@@ -674,7 +763,7 @@ async function importLauncherScript(scriptUrl) {
   const source = await response.text();
   const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
   try {
-    importScripts(blobUrl);
+    importScripts(asWorkerScriptUrl(blobUrl));
   } finally {
     URL.revokeObjectURL(blobUrl);
   }
@@ -755,6 +844,7 @@ async function handleRun(message) {
   if (!gpgScdaemonWasmUrl && gpgWasmUrl) {
     gpgScdaemonWasmUrl = gpgWasmUrl.replace(/gpg\.wasm(?=(?:[?#].*)?$)/, 'scdaemon.wasm');
   }
+  const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(message.usbAuthorizedDevices);
 
   const debugEnabled = message.debug === true;
   self.__gnupg_debug_enabled = debugEnabled;
@@ -808,6 +898,7 @@ async function handleRun(message) {
     };
   }
   postDebug('run.begin', {
+    buildTag: DEBUG_BUILD_TAG,
     args,
     stdinBytes: stdinBytes.length,
     hasStdinQueue: Boolean(stdinQueue),
@@ -821,6 +912,7 @@ async function handleRun(message) {
     gpgAgentWasmUrl,
     gpgScdaemonScriptUrl,
     gpgScdaemonWasmUrl,
+    usbAuthorizedDeviceCount: usbAuthorizedDevices.length,
     crossOriginIsolated: Boolean(self.crossOriginIsolated),
     hasSharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
   });
@@ -876,6 +968,7 @@ async function handleRun(message) {
         gpgScriptUrl,
         gpgWasmUrl,
         persistRoots,
+        usbAuthorizedDeviceCount: usbAuthorizedDevices.length,
         streamMetrics: { ...streamCapture.metrics },
       },
     });
@@ -913,7 +1006,7 @@ async function handleRun(message) {
   let agentHeartbeatId = null;
 
   const createAgentBridge = () => {
-    const worker = new Worker(gpgAgentWorkerUrl);
+    const worker = new Worker(asWorkerScriptUrl(gpgAgentWorkerUrl));
     let agentDone = false;
     let agentReady = false;
     let resolveResult;
@@ -1036,6 +1129,7 @@ async function handleRun(message) {
 
     worker.postMessage({
       type: 'start',
+      debug: debugEnabled,
       gpgAgentScriptUrl,
       gpgAgentWasmUrl,
       gpgScdaemonWorkerUrl,
@@ -1044,6 +1138,7 @@ async function handleRun(message) {
       homedir,
       fsState: incomingFsState,
       persistRoots,
+      usbAuthorizedDevices,
       bridge: {
         gpgToAgent: gpgToAgentDesc,
         agentToGpg: agentToGpgDesc,
@@ -1315,7 +1410,7 @@ async function handleRun(message) {
   };
 
   const createDirmngrBridge = () => {
-    const worker = new Worker(gpgDirmngrWorkerUrl);
+    const worker = new Worker(asWorkerScriptUrl(gpgDirmngrWorkerUrl));
     let dirmngrDone = false;
     let resolveResult;
     const resultPromise = new Promise((resolve) => {
@@ -1425,6 +1520,9 @@ async function handleRun(message) {
     });
 
     return {
+      readByte(shouldBlock = true) {
+        return queuePopByte(dirmngrToGpg, shouldBlock);
+      },
       readAvailableByte() {
         return queuePopByte(dirmngrToGpg, false);
       },
@@ -1563,10 +1661,10 @@ async function handleRun(message) {
     postError(`failed to create dirmngr bridge: ${formatError(error)}`);
   }
 
-  const commandFdStdin = shouldUseCommandFd();
+  const commandFdStdin = shouldUseCommandFd(args, Boolean(stdinQueue));
   postDebug('run.command-fd.mode', {
     enabled: commandFdStdin,
-    reason: 'forced-always',
+    reason: commandFdStdin ? 'pinentry-likely-and-stdin-queue' : 'pinentry-not-likely-or-no-stdin-queue',
   });
 
   const finalArgs = buildFinalArgs(args, {
@@ -1603,6 +1701,7 @@ async function handleRun(message) {
     enableAgentBridge,
     agentBridgeActive: Boolean(agentBridge),
     persistRoots,
+    usbAuthorizedDeviceCount: usbAuthorizedDevices.length,
     streamMetrics: { ...streamCapture.metrics },
     streamLengths: {
       stdout: streamCapture.stdout.length,
@@ -1835,6 +1934,12 @@ async function handleRun(message) {
                 if (immediate !== null) {
                   stdinRequestPending = false;
                   stdinPromptHint = '';
+                } else if (debugEnabled) {
+                  postDebug('run.stdin.eof', {
+                    mode: 'immediate',
+                    prompt: stdinPromptHint || '',
+                    queue: summarizeQueue(stdinQueue),
+                  });
                 }
                 return immediate;
               }
@@ -1843,6 +1948,12 @@ async function handleRun(message) {
               if (waited !== null) {
                 stdinRequestPending = false;
                 stdinPromptHint = '';
+              } else if (debugEnabled) {
+                postDebug('run.stdin.eof', {
+                  mode: 'waited',
+                  prompt: stdinPromptHint || '',
+                  queue: summarizeQueue(stdinQueue),
+                });
               }
               return waited;
             }
@@ -1890,6 +2001,7 @@ async function handleRun(message) {
             let bridgeReadCalls = 0;
             let bridgeWriteCalls = 0;
             let bridgePollCalls = 0;
+            let bridgeReadLoggedCalls = 0;
             let bridgeWriteLoggedCalls = 0;
             let bridgeLastReadLogAt = 0;
             let bridgeLastWriteLogAt = 0;
@@ -1899,16 +2011,27 @@ async function handleRun(message) {
               read(stream, buffer, offset, length) {
                 bridgeReadCalls += 1;
                 let count = 0;
+                const firstBytes = [];
                 while (count < length) {
-                  const byteValue = agentBridge.readAvailableByte();
+                  // Block on first byte (Atomics.wait), non-blocking for rest.
+                  // This mirrors the agent-side hybrid blocking stdin pattern
+                  // and avoids the EAGAIN race where libassuan's retry loop
+                  // may not work correctly under Asyncify.
+                  const shouldBlock = count === 0;
+                  const byteValue = shouldBlock
+                    ? agentBridge.readByte(true)
+                    : agentBridge.readAvailableByte();
 
                   if (byteValue === undefined) {
                     break;
                   }
-                  if (byteValue === null || byteValue === undefined) {
+                  if (byteValue === null) {
                     break;
                   }
                   buffer[offset + count] = byteValue;
+                  if (firstBytes.length < 64) {
+                    firstBytes.push(Number(byteValue) & 0xff);
+                  }
                   count += 1;
 
                   if (!agentBridge.hasReadableData()) {
@@ -1916,19 +2039,22 @@ async function handleRun(message) {
                   }
                 }
 
-                if (count === 0 && !agentBridge.isReadableClosed()) {
-                  const now = Date.now();
-                  if (debugEnabled && now - bridgeLastReadLogAt > 1500) {
-                    bridgeLastReadLogAt = now;
-                    emitStderrAndStatus(`[agent-bridge] read->EAGAIN calls=${bridgeReadCalls}`);
-                  }
-                  throw new FS.ErrnoError(EAGAIN);
-                }
+                // count===0 only if readByte returned null (queue closed = EOF)
+                // No EAGAIN needed — first byte blocks until data or close.
                 if (debugEnabled && count > 0) {
+                  const ascii = String.fromCharCode(...firstBytes.map((v) => (v >= 32 && v <= 126 ? v : 46)));
+                  if (bridgeReadLoggedCalls < 16) {
+                    bridgeReadLoggedCalls += 1;
+                    postDebug('run.agent.rx', {
+                      call: bridgeReadCalls,
+                      bytes: count,
+                      ascii,
+                    });
+                  }
                   const now = Date.now();
                   if (now - bridgeLastReadLogAt > 1500) {
                     bridgeLastReadLogAt = now;
-                    emitStderrAndStatus(`[agent-bridge] read bytes=${count} calls=${bridgeReadCalls}`);
+                    emitStderrAndStatus(`[agent-bridge] read bytes=${count} calls=${bridgeReadCalls} ascii=${ascii}`);
                   }
                 }
                 return count;
@@ -1949,14 +2075,11 @@ async function handleRun(message) {
                   bridgeWriteLoggedCalls += 1;
                   const hasLf = firstBytes.includes(10);
                   const ascii = String.fromCharCode(...firstBytes.map((v) => (v >= 32 && v <= 126 ? v : 46)));
-                  const stats = agentBridge.getStats();
-                  postDebug('run.agent.write-chunk', {
+                  postDebug('run.agent.tx', {
                     call: bridgeWriteCalls,
                     bytes: count,
                     hasLf,
-                    preview: firstBytes,
                     ascii,
-                    queue: stats.gpgToAgent,
                   });
                 }
                 if (debugEnabled) {
@@ -2034,7 +2157,11 @@ async function handleRun(message) {
                 read(stream, buffer, offset, length) {
                   let count = 0;
                   while (count < length) {
-                    const byteValue = bridge.readAvailableByte();
+                    // Block on first byte, non-blocking for rest (hybrid pattern)
+                    const shouldBlock = count === 0;
+                    const byteValue = shouldBlock
+                      ? bridge.readByte(true)
+                      : bridge.readAvailableByte();
                     if (byteValue === undefined || byteValue === null) {
                       break;
                     }
@@ -2045,9 +2172,7 @@ async function handleRun(message) {
                     }
                   }
 
-                  if (count === 0 && !bridge.isReadableClosed()) {
-                    throw new FS.ErrnoError(EAGAIN);
-                  }
+                  // count===0 only if readByte returned null (queue closed = EOF)
                   return count;
                 },
                 write(stream, buffer, offset, length) {

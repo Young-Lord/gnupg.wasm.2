@@ -13,6 +13,59 @@ function toUrlString(value, baseUrl) {
   }
 }
 
+let workerUrlPolicy = undefined;
+
+function getWorkerUrlPolicy() {
+  if (workerUrlPolicy !== undefined) {
+    return workerUrlPolicy;
+  }
+  if (!globalThis.trustedTypes || typeof globalThis.trustedTypes.createPolicy !== 'function') {
+    workerUrlPolicy = null;
+    return workerUrlPolicy;
+  }
+
+  const policyNames = [
+    'gnupg-wasm-worker-url',
+    'gnupg-wasm',
+    'default',
+  ];
+
+  for (const name of policyNames) {
+    try {
+      workerUrlPolicy = globalThis.trustedTypes.createPolicy(name, {
+        createScriptURL(value) {
+          return String(value);
+        },
+      });
+      return workerUrlPolicy;
+    } catch {
+      /* Ignore policy creation failures and try next candidate. */
+    }
+  }
+
+  if (globalThis.trustedTypes.defaultPolicy
+      && typeof globalThis.trustedTypes.defaultPolicy.createScriptURL === 'function') {
+    workerUrlPolicy = globalThis.trustedTypes.defaultPolicy;
+    return workerUrlPolicy;
+  }
+
+  workerUrlPolicy = null;
+  return workerUrlPolicy;
+}
+
+function asWorkerScriptUrl(value) {
+  const url = String(value);
+  const policy = getWorkerUrlPolicy();
+  if (!policy || typeof policy.createScriptURL !== 'function') {
+    return url;
+  }
+  try {
+    return policy.createScriptURL(url);
+  } catch {
+    return url;
+  }
+}
+
 function normalizePinentryReply(reply) {
   if (typeof reply === 'string') {
     return {
@@ -172,6 +225,44 @@ function normalizeStringArray(value) {
     return [];
   }
   return value.map((item) => String(item));
+}
+
+function normalizeUsbAuthorizedDevices(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const out = [];
+  const seen = new Set();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const vendorId = Number(entry.vendorId);
+    const productId = Number(entry.productId);
+    if (!Number.isFinite(vendorId) || !Number.isFinite(productId)) {
+      continue;
+    }
+
+    const normalizedEntry = {
+      vendorId: Math.max(0, Math.min(0xffff, vendorId | 0)),
+      productId: Math.max(0, Math.min(0xffff, productId | 0)),
+      serialNumber: typeof entry.serialNumber === 'string'
+        ? entry.serialNumber
+        : '',
+    };
+
+    const key = `${normalizedEntry.vendorId}:${normalizedEntry.productId}:${normalizedEntry.serialNumber}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(normalizedEntry);
+  }
+
+  return out;
 }
 
 function normalizeStdinText(value) {
@@ -457,7 +548,7 @@ export class WasmGpgBrowserClient {
       this._teardownAgentSessionWorker('agent session worker config changed');
     }
 
-    const worker = new Worker(this.gpgAgentSessionWorkerUrl);
+    const worker = new Worker(asWorkerScriptUrl(this.gpgAgentSessionWorkerUrl));
     worker.addEventListener('message', (event) => {
       const message = event.data;
       if (!message || typeof message !== 'object') {
@@ -520,7 +611,7 @@ export class WasmGpgBrowserClient {
     return worker;
   }
 
-  async _startPersistentAgentSession(fsState, persistRoots) {
+  async _startPersistentAgentSession(fsState, persistRoots, usbAuthorizedDevices, debugEnabled = false) {
     const worker = this._ensureAgentSessionWorker(
       this._agentSessionCallbacks.onDebug,
       this._agentSessionCallbacks.onStderr,
@@ -559,6 +650,7 @@ export class WasmGpgBrowserClient {
     try {
       worker.postMessage({
         type: 'run-session',
+        debug: debugEnabled === true,
         sessionId,
         gpgAgentScriptUrl: this.gpgAgentScriptUrl,
         gpgAgentWasmUrl: this.gpgAgentWasmUrl,
@@ -568,6 +660,7 @@ export class WasmGpgBrowserClient {
         homedir: this.homedir,
         fsState,
         persistRoots,
+        usbAuthorizedDevices,
         bridge,
       });
     } catch (error) {
@@ -616,7 +709,7 @@ export class WasmGpgBrowserClient {
 
     try {
       const argv = Array.isArray(args) ? args.map((item) => String(item)) : [];
-      const worker = new Worker(this.workerUrl);
+      const worker = new Worker(asWorkerScriptUrl(this.workerUrl));
 
       const onStdout = callbacks.onStdout;
       const onStderr = callbacks.onStderr;
@@ -647,6 +740,18 @@ export class WasmGpgBrowserClient {
         ? createSharedQueueDescriptor()
         : null;
       const stdinQueue = stdinQueueDesc ? createSharedQueue(stdinQueueDesc) : null;
+      const closeStdinQueue = (reason) => {
+        if (!stdinQueueDesc) {
+          return;
+        }
+        safeInvoke(onDebug, {
+          step: 'client.stdin.close',
+          data: {
+            reason: String(reason || 'unspecified'),
+          },
+        });
+        queueCloseDescriptor(stdinQueueDesc);
+      };
       if (stdinQueue && stdinText) {
         queuePushText(stdinQueue, stdinText);
       }
@@ -657,6 +762,7 @@ export class WasmGpgBrowserClient {
       const runTimeoutMs = Number.isFinite(callbacks.runTimeoutMs)
         ? Number(callbacks.runTimeoutMs)
         : 30000;
+      const debugEnabled = callbacks.debug === true;
 
       const fsState = callbacks.fsState && typeof callbacks.fsState === 'object'
         ? callbacks.fsState
@@ -665,6 +771,7 @@ export class WasmGpgBrowserClient {
       const persistRoots = Array.isArray(callbacks.persistRoots)
         ? callbacks.persistRoots.map((item) => String(item))
         : this.persistRoots;
+      const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(callbacks.usbAuthorizedDevices);
 
       this._agentSessionCallbacks = {
         onDebug: typeof onDebug === 'function' ? onDebug : null,
@@ -674,7 +781,12 @@ export class WasmGpgBrowserClient {
       const enableAgentBridge = callbacks.enableAgentBridge !== false;
       let persistentAgentSession = null;
       if (enableAgentBridge) {
-        persistentAgentSession = await this._startPersistentAgentSession(fsState, persistRoots);
+        persistentAgentSession = await this._startPersistentAgentSession(
+          fsState,
+          persistRoots,
+          usbAuthorizedDevices,
+          debugEnabled,
+        );
       }
 
       return await new Promise((resolve, reject) => {
@@ -711,9 +823,7 @@ export class WasmGpgBrowserClient {
           setTimeout(() => {
             worker.terminate();
           }, 80);
-          if (stdinQueueDesc) {
-            queueCloseDescriptor(stdinQueueDesc);
-          }
+          closeStdinQueue('finishResolve');
           resolve(value);
         };
 
@@ -724,9 +834,7 @@ export class WasmGpgBrowserClient {
           settled = true;
           clearWatchdog();
           closePersistentBridge();
-          if (stdinQueueDesc) {
-            queueCloseDescriptor(stdinQueueDesc);
-          }
+          closeStdinQueue('finishReject');
           worker.terminate();
           reject(error);
         };
@@ -784,9 +892,7 @@ export class WasmGpgBrowserClient {
 
         const handlePinentryViaStdinRequest = (request, promptInfo) => {
           if (!stdinQueue || !stdinQueueDesc || typeof onPinentry !== 'function') {
-            if (stdinQueueDesc) {
-              queueCloseDescriptor(stdinQueueDesc);
-            }
+            closeStdinQueue('pinentry-no-handler');
             return;
           }
 
@@ -971,9 +1077,17 @@ export class WasmGpgBrowserClient {
             }
 
             if (!stdinQueue || typeof callbacks.onInputRequest !== 'function') {
-              if (stdinQueueDesc) {
-                queueCloseDescriptor(stdinQueueDesc);
+              if (stdinQueue && stdinQueueDesc && wantsPinentryStdin) {
+                safeInvoke(onDebug, {
+                  step: 'client.stdin.autoreply.empty',
+                  data: {
+                    prompt: request.prompt,
+                  },
+                });
+                queuePushByte(stdinQueue, 0x0a, true);
+                return;
               }
+              closeStdinQueue('stdin-request-no-callback');
               return;
             }
 
@@ -981,7 +1095,7 @@ export class WasmGpgBrowserClient {
               .then((reply) => {
                 const normalized = normalizeStdinReply(reply);
                 if (normalized.eof) {
-                  queueCloseDescriptor(stdinQueueDesc);
+                  closeStdinQueue('onInputRequest-eof');
                   return;
                 }
                 if (normalized.text) {
@@ -990,7 +1104,7 @@ export class WasmGpgBrowserClient {
               })
               .catch((error) => {
                 safeInvoke(onStderr, `[wasm] input callback failed: ${error instanceof Error ? error.message : String(error)}`);
-                queueCloseDescriptor(stdinQueueDesc);
+                closeStdinQueue('onInputRequest-error');
               });
             return;
           }
@@ -1112,7 +1226,7 @@ export class WasmGpgBrowserClient {
             emitStatus,
             fsState,
             persistRoots,
-            debug: callbacks.debug === true,
+            debug: debugEnabled,
             enableAgentBridge,
             sharedAgentBridge: persistentAgentSession ? persistentAgentSession.bridge : null,
             runTimeoutMs: Number.isFinite(callbacks.runTimeoutMs)
@@ -1131,6 +1245,7 @@ export class WasmGpgBrowserClient {
                 },
             stdinText,
             stdinQueue: stdinQueueDesc,
+            usbAuthorizedDevices,
           });
         } catch (error) {
           finishReject(error instanceof Error ? error : new Error(String(error)));

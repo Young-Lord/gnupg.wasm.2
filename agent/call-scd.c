@@ -111,6 +111,15 @@ daemon_ctx (ctrl_t ctrl)
   return daemon_type_ctx (DAEMON_SCD, ctrl);
 }
 
+#ifdef __EMSCRIPTEN__
+static int
+wasm_trace_enabled_local (void)
+{
+  const char *s = getenv ("GNUPG_WASM_TRACE");
+  return (s && *s && strcmp (s, "0"));
+}
+#endif
+
 
 
 /* This handler is a helper for pincache_put_cb but may also be called
@@ -1284,12 +1293,21 @@ agent_card_scd (ctrl_t ctrl, const char *cmdline,
   struct inq_needpin_parm_s inqparm;
   int saveflag;
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_local ())
+    log_info ("[wasm-trace] scd-cmd: agent_card_scd enter cmd='%s'\n", cmdline);
+#endif
+
   /* This is a layer violation, but it's needed that because DEVINFO
      --watch is so special.  */
   if (!strcmp (cmdline, DEVINFO_WATCH_COMMAND))
     return agent_card_devinfo (ctrl, assuan_context);
 
   rc = start_scd (ctrl);
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_local ())
+    log_info ("[wasm-trace] scd-cmd: start_scd rc=%d\n", rc);
+#endif
   if (rc)
     return rc;
 
@@ -1307,6 +1325,12 @@ agent_card_scd (ctrl_t ctrl, const char *cmdline,
                         pass_data_thru, assuan_context,
                         inq_needpin, &inqparm,
                         pass_status_thru, assuan_context);
+
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_local ())
+    log_info ("[wasm-trace] scd-cmd: assuan_transact rc=%d cmd='%s'\n",
+              rc, cmdline);
+#endif
 
   assuan_set_flag (daemon_ctx (ctrl), ASSUAN_CONVEY_COMMENTS, saveflag);
   if (rc)

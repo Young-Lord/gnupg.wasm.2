@@ -38,6 +38,22 @@
 #include <assuan.h>
 #include "../common/i18n.h"
 #include "cvt-openpgp.h"
+
+/* Unbuffered trace macro - bypasses estream to avoid lost output on exit */
+#define WASM_TRACE(msg) do { \
+  static const char _t[] = "[wasm-trace-raw] " msg "\n"; \
+  write(STDERR_FILENO, _t, sizeof(_t) - 1); \
+} while(0)
+
+#define WASM_TRACEF(fmt, ...) do { \
+  char _b[256]; \
+  int _n = snprintf(_b, sizeof(_b), "[wasm-trace-raw] " fmt "\n", __VA_ARGS__); \
+  if (_n > 0) \
+    { \
+      size_t _len = (size_t)_n < sizeof(_b) ? (size_t)_n : sizeof(_b) - 1; \
+      write (STDERR_FILENO, _b, _len); \
+    } \
+} while (0)
 #include "../common/ssh-utils.h"
 #include "../common/asshelp.h"
 #include "../common/server-help.h"
@@ -57,6 +73,15 @@
 /* A shortcut to call assuan_set_error using an gpg_err_code_t and a
    text string.  */
 #define set_error(e,t) assuan_set_error (ctx, gpg_error (e), (t))
+
+#ifdef __EMSCRIPTEN__
+static int
+wasm_trace_enabled_cmd (void)
+{
+  const char *s = getenv ("GNUPG_WASM_TRACE");
+  return (s && *s && strcmp (s, "0"));
+}
+#endif
 
 /* Check that the maximum digest length we support has at least the
    length of the keygrip.  */
@@ -1261,6 +1286,12 @@ cmd_genkey (assuan_context_t ctx, char *line)
   rc = agent_genkey (ctrl, flags, cache_nonce, opt_timestamp,
                      (char*)value, valuelen,
                      newpasswd, &outbuf);
+  WASM_TRACEF("cmd_genkey: agent_genkey rc=%d", rc);
+  if (rc)
+    {
+      (void)print_assuan_status (ctx, "WASM_CMD_GENKEY_RC", "%d %d",
+                                 rc, gpg_err_code (rc));
+    }
 
  leave:
   if (newpasswd)
@@ -1271,12 +1302,22 @@ cmd_genkey (assuan_context_t ctx, char *line)
       xfree (newpasswd);
     }
   xfree (value);
+  WASM_TRACE("cmd_genkey: leave (before write_outbuf)");
   if (rc)
     clear_outbuf (&outbuf);
   else
     rc = write_and_clear_outbuf (ctx, &outbuf);
+  WASM_TRACEF("cmd_genkey: write_outbuf rc=%d", rc);
+  if (rc)
+    {
+      (void)print_assuan_status (ctx, "WASM_CMD_GENKEY_OUTBUF_RC", "%d %d",
+                                 rc, gpg_err_code (rc));
+    }
+  WASM_TRACE("cmd_genkey: after write_outbuf");
   xfree (cache_nonce);
   xfree (passwd_nonce);
+  WASM_TRACE("cmd_genkey: calling leave_cmd");
+  WASM_TRACEF("cmd_genkey: returning rc=%d", rc);
   return leave_cmd (ctx, rc);
 }
 
@@ -2709,6 +2750,11 @@ cmd_scd (assuan_context_t ctx, char *line)
 #ifdef BUILD_WITH_SCDAEMON
   ctrl_t ctrl = assuan_get_pointer (ctx);
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_cmd ())
+    log_info ("[wasm-trace] scd-cmd: cmd_scd enter line='%s'\n", line);
+#endif
+
   if (ctrl->restricted)
     {
       const char *argv[5];
@@ -2744,6 +2790,11 @@ cmd_scd (assuan_context_t ctx, char *line)
   eventcounter.maybe_key_change++;
 
   rc = divert_generic_cmd (ctrl, line, ctx);
+
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_cmd ())
+    log_info ("[wasm-trace] scd-cmd: cmd_scd rc=%d line='%s'\n", rc, line);
+#endif
 #else
   (void)ctx; (void)line;
   rc = gpg_error (GPG_ERR_NOT_SUPPORTED);
@@ -4545,14 +4596,18 @@ start_command_handler (ctrl_t ctrl, gnupg_fd_t listen_fd, gnupg_fd_t fd)
       assuan_peercred_t client_creds; /* Note: Points into CTX.  */
       pid_t pid;
 
+      WASM_TRACE("cmd-loop: calling assuan_accept");
       rc = assuan_accept (ctx);
+      WASM_TRACEF("cmd-loop: assuan_accept rc=%d code=%d", (int)rc, gpg_err_code (rc));
+      WASM_TRACE("cmd-loop: assuan_accept returned");
       if (gpg_err_code (rc) == GPG_ERR_EOF || rc == -1)
         {
+          WASM_TRACE("cmd-loop: accept EOF/terminate, breaking");
           break;
         }
       else if (rc)
         {
-          log_info ("Assuan accept problem: %s\n", gpg_strerror (rc));
+          WASM_TRACE("cmd-loop: accept error, breaking");
           break;
         }
 
@@ -4585,13 +4640,18 @@ start_command_handler (ctrl_t ctrl, gnupg_fd_t listen_fd, gnupg_fd_t fd)
       ctrl->client_pid = (pid == ASSUAN_INVALID_PID)? 0 : (unsigned long)pid;
       ctrl->server_local->connect_from_self = (pid == getpid ());
 
+      WASM_TRACE("cmd-loop: calling assuan_process");
       rc = assuan_process (ctx);
+      WASM_TRACEF("cmd-loop: assuan_process rc=%d code=%d", (int)rc, gpg_err_code (rc));
+      WASM_TRACE("cmd-loop: assuan_process returned");
       if (rc)
         {
-          log_info ("Assuan processing failed: %s\n", gpg_strerror (rc));
+          WASM_TRACE("cmd-loop: assuan_process error, continue");
           continue;
         }
     }
+
+  WASM_TRACE("cmd-loop: exited main loop");
 
   /* Clear the keyinfo cache.  */
   agent_card_free_keyinfo (ctrl->server_local->last_card_keyinfo.ki);

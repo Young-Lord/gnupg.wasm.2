@@ -126,6 +126,26 @@ p {
   box-shadow: var(--shadow);
 }
 
+.category-group {
+  position: relative;
+  margin-top: 0.88rem;
+  padding-top: 0.72rem;
+  border-top: 1px solid rgba(20, 69, 81, 0.2);
+}
+
+.category-group:first-of-type {
+  margin-top: 0.2rem;
+}
+
+.category-title {
+  margin: 0 0 0.62rem;
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #436672;
+}
+
 .split {
   display: grid;
   grid-template-columns: 1.08fr 1fr;
@@ -266,6 +286,12 @@ button:disabled {
   overflow: auto;
   font-size: 0.82rem;
   line-height: 1.36;
+  white-space: pre;
+}
+
+#usbDevices.file-tree {
+  min-height: 88px;
+  max-height: 180px;
 }
 
 .console {

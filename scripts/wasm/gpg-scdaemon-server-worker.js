@@ -4,6 +4,9 @@ let started = false;
 let finished = false;
 let bridge = null;
 let stderrBuffer = [];
+let stderrLineBuffer = [];
+let stderrLoggedLines = 0;
+let debugEnabled = false;
 
 const bridgeMetrics = {
   stdinReadCalls: 0,
@@ -16,7 +19,117 @@ const bridgeMetrics = {
   stderrPreview: [],
 };
 
+let workerUrlPolicy = undefined;
+let workerScriptUrlShimInstalled = false;
+const DEBUG_BUILD_TAG = '2026-02-13-log-v2';
+
+function ensureDefaultWorkerScriptPolicy() {
+  if (!self.trustedTypes || typeof self.trustedTypes.createPolicy !== 'function') {
+    return;
+  }
+  if (self.trustedTypes.defaultPolicy
+      && typeof self.trustedTypes.defaultPolicy.createScriptURL === 'function') {
+    return;
+  }
+  try {
+    self.trustedTypes.createPolicy('default', {
+      createScript(value) {
+        return String(value);
+      },
+      createScriptURL(value) {
+        return String(value);
+      },
+    });
+  } catch {
+    /* Ignore default policy creation failures. */
+  }
+}
+
+function getWorkerUrlPolicy() {
+  if (workerUrlPolicy !== undefined) {
+    return workerUrlPolicy;
+  }
+  if (!self.trustedTypes || typeof self.trustedTypes.createPolicy !== 'function') {
+    workerUrlPolicy = null;
+    return workerUrlPolicy;
+  }
+
+  ensureDefaultWorkerScriptPolicy();
+
+  const policyNames = [
+    'gnupg-wasm-worker-url',
+    'gnupg-wasm',
+  ];
+
+  for (const name of policyNames) {
+    try {
+      workerUrlPolicy = self.trustedTypes.createPolicy(name, {
+        createScriptURL(value) {
+          return String(value);
+        },
+      });
+      return workerUrlPolicy;
+    } catch {
+      /* Ignore policy creation failures and try next candidate. */
+    }
+  }
+
+  if (self.trustedTypes.defaultPolicy
+      && typeof self.trustedTypes.defaultPolicy.createScriptURL === 'function') {
+    workerUrlPolicy = self.trustedTypes.defaultPolicy;
+    return workerUrlPolicy;
+  }
+
+  workerUrlPolicy = null;
+  return workerUrlPolicy;
+}
+
+function installWorkerScriptUrlShim() {
+  if (workerScriptUrlShimInstalled) {
+    return;
+  }
+  if (typeof self.Worker !== 'function') {
+    return;
+  }
+
+  const NativeWorker = self.Worker;
+  const WorkerWrapper = function WrappedWorker(scriptURL, options) {
+    return new NativeWorker(asWorkerScriptUrl(scriptURL), options);
+  };
+
+  try {
+    Object.setPrototypeOf(WorkerWrapper, NativeWorker);
+  } catch {
+    /* Best effort only. */
+  }
+  WorkerWrapper.prototype = NativeWorker.prototype;
+
+  try {
+    self.Worker = WorkerWrapper;
+    workerScriptUrlShimInstalled = true;
+    postDebug('worker.script-url-shim', { installed: true });
+  } catch {
+    postDebug('worker.script-url-shim', { installed: false });
+  }
+}
+
+function asWorkerScriptUrl(value) {
+  const url = String(value);
+  const policy = getWorkerUrlPolicy();
+  if (!policy || typeof policy.createScriptURL !== 'function') {
+    return url;
+  }
+  try {
+    return policy.createScriptURL(url);
+  } catch {
+    return url;
+  }
+}
+
 function postDebug(step, data) {
+  if (!debugEnabled) {
+    return;
+  }
   postMessage({
     type: 'debug',
     step,
@@ -31,6 +144,54 @@ function formatError(error) {
   return String(error);
 }
 
+function byteToDebugChar(byteValue) {
+  const value = Number(byteValue) & 0xff;
+  if (value >= 32 && value <= 126) {
+    return String.fromCharCode(value);
+  }
+  if (value === 9) {
+    return '\\t';
+  }
+  return '.';
+}
+
+function createLineTracer(step, options = {}) {
+  const maxLines = Number.isFinite(options.maxLines)
+    ? Math.max(1, Number(options.maxLines) | 0)
+    : 120;
+  const maxLen = Number.isFinite(options.maxLen)
+    ? Math.max(16, Number(options.maxLen) | 0)
+    : 220;
+  const bytes = [];
+  let lineCount = 0;
+
+  return {
+    push(byteValue) {
+      if (byteValue === null || byteValue === undefined) {
+        return;
+      }
+      const value = Number(byteValue) & 0xff;
+      if (value === 13) {
+        return;
+      }
+      if (value === 10) {
+        if (bytes.length > 0 && lineCount < maxLines) {
+          lineCount += 1;
+          postDebug(step, {
+            n: lineCount,
+            line: bytes.map((item) => byteToDebugChar(item)).join(''),
+          });
+        }
+        bytes.length = 0;
+        return;
+      }
+      if (bytes.length < maxLen) {
+        bytes.push(value);
+      }
+    },
+  };
+}
+
 function normalizePath(pathValue, fallback) {
   let value = typeof pathValue === 'string' ? pathValue.trim() : '';
   if (!value) {
@@ -43,6 +204,42 @@ function normalizePath(pathValue, fallback) {
     value = value.slice(0, -1);
   }
   return value.replace(/\/{2,}/g, '/');
+}
+
+function normalizeUsbAuthorizedDevices(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const out = [];
+  const seen = new Set();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const vendorId = Number(entry.vendorId);
+    const productId = Number(entry.productId);
+    if (!Number.isFinite(vendorId) || !Number.isFinite(productId)) {
+      continue;
+    }
+
+    const normalizedEntry = {
+      vendorId: Math.max(0, Math.min(0xffff, vendorId | 0)),
+      productId: Math.max(0, Math.min(0xffff, productId | 0)),
+      serialNumber: typeof entry.serialNumber === 'string' ? entry.serialNumber : '',
+    };
+
+    const key = `${normalizedEntry.vendorId}:${normalizedEntry.productId}:${normalizedEntry.serialNumber}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(normalizedEntry);
+  }
+
+  return out;
 }
 
 function ensureDirectory(FS, dirPath) {
@@ -161,13 +358,31 @@ function writeStderrByte(ch) {
   if (ch === null || ch === undefined) {
     return;
   }
+  const value = Number(ch) & 0xff;
   bridgeMetrics.stderrWrite += 1;
   if (bridgeMetrics.stderrPreview.length < 32) {
-    bridgeMetrics.stderrPreview.push(Number(ch) & 0xff);
+    bridgeMetrics.stderrPreview.push(value);
   }
-  stderrBuffer.push(Number(ch) & 0xff);
+  stderrBuffer.push(value);
   if (stderrBuffer.length > 4096) {
     stderrBuffer = stderrBuffer.slice(-2048);
+  }
+
+  if (value === 10 || value === 13) {
+    if (stderrLineBuffer.length > 0) {
+      const line = String.fromCharCode(...stderrLineBuffer).trim();
+      stderrLineBuffer = [];
+      if (line && stderrLoggedLines < 40) {
+        stderrLoggedLines += 1;
+        postDebug('stderr.line', { line });
+      }
+    }
+    return;
+  }
+
+  stderrLineBuffer.push(value);
+  if (stderrLineBuffer.length > 1024) {
+    stderrLineBuffer = stderrLineBuffer.slice(-512);
   }
 }
 
@@ -185,7 +400,7 @@ async function importLauncherScript(scriptUrl) {
   const useFetchBlobPath = !/\.m?js(?:[?#].*)?$/i.test(scriptUrl);
 
   if (!useFetchBlobPath) {
-    importScripts(scriptUrl);
+    importScripts(asWorkerScriptUrl(scriptUrl));
     return;
   }
 
@@ -197,7 +412,7 @@ async function importLauncherScript(scriptUrl) {
   const source = await response.text();
   const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
   try {
-    importScripts(blobUrl);
+    importScripts(asWorkerScriptUrl(blobUrl));
   } finally {
     URL.revokeObjectURL(blobUrl);
   }
@@ -208,6 +423,15 @@ function finish(exitCode, errorMessage) {
     return;
   }
   finished = true;
+
+  if (stderrLineBuffer.length > 0 && stderrLoggedLines < 40) {
+    const tailLine = String.fromCharCode(...stderrLineBuffer).trim();
+    stderrLineBuffer = [];
+    if (tailLine) {
+      stderrLoggedLines += 1;
+      postDebug('stderr.line', { line: tailLine });
+    }
+  }
 
   if (bridge) {
     queueClose(bridge.agentToScdaemon);
@@ -241,6 +465,7 @@ async function handleStart(message) {
     return;
   }
   started = true;
+  debugEnabled = Boolean(message && message.debug === true);
 
   const scdaemonScriptUrl = typeof message.scdaemonScriptUrl === 'string'
     ? message.scdaemonScriptUrl
@@ -249,6 +474,13 @@ async function handleStart(message) {
     ? message.scdaemonWasmUrl
     : '';
   const homedir = normalizePath(message.homedir, '/gnupg');
+  const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(message.usbAuthorizedDevices);
+
+  self.__gnupgAuthorizedUsbDevices = usbAuthorizedDevices;
+  postDebug('usb.authorized-devices', {
+    buildTag: DEBUG_BUILD_TAG,
+    count: usbAuthorizedDevices.length,
+  });
 
   if (!scdaemonScriptUrl) {
     finish(2, 'missing scdaemonScriptUrl');
@@ -265,9 +497,12 @@ async function handleStart(message) {
   };
 
   const finalArgs = [
-    '--multi-server',
+    '--server',
+    '--verbose',
     '--homedir', homedir,
   ];
+
+  installWorkerScriptUrlShim();
 
   self.Module = {
     arguments: finalArgs,
@@ -286,10 +521,19 @@ async function handleStart(message) {
           throw new Error('FS is not initialized in scdaemon worker');
         }
 
-        const envObj = self.ENV || (self.Module && self.Module.ENV);
-        if (envObj) {
-          envObj.GNUPG_WASM_TRACE = '1';
-        }
+        const envObj = (() => {
+          const base = self.ENV && typeof self.ENV === 'object' ? self.ENV : {};
+          self.ENV = base;
+          if (self.Module && typeof self.Module === 'object') {
+            self.Module.ENV = base;
+          }
+          if (debugEnabled) {
+            base.GNUPG_WASM_TRACE = '1';
+          } else if (Object.prototype.hasOwnProperty.call(base, 'GNUPG_WASM_TRACE')) {
+            delete base.GNUPG_WASM_TRACE;
+          }
+          return base;
+        })();
 
         ensureDirectory(FS, homedir);
         try {
@@ -298,14 +542,34 @@ async function handleStart(message) {
           /* Best effort only. */
         }
 
+        const rxTracer = createLineTracer('rx');
+        const txTracer = createLineTracer('tx');
+
         FS.init(
           () => {
             bridgeMetrics.stdinReadCalls += 1;
-            const value = queuePopByte(bridge.agentToScdaemon, false);
+            const waitStartedAt = Date.now();
+            const value = queuePopByte(bridge.agentToScdaemon, true);
+            const waitMs = Date.now() - waitStartedAt;
+            if (waitMs >= 400) {
+              postDebug('wait', {
+                ms: waitMs,
+                calls: bridgeMetrics.stdinReadCalls,
+                rxBytes: bridgeMetrics.stdinRead,
+                txBytes: bridgeMetrics.stdoutWrite,
+              });
+            }
             if (value !== null && value !== undefined) {
               bridgeMetrics.stdinRead += 1;
+              rxTracer.push(value);
               if (bridgeMetrics.stdinPreview.length < 32) {
                 bridgeMetrics.stdinPreview.push(Number(value) & 0xff);
+              }
+              if ((bridgeMetrics.stdinRead % 256) === 0) {
+                postDebug('rx.total', {
+                  bytes: bridgeMetrics.stdinRead,
+                  calls: bridgeMetrics.stdinReadCalls,
+                });
               }
             }
             return value;
@@ -316,8 +580,15 @@ async function handleStart(message) {
             }
             bridgeMetrics.stdoutWriteCalls += 1;
             bridgeMetrics.stdoutWrite += 1;
+            txTracer.push(ch);
             if (bridgeMetrics.stdoutPreview.length < 32) {
               bridgeMetrics.stdoutPreview.push(Number(ch) & 0xff);
+            }
+            if ((bridgeMetrics.stdoutWrite % 256) === 0) {
+              postDebug('tx.total', {
+                bytes: bridgeMetrics.stdoutWrite,
+                calls: bridgeMetrics.stdoutWriteCalls,
+              });
             }
             queuePushByte(bridge.scdaemonToAgent, ch, true);
           },

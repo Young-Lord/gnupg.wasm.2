@@ -24,10 +24,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
 
 #include "agent.h"
 #include "../common/i18n.h"
 #include "../common/sysutils.h"
+
+/* Unbuffered trace macro - bypasses estream to avoid lost output on exit */
+#define WASM_TRACE(msg) do { \
+  static const char _t[] = "[wasm-trace-raw] " msg "\n"; \
+  write(STDERR_FILENO, _t, sizeof(_t) - 1); \
+} while(0)
+
+#define WASM_TRACEF(fmt, ...) do { \
+  char _b[256]; \
+  int _n = snprintf(_b, sizeof(_b), "[wasm-trace-raw] " fmt "\n", __VA_ARGS__); \
+  if (_n > 0) \
+    { \
+      size_t _len = (size_t)_n < sizeof(_b) ? (size_t)_n : sizeof(_b) - 1; \
+      write (STDERR_FILENO, _b, _len); \
+    } \
+} while (0)
 
 
 void
@@ -540,12 +557,15 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
   size_t len;
   char *buf;
 
+  WASM_TRACE("agent_genkey: enter");
+
   rc = gcry_sexp_sscan (&s_keyparam, NULL, keyparam, keyparamlen);
   if (rc)
     {
       log_error ("failed to convert keyparam: %s\n", gpg_strerror (rc));
       return gpg_error (GPG_ERR_INV_DATA);
     }
+  WASM_TRACE("agent_genkey: sexp_sscan ok");
 
   /* Get the passphrase now, cause key generation may take a while. */
   if (override_passphrase)
@@ -562,10 +582,12 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
     ; /* No need to ask for a passphrase.  */
   else
     {
+      WASM_TRACE("agent_genkey: calling ask_new_passphrase");
       rc = agent_ask_new_passphrase (ctrl,
                                      L_("Please enter the passphrase to%0A"
                                         "protect your new key"),
                                      &passphrase_buffer);
+      WASM_TRACE("agent_genkey: ask_new_passphrase returned");
       if (rc)
         {
           gcry_sexp_release (s_keyparam);
@@ -574,10 +596,33 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
       passphrase = passphrase_buffer;
     }
 
+  WASM_TRACE("agent_genkey: calling gcry_pk_genkey");
+  if (ctrl)
+    agent_print_status (ctrl, "WASM_GCRY_PK_GENKEY", "enter");
   rc = gcry_pk_genkey (&s_key, s_keyparam );
+  if (ctrl)
+    agent_print_status (ctrl, "WASM_GCRY_PK_GENKEY", "ret %d %d", rc, gpg_err_code (rc));
+  WASM_TRACEF("agent_genkey: gcry_pk_genkey rc=%d", rc);
+#ifdef __EMSCRIPTEN__
+  if (gpg_err_code (rc) == GPG_ERR_EOF)
+    {
+      /* Browser/WASM builds occasionally surface EOF here via the
+       * random backend path; force quick-random and retry once.  */
+      WASM_TRACE("agent_genkey: retry gcry_pk_genkey with quick-random");
+      if (ctrl)
+        agent_print_status (ctrl, "WASM_GCRY_PK_GENKEY", "retry");
+      gcry_control (GCRYCTL_ENABLE_QUICK_RANDOM, 0);
+      rc = gcry_pk_genkey (&s_key, s_keyparam );
+      if (ctrl)
+        agent_print_status (ctrl, "WASM_GCRY_PK_GENKEY", "retry-ret %d %d", rc, gpg_err_code (rc));
+      WASM_TRACEF("agent_genkey: retry gcry_pk_genkey rc=%d", rc);
+    }
+#endif
+  WASM_TRACE("agent_genkey: gcry_pk_genkey returned");
   gcry_sexp_release (s_keyparam);
   if (rc)
     {
+      WASM_TRACEF("agent_genkey: returning error after gcry_pk_genkey rc=%d", rc);
       log_error ("key generation failed: %s\n", gpg_strerror (rc));
       xfree (passphrase_buffer);
       return rc;
@@ -602,16 +647,15 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
       return gpg_error (GPG_ERR_INV_DATA);
     }
   gcry_sexp_release (s_key); s_key = NULL;
+  WASM_TRACE("agent_genkey: keys extracted ok");
 
   /* store the secret key */
-  if (opt.verbose)
-    log_info ("storing %sprivate key\n",
-               ctrl->ephemeral_mode?"ephemeral ":"");
+  WASM_TRACE("agent_genkey: calling store_key");
   rc = store_key (ctrl, s_private, passphrase, 0, ctrl->s2k_count, timestamp);
+  WASM_TRACEF("agent_genkey: store_key rc=%d", rc);
+  WASM_TRACE("agent_genkey: store_key returned");
   if (!rc && !ctrl->ephemeral_mode)
     {
-      /* FIXME: or does it make sense to also cache passphrases in
-       * ephemeral mode using a dedicated cache?  */
       if (!cache_nonce)
         {
           char tmpbuf[12];
@@ -622,7 +666,10 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
           && !(flags & GENKEY_FLAG_NO_PROTECTION)
           && !agent_put_cache (ctrl, cache_nonce, CACHE_MODE_NONCE,
                                passphrase, ctrl->cache_ttl_opt_preset))
-        agent_write_status (ctrl, "CACHE_NONCE", cache_nonce, NULL);
+        {
+          WASM_TRACE("agent_genkey: writing CACHE_NONCE status");
+          agent_write_status (ctrl, "CACHE_NONCE", cache_nonce, NULL);
+        }
       if ((flags & GENKEY_FLAG_PRESET)
           && !(flags & GENKEY_FLAG_NO_PROTECTION))
         {
@@ -643,19 +690,20 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
   gcry_sexp_release (s_private);
   if (rc)
     {
+      WASM_TRACEF("agent_genkey: returning error after store_key rc=%d", rc);
       gcry_sexp_release (s_public);
       return rc;
     }
 
   /* return the public key */
-  if (DBG_CRYPTO)
-    log_debug ("returning public key\n");
+  WASM_TRACE("agent_genkey: preparing public key output");
   len = gcry_sexp_sprint (s_public, GCRYSEXP_FMT_CANON, NULL, 0);
   log_assert (len);
   buf = xtrymalloc (len);
   if (!buf)
     {
       gpg_error_t tmperr = out_of_core ();
+      WASM_TRACEF("agent_genkey: out_of_core rc=%d", tmperr);
       gcry_sexp_release (s_private);
       gcry_sexp_release (s_public);
       return tmperr;
@@ -666,6 +714,7 @@ agent_genkey (ctrl_t ctrl, unsigned int flags,
   gcry_sexp_release (s_public);
   xfree (buf);
 
+  WASM_TRACE("agent_genkey: returning 0 (success)");
   return 0;
 }
 

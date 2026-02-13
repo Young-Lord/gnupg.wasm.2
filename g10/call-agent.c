@@ -51,6 +51,24 @@ static assuan_context_t agent_ctx = NULL;
 static int did_early_card_test;
 #ifdef __EMSCRIPTEN__
 static unsigned long cached_agent_s2k_count;
+
+#define WASM_TRACE(msg) do { \
+  static const char _t[] = "[wasm-trace] " msg "\n"; \
+  write (STDERR_FILENO, _t, sizeof(_t) - 1); \
+} while (0)
+
+#define WASM_TRACEF(fmt, ...) do { \
+  char _b[320]; \
+  int _n = snprintf (_b, sizeof(_b), "[wasm-trace] " fmt "\n", __VA_ARGS__); \
+  if (_n > 0) \
+    { \
+      size_t _len = (size_t)_n < sizeof(_b) ? (size_t)_n : sizeof(_b) - 1; \
+      write (STDERR_FILENO, _b, _len); \
+    } \
+} while (0)
+#else
+#define WASM_TRACE(msg) ((void)0)
+#define WASM_TRACEF(...) ((void)0)
 #endif
 
 struct confirm_parm_s
@@ -2537,6 +2555,8 @@ cache_nonce_status_cb (void *opaque, const char *line)
   struct cache_nonce_parm_s *parm = opaque;
   const char *s;
 
+  WASM_TRACEF("agent_genkey.status: '%s'", line? line : "(null)");
+
   if ((s = has_leading_keyword (line, "CACHE_NONCE")))
     {
       if (parm->cache_nonce_addr)
@@ -2558,6 +2578,18 @@ cache_nonce_status_cb (void *opaque, const char *line)
       if (opt.enable_progress_filter)
         write_status_text (STATUS_PROGRESS, s);
     }
+  else if ((s = has_leading_keyword (line, "WASM_GCRY_PK_GENKEY")))
+    {
+      WASM_TRACEF("agent_genkey.status.WASM_GCRY_PK_GENKEY: %s", s);
+    }
+  else if ((s = has_leading_keyword (line, "WASM_CMD_GENKEY_RC")))
+    {
+      WASM_TRACEF("agent_genkey.status.WASM_CMD_GENKEY_RC: %s", s);
+    }
+  else if ((s = has_leading_keyword (line, "WASM_CMD_GENKEY_OUTBUF_RC")))
+    {
+      WASM_TRACEF("agent_genkey.status.WASM_CMD_GENKEY_OUTBUF_RC: %s", s);
+    }
 
   return 0;
 }
@@ -2572,18 +2604,49 @@ inq_genkey_parms (void *opaque, const char *line)
   struct genkey_parm_s *parm = opaque;
   gpg_error_t err;
 
+  WASM_TRACEF("agent_genkey.inq: line='%s'", line? line : "(null)");
+
   if (has_leading_keyword (line, "KEYPARAM"))
     {
+#ifdef __EMSCRIPTEN__
+      const char *keyparms = parm->keyparms;
+      char *patched = NULL;
+
+      /* In browser/WASM builds, Ed25519 keyparam "(flags eddsa comp)"
+       * has been observed to trigger fatal failure inside gcry_pk_genkey.
+       * Strip the optional 'comp' flag and keep plain eddsa.
+       */
+      if (keyparms && strstr (keyparms, "(flags eddsa comp)"))
+        {
+          patched = xtrystrdup (keyparms);
+          if (patched)
+            {
+              char *p = strstr (patched, "(flags eddsa comp)");
+              if (p)
+                memmove (p + 12, p + 17, strlen (p + 17) + 1);
+              keyparms = patched;
+              WASM_TRACEF ("agent_genkey.inq: patched KEYPARAM='%s'", keyparms);
+            }
+        }
+      err = assuan_send_data (parm->dflt->ctx, keyparms, strlen (keyparms));
+      xfree (patched);
+#else
       err = assuan_send_data (parm->dflt->ctx,
                               parm->keyparms, strlen (parm->keyparms));
+#endif
+      WASM_TRACEF("agent_genkey.inq: sent KEYPARAM rc=%d code=%d", err, gpg_err_code (err));
     }
   else if (has_leading_keyword (line, "NEWPASSWD") && parm->passphrase)
     {
       err = assuan_send_data (parm->dflt->ctx,
                               parm->passphrase,  strlen (parm->passphrase));
+      WASM_TRACEF("agent_genkey.inq: sent NEWPASSWD rc=%d code=%d", err, gpg_err_code (err));
     }
   else
-    err = default_inq_cb (parm->dflt, line);
+    {
+      err = default_inq_cb (parm->dflt, line);
+      WASM_TRACEF("agent_genkey.inq: default_inq_cb rc=%d code=%d", err, gpg_err_code (err));
+    }
 
   return err;
 }
@@ -2640,8 +2703,10 @@ agent_genkey (ctrl_t ctrl, char **cache_nonce_addr, char **passwd_nonce_addr,
     ; /* A RESET would flush the passwd nonce cache.  */
   else
     {
+      WASM_TRACE("agent_genkey: sending RESET");
       err = assuan_transact (agent_ctx, "RESET",
                              NULL, NULL, NULL, NULL, NULL, NULL);
+      WASM_TRACEF("agent_genkey: RESET rc=%d code=%d", err, gpg_err_code (err));
       if (err)
         return err;
     }
@@ -2661,10 +2726,12 @@ agent_genkey (ctrl_t ctrl, char **cache_nonce_addr, char **passwd_nonce_addr,
             cache_nonce_addr && *cache_nonce_addr? *cache_nonce_addr:"");
   cn_parm.cache_nonce_addr = cache_nonce_addr;
   cn_parm.passwd_nonce_addr = NULL;
+  WASM_TRACEF("agent_genkey: sending command '%s'", line);
   err = assuan_transact (agent_ctx, line,
                          put_membuf_cb, &data,
                          inq_genkey_parms, &gk_parm,
                          cache_nonce_status_cb, &cn_parm);
+  WASM_TRACEF("agent_genkey: GENKEY transact rc=%d code=%d", err, gpg_err_code (err));
   if (err)
     {
       xfree (get_membuf (&data, &len));

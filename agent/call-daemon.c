@@ -314,8 +314,26 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
   if (opt.disable_daemon[type])
     return gpg_error (GPG_ERR_NOT_SUPPORTED);
 
+#ifdef __EMSCRIPTEN__
+  if (type == DAEMON_SCD && wasm_trace_enabled ())
+    log_info ("[wasm-trace] scdaemon: daemon_start enter"
+              " require_socket=%d local=%p local_ctx=%p local_in_use=%d"
+              " primary_ctx=%p reusable=%d\n",
+              require_socket,
+              ctrl->d_local[type],
+              ctrl->d_local[type] ? ctrl->d_local[type]->ctx : NULL,
+              ctrl->d_local[type] ? !!ctrl->d_local[type]->in_use : 0,
+              daemon_global[type].primary_ctx,
+              daemon_global[type].primary_ctx_reusable);
+#endif
+
   if (ctrl->d_local[type] && ctrl->d_local[type]->ctx)
     {
+#ifdef __EMSCRIPTEN__
+      if (type == DAEMON_SCD && wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: daemon_start fast reuse local"
+                  " ctx=%p\n", ctrl->d_local[type]->ctx);
+#endif
       ctrl->d_local[type]->in_use = 1;
       return 0; /* Okay, the context is fine.  */
     }
@@ -335,6 +353,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
                  strerror (rc));
       return gpg_error (GPG_ERR_INTERNAL);
     }
+
+#ifdef __EMSCRIPTEN__
+  if (type == DAEMON_SCD && wasm_trace_enabled ())
+    log_info ("[wasm-trace] scdaemon: daemon_start lock acquired\n");
+#endif
 
   /* If this is the first call for this session, setup the local data
      structure. */
@@ -363,6 +386,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
     {
       ctx = g->primary_ctx;
       g->primary_ctx_reusable = 0;
+#ifdef __EMSCRIPTEN__
+      if (type == DAEMON_SCD && wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: daemon_start reusing primary"
+                  " ctx=%p\n", g->primary_ctx);
+#endif
       if (opt.verbose)
         log_info ("new connection to %s daemon established (reusing)\n",
 		  name);
@@ -383,6 +411,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
       int have_wasm_scd_env = 0;
 
       rc = wasm_connect_preopened_scdaemon (ctx, &have_wasm_scd_env);
+#ifdef __EMSCRIPTEN__
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: preopened connect result"
+                  " rc=%d have_env=%d\n", rc, have_wasm_scd_env);
+#endif
       if (!rc)
         {
           if (opt.verbose)
@@ -393,6 +426,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
 
       if (have_wasm_scd_env)
         {
+#ifdef __EMSCRIPTEN__
+          if (wasm_trace_enabled ())
+            log_info ("[wasm-trace] scdaemon: preopened fd existed but"
+                      " connect failed rc=%d\n", rc);
+#endif
           err = gpg_error (GPG_ERR_NO_SCDAEMON);
           goto leave;
         }
@@ -401,6 +439,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
 
   if (g->socket_name)
     {
+#ifdef __EMSCRIPTEN__
+      if (type == DAEMON_SCD && wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: trying socket connect '%s'\n",
+                  g->socket_name);
+#endif
       rc = assuan_socket_connect (ctx, g->socket_name, 0, 0);
       if (rc)
         {
@@ -418,6 +461,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
 
   if (g->primary_ctx)
     {
+#ifdef __EMSCRIPTEN__
+      if (type == DAEMON_SCD && wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: primary_ctx already set but not"
+                  " reusable primary=%p\n", g->primary_ctx);
+#endif
       log_info ("%s daemon is running but won't accept further connections\n",
 		name);
       err = gpg_error (GPG_ERR_NO_SCDAEMON);
@@ -571,6 +619,11 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
   }
 
  leave:
+#ifdef __EMSCRIPTEN__
+  if (type == DAEMON_SCD && wasm_trace_enabled ())
+    log_info ("[wasm-trace] scdaemon: daemon_start leave err=%d ctx=%p\n",
+              err, ctx);
+#endif
   xfree (abs_homedir);
   abs_homedir = NULL;
   if (err)

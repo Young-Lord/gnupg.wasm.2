@@ -8,7 +8,9 @@ let persistRoots = [];
 let bridge = null;
 let scdaemonBridge = null;
 let stderrBuffer = [];
+let stderrLineBuffer = [];
 let heartbeatId = null;
+let debugEnabled = false;
 const bridgeMetrics = {
   stdinReadCalls: 0,
   stdinRead: 0,
@@ -22,10 +24,69 @@ const bridgeMetrics = {
 const SUPPRESSED_DEBUG_STEPS = new Set([
   'bridge.stdin.call',
   'bridge.stdin.byte',
+  'bridge.stdin',
   'bridge.stdout.byte',
+  'bridge.stdout',
 ]);
 
+let workerUrlPolicy = undefined;
+const DEBUG_BUILD_TAG = '2026-02-13-log-v2';
+
+function getWorkerUrlPolicy() {
+  if (workerUrlPolicy !== undefined) {
+    return workerUrlPolicy;
+  }
+  if (!self.trustedTypes || typeof self.trustedTypes.createPolicy !== 'function') {
+    workerUrlPolicy = null;
+    return workerUrlPolicy;
+  }
+
+  const policyNames = [
+    'gnupg-wasm-worker-url',
+    'gnupg-wasm',
+    'default',
+  ];
+
+  for (const name of policyNames) {
+    try {
+      workerUrlPolicy = self.trustedTypes.createPolicy(name, {
+        createScriptURL(value) {
+          return String(value);
+        },
+      });
+      return workerUrlPolicy;
+    } catch {
+      /* Ignore policy creation failures and try next candidate. */
+    }
+  }
+
+  if (self.trustedTypes.defaultPolicy
+      && typeof self.trustedTypes.defaultPolicy.createScriptURL === 'function') {
+    workerUrlPolicy = self.trustedTypes.defaultPolicy;
+    return workerUrlPolicy;
+  }
+
+  workerUrlPolicy = null;
+  return workerUrlPolicy;
+}
+
+function asWorkerScriptUrl(value) {
+  const url = String(value);
+  const policy = getWorkerUrlPolicy();
+  if (!policy || typeof policy.createScriptURL !== 'function') {
+    return url;
+  }
+  try {
+    return policy.createScriptURL(url);
+  } catch {
+    return url;
+  }
+}
+
 function postDebug(step, data) {
+  if (!debugEnabled) {
+    return;
+  }
   if (SUPPRESSED_DEBUG_STEPS.has(step)) {
     return;
   }
@@ -41,6 +102,64 @@ function formatError(error) {
     return error.message;
   }
   return String(error);
+}
+
+function byteToDebugChar(byteValue) {
+  const value = Number(byteValue) & 0xff;
+  if (value >= 32 && value <= 126) {
+    return String.fromCharCode(value);
+  }
+  if (value === 9) {
+    return '\\t';
+  }
+  return '.';
+}
+
+function createLineTracer(step, options = {}) {
+  const maxLines = Number.isFinite(options.maxLines)
+    ? Math.max(1, Number(options.maxLines) | 0)
+    : 120;
+  const maxLen = Number.isFinite(options.maxLen)
+    ? Math.max(16, Number(options.maxLen) | 0)
+    : 220;
+  const bytes = [];
+  let lineCount = 0;
+
+  const emitLine = (tail) => {
+    if (!bytes.length || lineCount >= maxLines) {
+      bytes.length = 0;
+      return;
+    }
+    lineCount += 1;
+    postDebug(step, {
+      n: lineCount,
+      line: bytes.map((value) => byteToDebugChar(value)).join(''),
+      tail: Boolean(tail),
+    });
+    bytes.length = 0;
+  };
+
+  return {
+    push(byteValue) {
+      if (byteValue === null || byteValue === undefined) {
+        return;
+      }
+      const value = Number(byteValue) & 0xff;
+      if (value === 13) {
+        return;
+      }
+      if (value === 10) {
+        emitLine(false);
+        return;
+      }
+      if (bytes.length < maxLen) {
+        bytes.push(value);
+      }
+    },
+    flushTail() {
+      emitLine(true);
+    },
+  };
 }
 
 function normalizePath(pathValue, fallback) {
@@ -90,6 +209,42 @@ function normalizePersistRoots(value, fallback) {
   }
 
   return roots;
+}
+
+function normalizeUsbAuthorizedDevices(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const out = [];
+  const seen = new Set();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const vendorId = Number(entry.vendorId);
+    const productId = Number(entry.productId);
+    if (!Number.isFinite(vendorId) || !Number.isFinite(productId)) {
+      continue;
+    }
+
+    const normalizedEntry = {
+      vendorId: Math.max(0, Math.min(0xffff, vendorId | 0)),
+      productId: Math.max(0, Math.min(0xffff, productId | 0)),
+      serialNumber: typeof entry.serialNumber === 'string' ? entry.serialNumber : '',
+    };
+
+    const key = `${normalizedEntry.vendorId}:${normalizedEntry.productId}:${normalizedEntry.serialNumber}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(normalizedEntry);
+  }
+
+  return out;
 }
 
 function parentDirectory(pathValue) {
@@ -324,6 +479,12 @@ function queuePopByte(queue, shouldBlock = false) {
     }
 
     if (Atomics.load(ctrl, 2) !== 0) {
+      postDebug('bridge.stdin.queue-closed-eof', {
+        head: Atomics.load(ctrl, 0),
+        tail: Atomics.load(ctrl, 1),
+        shouldBlock,
+        stack: new Error().stack?.split('\n').slice(0, 5).join(' | '),
+      });
       return null;
     }
 
@@ -369,8 +530,22 @@ function writeStderrByte(ch) {
     bridgeMetrics.stderrPreview.push(Number(ch) & 0xff);
   }
   stderrBuffer.push(Number(ch) & 0xff);
-  if (stderrBuffer.length > 4096) {
-    stderrBuffer = stderrBuffer.slice(-2048);
+  stderrLineBuffer.push(Number(ch) & 0xff);
+  if (Number(ch) === 10) {
+    try {
+      const line = new TextDecoder().decode(new Uint8Array(stderrLineBuffer)).trimEnd();
+      if (line) {
+        postDebug('stderr.line', { line });
+      }
+    } catch {
+      /* Ignore stderr decoding issues in debug path. */
+    }
+    stderrLineBuffer = [];
+  } else if (stderrLineBuffer.length > 2048) {
+    stderrLineBuffer = stderrLineBuffer.slice(-1024);
+  }
+  if (stderrBuffer.length > 65536) {
+    stderrBuffer = stderrBuffer.slice(-32768);
   }
 }
 
@@ -388,7 +563,7 @@ async function importLauncherScript(scriptUrl) {
   const useFetchBlobPath = !/\.m?js(?:[?#].*)?$/i.test(scriptUrl);
 
   if (!useFetchBlobPath) {
-    importScripts(scriptUrl);
+    importScripts(asWorkerScriptUrl(scriptUrl));
     return;
   }
 
@@ -400,7 +575,7 @@ async function importLauncherScript(scriptUrl) {
   const source = await response.text();
   const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
   try {
-    importScripts(blobUrl);
+    importScripts(asWorkerScriptUrl(blobUrl));
   } finally {
     URL.revokeObjectURL(blobUrl);
   }
@@ -459,6 +634,7 @@ async function handleStart(message) {
     return;
   }
   started = true;
+  debugEnabled = Boolean(message && message.debug === true);
 
   const gpgAgentScriptUrl = typeof message.gpgAgentScriptUrl === 'string'
     ? message.gpgAgentScriptUrl
@@ -480,6 +656,7 @@ async function handleStart(message) {
   const incomingFsState = message.fsState && typeof message.fsState === 'object'
     ? message.fsState
     : null;
+  const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(message.usbAuthorizedDevices);
 
   persistRoots = normalizePersistRoots(
     message.persistRoots,
@@ -514,23 +691,38 @@ async function handleStart(message) {
   };
 
   heartbeatId = setInterval(() => {
-    postDebug('heartbeat', {
-      bridgeMetrics: { ...bridgeMetrics },
-      gpgToAgent: summarizeQueue(bridge.gpgToAgent),
-      agentToGpg: summarizeQueue(bridge.agentToGpg),
+    const gpgToAgent = summarizeQueue(bridge.gpgToAgent);
+    const agentToGpg = summarizeQueue(bridge.agentToGpg);
+    const scd = scdaemonBridge && typeof scdaemonBridge.getStats === 'function'
+      ? scdaemonBridge.getStats()
+      : null;
+    const envObj = self.ENV || (self.Module && self.Module.ENV);
+    postDebug('watch', {
+      g2a: gpgToAgent.used,
+      a2g: agentToGpg.used,
+      scdA2S: scd && scd.agentToScdaemon ? scd.agentToScdaemon.used : -1,
+      scdS2A: scd && scd.scdaemonToAgent ? scd.scdaemonToAgent.used : -1,
+      scdDone: scd ? Boolean(scd.daemonDone) : null,
+      stdinCalls: bridgeMetrics.stdinReadCalls,
+      stdoutCalls: bridgeMetrics.stdoutWriteCalls,
+      scdaemonFdEnv: envObj && envObj.GNUPG_WASM_SCDAEMON_FD
+        ? String(envObj.GNUPG_WASM_SCDAEMON_FD)
+        : '',
     });
   }, 2000);
 
   postDebug('start', {
+    buildTag: DEBUG_BUILD_TAG,
     gpgAgentScriptUrl,
     gpgAgentWasmUrl,
     homedir,
     persistRoots,
+    usbAuthorizedDeviceCount: usbAuthorizedDevices.length,
     hasIncomingFsState: Boolean(incomingFsState),
   });
 
   const createScdaemonBridge = () => {
-    const worker = new Worker(gpgScdaemonWorkerUrl);
+    const worker = new Worker(asWorkerScriptUrl(gpgScdaemonWorkerUrl));
     let daemonDone = false;
     let resolveResult;
     let rejectResult;
@@ -608,10 +800,16 @@ async function handleStart(message) {
       }
       if (messageData.type === 'error') {
         postDebug('scdaemon.error', { message: String(messageData.message || 'unknown worker error') });
+        resolveReady(false);
         return;
       }
       if (messageData.type === 'result') {
         daemonDone = true;
+        postDebug('scdaemon.exit', {
+          exitCode: Number.isFinite(messageData.exitCode) ? Number(messageData.exitCode) : null,
+          error: messageData.error ? String(messageData.error) : '',
+        });
+        resolveReady(false);
         resolveResult(messageData);
       }
     });
@@ -624,9 +822,11 @@ async function handleStart(message) {
 
     worker.postMessage({
       type: 'start',
+      debug: debugEnabled,
       scdaemonScriptUrl: gpgScdaemonScriptUrl,
       scdaemonWasmUrl: gpgScdaemonWasmUrl,
       homedir,
+      usbAuthorizedDevices,
       bridge: {
         agentToScdaemon: agentToScdaemonDesc,
         scdaemonToAgent: scdaemonToAgentDesc,
@@ -634,6 +834,9 @@ async function handleStart(message) {
     });
 
     return {
+      readByte(shouldBlock = true) {
+        return queuePopByte(scdaemonToAgent, shouldBlock);
+      },
       readAvailableByte() {
         return queuePopByte(scdaemonToAgent, false);
       },
@@ -655,6 +858,13 @@ async function handleStart(message) {
           return;
         }
         queuePushByte(agentToScdaemon, ch, true);
+      },
+      getStats() {
+        return {
+          agentToScdaemon: summarizeQueue(agentToScdaemon),
+          scdaemonToAgent: summarizeQueue(scdaemonToAgent),
+          daemonDone,
+        };
       },
       async awaitReady(timeoutMs) {
         let timeoutId = null;
@@ -701,28 +911,59 @@ async function handleStart(message) {
     };
   };
 
-  try {
-    scdaemonBridge = createScdaemonBridge();
-    const scdReady = await scdaemonBridge.awaitReady(12000);
-    postDebug('scdaemon.ready', {
-      scdReady,
-      gpgScdaemonWorkerUrl,
-      gpgScdaemonScriptUrl,
-      gpgScdaemonWasmUrl,
-    });
-    if (!scdReady) {
-      finish(2, 'scdaemon worker did not report ready within timeout');
-      return;
+  if (usbAuthorizedDevices.length > 0) {
+    try {
+      scdaemonBridge = createScdaemonBridge();
+      const scdReady = await scdaemonBridge.awaitReady(12000);
+      postDebug('scdaemon.ready', {
+        scdReady,
+        gpgScdaemonWorkerUrl,
+        gpgScdaemonScriptUrl,
+        gpgScdaemonWasmUrl,
+      });
+      if (!scdReady) {
+        postDebug('scdaemon.unavailable', {
+          reason: 'worker did not report ready within timeout',
+          gpgScdaemonWorkerUrl,
+          gpgScdaemonScriptUrl,
+          gpgScdaemonWasmUrl,
+        });
+        if (scdaemonBridge) {
+          await scdaemonBridge.shutdownAndWait(300).catch(() => null);
+          scdaemonBridge = null;
+        }
+      }
+    } catch (error) {
+      postDebug('scdaemon.unavailable', {
+        reason: 'failed to create scdaemon bridge',
+        errorMessage: formatError(error),
+        gpgScdaemonWorkerUrl,
+        gpgScdaemonScriptUrl,
+        gpgScdaemonWasmUrl,
+      });
+      if (scdaemonBridge) {
+        await scdaemonBridge.shutdownAndWait(300).catch(() => null);
+        scdaemonBridge = null;
+      }
     }
-  } catch (error) {
-    finish(2, `failed to create scdaemon bridge: ${formatError(error)}`);
-    return;
+  } else {
+    postDebug('scdaemon.skip', {
+      reason: 'no authorized usb devices',
+    });
   }
 
+  const useQuickRandom = message.quickRandom !== false;
   const finalArgs = [
     '--server',
+    '--verbose',
     '--homedir', homedir,
   ];
+  if (useQuickRandom) {
+    finalArgs.push('--debug-quick-random');
+  }
+  postDebug('quick-random', {
+    enabled: useQuickRandom,
+  });
 
   self.Module = {
     arguments: finalArgs,
@@ -742,35 +983,101 @@ async function handleStart(message) {
         }
         activeFS = FS;
 
-        const envObj = self.ENV || (self.Module && self.Module.ENV);
-        if (envObj) {
-          envObj.GNUPG_WASM_TRACE = '1';
-        }
+          const envObj = (() => {
+            const base = self.ENV && typeof self.ENV === 'object' ? self.ENV : {};
+            self.ENV = base;
+            if (self.Module && typeof self.Module === 'object') {
+              self.Module.ENV = base;
+            }
+            if (debugEnabled) {
+              base.GNUPG_WASM_TRACE = '1';
+            } else if (Object.prototype.hasOwnProperty.call(base, 'GNUPG_WASM_TRACE')) {
+              delete base.GNUPG_WASM_TRACE;
+            }
+            return base;
+          })();
+
+        postDebug('prerun.env', {
+          hasSelfEnv: Boolean(self.ENV),
+          hasModuleEnv: Boolean(self.Module && self.Module.ENV),
+          trace: envObj.GNUPG_WASM_TRACE,
+        });
+
+        const ipcRxTracer = createLineTracer('ipc.rx');
+        const ipcTxTracer = createLineTracer('ipc.tx');
+        const scdTxTracer = createLineTracer('scd.tx');
+        const scdRxTracer = createLineTracer('scd.rx');
+
+        // Track whether we have delivered at least one byte in the current
+        // Emscripten read() call.  Emscripten calls input() in a tight loop
+        // up to `length` times.  We must BLOCK on the very first byte (so the
+        // C code sleeps until data arrives instead of getting EAGAIN/EOF), but
+        // return undefined for subsequent bytes when the queue is empty so
+        // that the read loop breaks and returns the partial line to the C
+        // caller (assuan reads one line at a time).
+        let stdinDeliveredInRead = 0;
+        let stdinReadSeq = 0;  // increments each time we start a new "logical read"
 
         FS.init(
           () => {
             bridgeMetrics.stdinReadCalls += 1;
-            if (bridgeMetrics.stdinReadCalls <= 16 || (bridgeMetrics.stdinReadCalls % 64) === 0) {
+            const callNum = bridgeMetrics.stdinReadCalls;
+
+            // Log every call for the first 64, then every 64th
+            if (callNum <= 64 || (callNum % 64) === 0) {
               postDebug('bridge.stdin.call', {
-                calls: bridgeMetrics.stdinReadCalls,
+                seq: stdinReadSeq,
+                n: callNum,
+                delivered: stdinDeliveredInRead,
                 queue: summarizeQueue(bridge.gpgToAgent),
               });
             }
-            const value = queuePopByte(bridge.gpgToAgent, false);
+
+            // Block only when no bytes delivered yet in this read() call.
+            const shouldBlock = stdinDeliveredInRead === 0;
+            if (shouldBlock && callNum <= 200) {
+              postDebug('bridge.stdin.blocking', {
+                seq: stdinReadSeq,
+                n: callNum,
+                queue: summarizeQueue(bridge.gpgToAgent),
+              });
+            }
+            const value = queuePopByte(bridge.gpgToAgent, shouldBlock);
+
             if (value !== null && value !== undefined) {
+              stdinDeliveredInRead += 1;
               bridgeMetrics.stdinRead += 1;
+              ipcRxTracer.push(value);
               if (bridgeMetrics.stdinPreview.length < 32) {
                 bridgeMetrics.stdinPreview.push(Number(value) & 0xff);
               }
-              if (bridgeMetrics.stdinRead <= 32) {
+              // Log every byte for first 64 reads
+              if (bridgeMetrics.stdinRead <= 64) {
                 postDebug('bridge.stdin.byte', {
+                  seq: stdinReadSeq,
                   index: bridgeMetrics.stdinRead,
                   value: Number(value) & 0xff,
+                  chr: String.fromCharCode(Number(value) & 0xff),
                 });
               }
               if ((bridgeMetrics.stdinRead % 256) === 0) {
                 postDebug('bridge.stdin', { bytes: bridgeMetrics.stdinRead });
               }
+            } else {
+              // null = EOF (queue closed), undefined = no data (non-blocking).
+              const wasBlocking = shouldBlock;
+              const isNull = value === null;
+              postDebug('bridge.stdin.empty', {
+                seq: stdinReadSeq,
+                n: callNum,
+                delivered: stdinDeliveredInRead,
+                isNull,
+                wasBlocking,
+                queue: summarizeQueue(bridge.gpgToAgent),
+              });
+              // Reset delivered counter so next read() call blocks again.
+              stdinDeliveredInRead = 0;
+              stdinReadSeq += 1;
             }
             return value;
           },
@@ -780,9 +1087,10 @@ async function handleStart(message) {
             }
             bridgeMetrics.stdoutWriteCalls += 1;
             bridgeMetrics.stdoutWrite += 1;
-             if (bridgeMetrics.stdoutPreview.length < 32) {
-               bridgeMetrics.stdoutPreview.push(Number(ch) & 0xff);
-             }
+            ipcTxTracer.push(ch);
+            if (bridgeMetrics.stdoutPreview.length < 32) {
+              bridgeMetrics.stdoutPreview.push(Number(ch) & 0xff);
+            }
             if (bridgeMetrics.stdoutWrite <= 32) {
               postDebug('bridge.stdout.byte', {
                 index: bridgeMetrics.stdoutWrite,
@@ -799,7 +1107,7 @@ async function handleStart(message) {
           }
         );
 
-        if (scdaemonBridge && envObj) {
+        if (scdaemonBridge) {
           const devName = `gnupg-scd-bridge-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
           const devPath = `/dev/${devName}`;
           try {
@@ -813,36 +1121,116 @@ async function handleStart(message) {
             const POLLIN = 0x001;
             const POLLOUT = 0x004;
             const POLLHUP = 0x010;
-            const errnoCodes = self.ERRNO_CODES || (self.Module && self.Module.ERRNO_CODES) || null;
-            const EAGAIN = errnoCodes && Number.isFinite(errnoCodes.EAGAIN)
-              ? Number(errnoCodes.EAGAIN)
-              : 6;
+            let scdaemonReadCalls = 0;
+            let scdaemonReadBytes = 0;
+            let scdaemonWriteCalls = 0;
+            let scdaemonWriteBytes = 0;
+            let scdaemonReadLoggedCalls = 0;
+            let scdaemonWriteLoggedCalls = 0;
+            let scdaemonLastReadLogAt = 0;
+            let scdaemonLastWriteLogAt = 0;
 
             FS.registerDevice(dev, {
               read(stream, buffer, offset, length) {
+                scdaemonReadCalls += 1;
                 let count = 0;
+                const firstBytes = [];
+
+                if (length <= 0) {
+                  return 0;
+                }
+
+                const waitStartedAt = Date.now();
+                const firstByte = scdaemonBridge.readByte(true);
+                const waitMs = Date.now() - waitStartedAt;
+                if (waitMs >= 400) {
+                  postDebug('scd.wait', {
+                    ms: waitMs,
+                    calls: scdaemonReadCalls,
+                    readBytes: scdaemonReadBytes,
+                    writeBytes: scdaemonWriteBytes,
+                    queue: summarizeQueue(scdaemonToAgent),
+                  });
+                }
+                if (firstByte === null) {
+                  postDebug('scd.eof', {
+                    calls: scdaemonReadCalls,
+                    totalBytes: scdaemonReadBytes,
+                  });
+                  return 0;
+                }
+
+                buffer[offset + count] = firstByte;
+                scdRxTracer.push(firstByte);
+                if (firstBytes.length < 64) {
+                  firstBytes.push(Number(firstByte) & 0xff);
+                }
+                count += 1;
+
                 while (count < length) {
-                  const byteValue = scdaemonBridge.readAvailableByte();
+                  const byteValue = scdaemonBridge.readByte(false);
                   if (byteValue === undefined || byteValue === null) {
                     break;
                   }
                   buffer[offset + count] = byteValue;
-                  count += 1;
-                  if (!scdaemonBridge.hasReadableData()) {
-                    break;
+                  scdRxTracer.push(byteValue);
+                  if (firstBytes.length < 64) {
+                    firstBytes.push(Number(byteValue) & 0xff);
                   }
+                  count += 1;
                 }
 
-                if (count === 0 && !scdaemonBridge.isReadableClosed()) {
-                  throw new FS.ErrnoError(EAGAIN);
+                if (count > 0) {
+                  scdaemonReadBytes += count;
+                  const now = Date.now();
+                  if (scdaemonReadCalls <= 24 || (now - scdaemonLastReadLogAt > 1200)) {
+                    scdaemonLastReadLogAt = now;
+                    const ascii = String.fromCharCode(...firstBytes.map((v) => (v >= 32 && v <= 126 ? v : 46)));
+                    const payload = {
+                      calls: scdaemonReadCalls,
+                      count,
+                      totalBytes: scdaemonReadBytes,
+                    };
+                    if (scdaemonReadLoggedCalls < 12) {
+                      scdaemonReadLoggedCalls += 1;
+                      payload.ascii = ascii;
+                    }
+                    postDebug('scd.rx.chunk', payload);
+                  }
                 }
                 return count;
               },
               write(stream, buffer, offset, length) {
+                scdaemonWriteCalls += 1;
                 let count = 0;
+                const firstBytes = [];
                 while (count < length) {
-                  scdaemonBridge.writeByte(buffer[offset + count]);
+                  const byteValue = buffer[offset + count];
+                  if (firstBytes.length < 64) {
+                    firstBytes.push(Number(byteValue) & 0xff);
+                  }
+                  scdTxTracer.push(byteValue);
+                  scdaemonBridge.writeByte(byteValue);
                   count += 1;
+                }
+                scdaemonWriteBytes += count;
+                if (scdaemonWriteLoggedCalls < 12) {
+                  scdaemonWriteLoggedCalls += 1;
+                  const ascii = String.fromCharCode(...firstBytes.map((v) => (v >= 32 && v <= 126 ? v : 46)));
+                  postDebug('scd.tx.chunk', {
+                    calls: scdaemonWriteCalls,
+                    count,
+                    totalBytes: scdaemonWriteBytes,
+                    ascii,
+                  });
+                }
+                const now = Date.now();
+                if (now - scdaemonLastWriteLogAt > 1200) {
+                  scdaemonLastWriteLogAt = now;
+                  postDebug('scd.tx.total', {
+                    calls: scdaemonWriteCalls,
+                    totalBytes: scdaemonWriteBytes,
+                  });
                 }
                 return count;
               },
@@ -867,19 +1255,20 @@ async function handleStart(message) {
             postDebug('prerun.scdaemon-fd', {
               devPath,
               fd: stream.fd,
+              fdEnv: envObj.GNUPG_WASM_SCDAEMON_FD,
             });
           } catch (error) {
             throw new Error(`failed to create scdaemon bridge fd: ${formatError(error)}`);
           }
-        } else if (envObj && envObj.GNUPG_WASM_SCDAEMON_FD) {
+        } else if (envObj.GNUPG_WASM_SCDAEMON_FD) {
           delete envObj.GNUPG_WASM_SCDAEMON_FD;
         }
 
         postDebug('prerun.fs-init', {
           persistRoots,
-    hasIncomingFsState: Boolean(incomingFsState),
-    hasScdaemonBridge: Boolean(scdaemonBridge),
-  });
+          hasIncomingFsState: Boolean(incomingFsState),
+          hasScdaemonBridge: Boolean(scdaemonBridge),
+        });
 
         if (incomingFsState) {
           restoreFsState(FS, incomingFsState);
@@ -900,9 +1289,12 @@ async function handleStart(message) {
       postDebug('runtime-initialized', {});
       postMessage({ type: 'ready' });
       try {
+        postDebug('callMain.enter', { args: finalArgs });
         const rc = callMainWith(finalArgs.slice());
+        postDebug('callMain.exit', { rc, stdinReadCalls: bridgeMetrics.stdinReadCalls, stdinRead: bridgeMetrics.stdinRead });
         finish(Number.isFinite(rc) ? rc : 0, 'callMain returned');
       } catch (error) {
+        postDebug('callMain.error', { error: formatError(error), stdinReadCalls: bridgeMetrics.stdinReadCalls, stdinRead: bridgeMetrics.stdinRead });
         if (error && typeof error === 'object' && Number.isFinite(error.status)) {
           finish(Number(error.status), 'callMain exit status');
           return;

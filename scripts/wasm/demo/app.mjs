@@ -10,7 +10,6 @@ const el = {
   homedir: document.querySelector('#homedir'),
   defaultPassphrase: document.querySelector('#defaultPassphrase'),
   autoPinentry: document.querySelector('#autoPinentry'),
-  symmetricProfile: document.querySelector('#symmetricProfile'),
   sessionInfo: document.querySelector('#sessionInfo'),
 
   filePath: document.querySelector('#filePath'),
@@ -51,6 +50,11 @@ const el = {
   btnDecrypt: document.querySelector('#btnDecrypt'),
   btnClearSign: document.querySelector('#btnClearSign'),
   btnVerify: document.querySelector('#btnVerify'),
+  btnCardStatus: document.querySelector('#btnCardStatus'),
+  btnEditCard: document.querySelector('#btnEditCard'),
+  btnRequestUsbDevice: document.querySelector('#btnRequestUsbDevice'),
+  btnClearUsbDevices: document.querySelector('#btnClearUsbDevices'),
+  usbDevices: document.querySelector('#usbDevices'),
   btnRunRaw: document.querySelector('#btnRunRaw'),
   btnClearConsole: document.querySelector('#btnClearConsole'),
 
@@ -73,6 +77,9 @@ let pinentryResolver = null;
 let stdinResolver = null;
 let gpgClient = null;
 let gpgClientKey = '';
+let authorizedUsbDevices = [];
+
+const USB_AUTH_STORAGE_KEY = 'gnupg-wasm-authorized-usb-devices-v1';
 
 function nowLabel() {
   return new Date().toLocaleTimeString();
@@ -123,6 +130,169 @@ function normalizePath(pathValue, fallback = '/work/note.txt') {
     value = value.slice(0, -1);
   }
   return value.replace(/\/{2,}/g, '/');
+}
+
+function toHex16(value) {
+  return `0x${(Number(value) & 0xffff).toString(16).padStart(4, '0')}`;
+}
+
+function normalizeUsbAuthorizedDevices(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const out = [];
+  const seen = new Set();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const vendorId = Number(entry.vendorId);
+    const productId = Number(entry.productId);
+    if (!Number.isFinite(vendorId) || !Number.isFinite(productId)) {
+      continue;
+    }
+
+    const normalizedEntry = {
+      vendorId: Math.max(0, Math.min(0xffff, vendorId | 0)),
+      productId: Math.max(0, Math.min(0xffff, productId | 0)),
+      serialNumber: typeof entry.serialNumber === 'string' ? entry.serialNumber : '',
+      manufacturerName: typeof entry.manufacturerName === 'string' ? entry.manufacturerName : '',
+      productName: typeof entry.productName === 'string' ? entry.productName : '',
+    };
+
+    const key = `${normalizedEntry.vendorId}:${normalizedEntry.productId}:${normalizedEntry.serialNumber}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(normalizedEntry);
+  }
+
+  return out;
+}
+
+function loadAuthorizedUsbDevices() {
+  let parsed = [];
+  try {
+    const raw = localStorage.getItem(USB_AUTH_STORAGE_KEY);
+    if (raw) {
+      parsed = JSON.parse(raw);
+    }
+  } catch {
+    parsed = [];
+  }
+  authorizedUsbDevices = normalizeUsbAuthorizedDevices(parsed);
+}
+
+function saveAuthorizedUsbDevices() {
+  try {
+    localStorage.setItem(USB_AUTH_STORAGE_KEY, JSON.stringify(authorizedUsbDevices));
+  } catch {
+    /* Best effort only. */
+  }
+}
+
+function renderAuthorizedUsbDevices() {
+  if (!el.usbDevices) {
+    return;
+  }
+  if (!authorizedUsbDevices.length) {
+    el.usbDevices.textContent = 'No selected USB smartcard device yet. Use "Select USB Smartcard Device" first.';
+    return;
+  }
+
+  const lines = authorizedUsbDevices.map((entry, idx) => {
+    const names = [entry.manufacturerName, entry.productName].filter(Boolean).join(' ').trim();
+    const serial = entry.serialNumber ? ` sn=${entry.serialNumber}` : '';
+    const namePart = names ? ` ${names}` : '';
+    return `${idx + 1}. ${toHex16(entry.vendorId)}:${toHex16(entry.productId)}${serial}${namePart}`;
+  });
+  el.usbDevices.textContent = lines.join('\n');
+}
+
+function upsertAuthorizedUsbDevice(entry) {
+  const normalized = normalizeUsbAuthorizedDevices([entry]);
+  if (!normalized.length) {
+    return false;
+  }
+
+  const candidate = normalized[0];
+  const key = `${candidate.vendorId}:${candidate.productId}:${candidate.serialNumber}`;
+  const existingIdx = authorizedUsbDevices.findIndex(
+    (item) => `${item.vendorId}:${item.productId}:${item.serialNumber}` === key
+  );
+
+  if (existingIdx === -1) {
+    authorizedUsbDevices.push(candidate);
+  } else {
+    authorizedUsbDevices[existingIdx] = {
+      ...authorizedUsbDevices[existingIdx],
+      ...candidate,
+    };
+  }
+
+  saveAuthorizedUsbDevices();
+  renderAuthorizedUsbDevices();
+  return true;
+}
+
+function clearAuthorizedUsbDevices() {
+  authorizedUsbDevices = [];
+  saveAuthorizedUsbDevices();
+  renderAuthorizedUsbDevices();
+  appendConsole('note', '[usb] cleared selected USB device allowlist');
+}
+
+function getAuthorizedUsbDevicesForRun() {
+  return authorizedUsbDevices.map((entry) => ({
+    vendorId: entry.vendorId,
+    productId: entry.productId,
+    serialNumber: entry.serialNumber,
+  }));
+}
+
+async function requestUsbDeviceAuthorization() {
+  if (!navigator.usb || typeof navigator.usb.requestDevice !== 'function') {
+    appendConsole('error', 'WebUSB requestDevice is not available in this environment');
+    return;
+  }
+
+  try {
+    const device = await navigator.usb.requestDevice({ filters: [] });
+    const added = upsertAuthorizedUsbDevice({
+      vendorId: device.vendorId,
+      productId: device.productId,
+      serialNumber: typeof device.serialNumber === 'string' ? device.serialNumber : '',
+      manufacturerName: typeof device.manufacturerName === 'string' ? device.manufacturerName : '',
+      productName: typeof device.productName === 'string' ? device.productName : '',
+    });
+
+    if (added) {
+      appendConsole(
+        'ok',
+        `[usb] selected ${toHex16(device.vendorId)}:${toHex16(device.productId)}${device.serialNumber ? ` sn=${device.serialNumber}` : ''}`
+      );
+    } else {
+      appendConsole('error', '[usb] selected device is missing vendor/product identifiers');
+    }
+  } catch (error) {
+    if (error && typeof error === 'object' && error.name === 'NotFoundError') {
+      appendConsole('note', '[usb] selection cancelled by user');
+      return;
+    }
+    appendConsole('error', `[usb] requestDevice failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function ensureUsbDeviceSelectedForCardOps() {
+  if (authorizedUsbDevices.length > 0) {
+    return true;
+  }
+  appendConsole('error', 'no USB smartcard device selected; click "Select USB Smartcard Device" first');
+  return false;
 }
 
 function isLikelyKeygenArgs(args) {
@@ -294,28 +464,81 @@ function deleteFile(pathValue) {
 function renderFileTree() {
   ensureState();
 
-  const dirs = fsState.dirs
-    .map((entry) => entry.path)
-    .sort((a, b) => a.localeCompare(b));
+  const nodes = new Map();
 
-  const files = fsState.files
-    .map((entry) => ({ path: entry.path, size: approxBase64Bytes(entry.data) }))
-    .sort((a, b) => a.path.localeCompare(b.path));
+  const ensureNode = (pathValue) => {
+    const path = normalizePath(pathValue, '/');
+    if (!nodes.has(path)) {
+      nodes.set(path, {
+        path,
+        dirs: new Set(),
+        files: [],
+      });
+    }
+    return nodes.get(path);
+  };
 
-  const lines = [];
-  lines.push('dirs');
-  for (const dir of dirs) {
-    lines.push(`  ${dir}`);
+  ensureNode('/');
+
+  for (const entry of fsState.dirs) {
+    const dirPath = normalizePath(entry.path, '/');
+    ensureNode(dirPath);
+    if (dirPath === '/') {
+      continue;
+    }
+    const parent = parentPath(dirPath);
+    const node = ensureNode(parent);
+    node.dirs.add(dirPath);
   }
 
-  lines.push('');
-  lines.push('files');
-  for (const file of files) {
-    lines.push(`  ${file.path} (${file.size} bytes)`);
+  for (const entry of fsState.files) {
+    const filePath = normalizePath(entry.path, '/work/note.txt');
+    const parent = parentPath(filePath);
+    ensureNode(parent).files.push({
+      path: filePath,
+      size: approxBase64Bytes(entry.data),
+    });
   }
 
-  if (!files.length) {
-    lines.push('  (no files yet)');
+  const toLabel = (pathValue, isDir) => {
+    if (pathValue === '/') {
+      return '/';
+    }
+    const parts = pathValue.split('/').filter(Boolean);
+    const last = parts.length ? parts[parts.length - 1] : pathValue;
+    return isDir ? `${last}/` : last;
+  };
+
+  const lines = ['virtual-fs'];
+
+  const renderNode = (pathValue, prefix = '') => {
+    const node = ensureNode(pathValue);
+    const childDirs = Array.from(node.dirs).sort((a, b) => a.localeCompare(b));
+    const childFiles = node.files.sort((a, b) => a.path.localeCompare(b.path));
+    const items = [
+      ...childDirs.map((dir) => ({ type: 'dir', value: dir })),
+      ...childFiles.map((file) => ({ type: 'file', value: file })),
+    ];
+
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i];
+      const isLast = i === items.length - 1;
+      const branch = isLast ? '└── ' : '├── ';
+      const childPrefix = `${prefix}${isLast ? '    ' : '│   '}`;
+
+      if (item.type === 'dir') {
+        lines.push(`${prefix}${branch}${toLabel(item.value, true)}`);
+        renderNode(item.value, childPrefix);
+      } else {
+        lines.push(`${prefix}${branch}${toLabel(item.value.path, false)} (${item.value.size} bytes)`);
+      }
+    }
+  };
+
+  renderNode('/');
+
+  if (lines.length === 1) {
+    lines.push('└── (empty)');
   }
 
   el.fileTree.textContent = lines.join('\n');
@@ -696,7 +919,7 @@ function createClient(homedir, persistRoots) {
     gpgAgentWasmUrl,
     homedir,
     persistRoots,
-    persistentAgentRuntime: true,
+    persistentAgentRuntime: false,
   });
 }
 
@@ -783,8 +1006,9 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
       fsState,
       persistRoots,
       emitStatus: true,
-      debug: true,
+      debug: options.debug === true,
       runTimeoutMs,
+      usbAuthorizedDevices: getAuthorizedUsbDevicesForRun(),
       onInputRequest: (request) => {
         const preset = readStdinPresetText();
         if (preset) {
@@ -802,12 +1026,14 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
       onStatus: (line) => {
         appendConsole('status', `[status] ${String(line ?? '')}`);
       },
-      onDebug: (entry) => {
-        const step = entry && typeof entry.step === 'string' ? entry.step : 'unknown';
-        perf.markFromDebugStep(step);
-        const dataText = formatDebugData(entry ? entry.data : null);
-        appendConsole('note', `[debug:${step}] ${dataText}`);
-      },
+      onDebug: options.debug === true
+        ? (entry) => {
+            const step = entry && typeof entry.step === 'string' ? entry.step : 'unknown';
+            perf.markFromDebugStep(step);
+            const dataText = formatDebugData(entry ? entry.data : null);
+            appendConsole('note', `[debug:${step}] ${dataText}`);
+          }
+        : undefined,
       onPinentry: promptPinentry,
       pinentryRequest,
     });
@@ -986,32 +1212,19 @@ async function handleKeyserverRefresh() {
 async function handleSymmetricEncrypt() {
   const source = normalizePath(el.sourcePath.value, '/work/input.txt');
   const output = normalizePath(el.outputPath.value, '/work/output.asc');
-  const symmetricProfile = el.symmetricProfile && typeof el.symmetricProfile.value === 'string'
-    ? el.symmetricProfile.value.trim()
-    : 'secure';
   el.sourcePath.value = source;
   el.outputPath.value = output;
 
   writeEditorToPath(source);
-  const args = ['--armor', '--output', output];
-  let perfLabel = 'symmetric-encrypt';
-
-  if (symmetricProfile === 'fast-dev') {
-    args.push('--s2k-count', '65536');
-    perfLabel = 'symmetric-encrypt-fast-dev';
-    appendConsole('note', 'symmetric profile: fast-dev (--s2k-count 65536, weaker KDF for testing)');
-  } else {
-    appendConsole('note', 'symmetric profile: secure (default S2K cost)');
-  }
-
-  args.push('--symmetric', source);
+  const args = ['--armor', '--output', output, '--symmetric', source];
+  appendConsole('note', 'symmetric encryption uses default secure S2K settings');
 
   const result = await runGpg(args, {
     op: 'symmetric',
     keyHint: source,
   }, {
     perfEnabled: true,
-    perfLabel,
+    perfLabel: 'symmetric-encrypt',
     perfInputPath: source,
     perfOutputPath: output,
   });
@@ -1087,6 +1300,21 @@ async function handleVerify() {
   writeEditorToPath(source);
 
   await runGpg(['--verify', source]);
+}
+
+async function handleCardStatus() {
+  if (!ensureUsbDeviceSelectedForCardOps()) {
+    return;
+  }
+  await runGpg(['--card-status']);
+}
+
+async function handleEditCard() {
+  if (!ensureUsbDeviceSelectedForCardOps()) {
+    return;
+  }
+  appendConsole('note', 'card-edit may prompt for input; use stdin preset or dialog if needed');
+  await runGpg(['--card-edit']);
 }
 
 async function handleRawCommand() {
@@ -1218,6 +1446,22 @@ function bindEvents() {
     await handleVerify();
   });
 
+  el.btnRequestUsbDevice.addEventListener('click', async () => {
+    await requestUsbDeviceAuthorization();
+  });
+
+  el.btnClearUsbDevices.addEventListener('click', () => {
+    clearAuthorizedUsbDevices();
+  });
+
+  el.btnCardStatus.addEventListener('click', async () => {
+    await handleCardStatus();
+  });
+
+  el.btnEditCard.addEventListener('click', async () => {
+    await handleEditCard();
+  });
+
   el.btnRunRaw.addEventListener('click', async () => {
     await handleRawCommand();
   });
@@ -1276,6 +1520,8 @@ function initDefaults() {
 
 function main() {
   initDefaults();
+  loadAuthorizedUsbDevices();
+  renderAuthorizedUsbDevices();
   bindEvents();
   resetSession();
   appendConsole(
@@ -1288,6 +1534,7 @@ function main() {
       'browser is not cross-origin isolated; use scripts/wasm/demo/serve.py and hard refresh'
     );
   }
+  appendConsole('note', `[usb] selected smartcard USB devices: ${authorizedUsbDevices.length}`);
   appendConsole('note', 'ready; start with "Run --version" or "Generate Key"');
 }
 
