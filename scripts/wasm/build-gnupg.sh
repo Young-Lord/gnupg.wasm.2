@@ -279,6 +279,7 @@ GNUPG_CXXFLAGS="$CXXFLAGS"
 if [[ "$TARGET" == "browser" ]]; then
   GNUPG_LDFLAGS="$(wasm_append_flags "$LDFLAGS" "$WASM_BROWSER_LDFLAGS")"
   GNUPG_LDFLAGS="$(wasm_append_flags "$GNUPG_LDFLAGS" "-sTRUSTED_TYPES=1")"
+  GNUPG_LDFLAGS="$(wasm_append_flags "$GNUPG_LDFLAGS" "-sDYNAMIC_EXECUTION=0")"
 else
   GNUPG_LDFLAGS="$(wasm_append_flags "$LDFLAGS" "$WASM_NODE_LDFLAGS")"
 fi

@@ -7,6 +7,7 @@ let stderrBuffer = [];
 let stderrLineBuffer = [];
 let stderrLoggedLines = 0;
 let debugEnabled = false;
+let heartbeatId = null;
 
 const bridgeMetrics = {
   stdinReadCalls: 0,
@@ -21,7 +22,33 @@ const bridgeMetrics = {
 
 let workerUrlPolicy = undefined;
 let workerScriptUrlShimInstalled = false;
-const DEBUG_BUILD_TAG = '2026-02-13-log-v2';
+const DEBUG_BUILD_TAG = '2026-02-15-console-trace-v9';
+
+// Global error handlers — catch anything that kills the worker silently
+self.onerror = (message, source, lineno, colno, error) => {
+  try {
+    console.error('[scd-onerror]', message, source, lineno, colno, error);
+    postDebug('global.onerror', {
+      message: String(message || ''),
+      source: String(source || '').slice(-80),
+      lineno,
+      colno,
+      error: error ? formatError(error) : '',
+    });
+    finish(1, `global error: ${message}`);
+  } catch { /* last resort */ }
+};
+self.onunhandledrejection = (event) => {
+  try {
+    const reason = event && event.reason;
+    console.error('[scd-unhandledrejection]', reason);
+    postDebug('global.unhandledrejection', {
+      reason: reason ? formatError(reason) : 'unknown',
+    });
+    // Don't call finish() for unhandled rejections from pthread workers —
+    // they may be non-fatal.
+  } catch { /* last resort */ }
+};
 
 function ensureDefaultWorkerScriptPolicy() {
   if (!self.trustedTypes || typeof self.trustedTypes.createPolicy !== 'function') {
@@ -107,9 +134,7 @@ function installWorkerScriptUrlShim() {
   try {
     self.Worker = WorkerWrapper;
     workerScriptUrlShimInstalled = true;
-    postDebug('worker.script-url-shim', { installed: true });
   } catch {
-    postDebug('worker.script-url-shim', { installed: false });
   }
 }
 
@@ -364,17 +389,32 @@ function writeStderrByte(ch) {
     bridgeMetrics.stderrPreview.push(value);
   }
   stderrBuffer.push(value);
-  if (stderrBuffer.length > 4096) {
-    stderrBuffer = stderrBuffer.slice(-2048);
+  if (stderrBuffer.length > 16384) {
+    stderrBuffer = stderrBuffer.slice(-8192);
   }
 
   if (value === 10 || value === 13) {
     if (stderrLineBuffer.length > 0) {
       const line = String.fromCharCode(...stderrLineBuffer).trim();
       stderrLineBuffer = [];
-      if (line && stderrLoggedLines < 40) {
-        stderrLoggedLines += 1;
-        postDebug('stderr.line', { line });
+      if (line) {
+        console.error('[scd-stderr]', line);
+      }
+      if (line && stderrLoggedLines < 120) {
+        // Filter out noisy per-byte/per-call wasm-trace lines
+        const isNoise = line.includes('[wasm-trace]') && (
+          line.includes('_assuan_read:') ||
+          line.includes('_assuan_write:') ||
+          line.includes('writen:') ||
+          line.includes('readline: calling readfnc') ||
+          line.includes('readline: readfnc returned') ||
+          line.includes('readline: enter') ||
+          line.includes('readline: done')
+        );
+        if (!isNoise) {
+          stderrLoggedLines += 1;
+          postDebug('stderr.line', { line });
+        }
       }
     }
     return;
@@ -394,6 +434,38 @@ function callMainWith(args) {
     return self.Module.callMain(args);
   }
   throw new Error('callMain is not available for scdaemon worker');
+}
+
+function getAsyncifySnapshot() {
+  const asyncify = self.Asyncify;
+  if (!asyncify || typeof asyncify !== 'object') {
+    return {
+      present: false,
+      pending: false,
+      state: -1,
+      stateName: 'absent',
+      hasWhenDone: false,
+    };
+  }
+
+  const state = Number(asyncify.state);
+  const stateName = state === 0
+    ? 'normal'
+    : state === 1
+      ? 'unwinding'
+      : state === 2
+        ? 'rewinding'
+        : state === 3
+          ? 'disabled'
+          : `unknown(${state})`;
+
+  return {
+    present: true,
+    pending: Boolean(asyncify.currData),
+    state,
+    stateName,
+    hasWhenDone: typeof asyncify.whenDone === 'function',
+  };
 }
 
 async function importLauncherScript(scriptUrl) {
@@ -419,34 +491,45 @@ async function importLauncherScript(scriptUrl) {
 }
 
 function finish(exitCode, errorMessage) {
+  console.error('[scd-finish] exitCode=' + exitCode, 'error=' + (errorMessage || ''),
+    'rx=' + bridgeMetrics.stdinRead, 'tx=' + bridgeMetrics.stdoutWrite,
+    'calls=' + bridgeMetrics.stdinReadCalls,
+    'stack=' + new Error().stack?.split('\n').slice(1, 4).join(' | '));
   if (finished) {
+    console.error('[scd-finish] ALREADY FINISHED, skipping');
     return;
   }
   finished = true;
 
-  if (stderrLineBuffer.length > 0 && stderrLoggedLines < 40) {
+  if (heartbeatId !== null) {
+    clearInterval(heartbeatId);
+    heartbeatId = null;
+  }
+
+  postDebug('finish', {
+    exitCode: Number.isFinite(exitCode) ? exitCode : 1,
+    error: errorMessage ? String(errorMessage) : '',
+    rx: bridgeMetrics.stdinRead,
+    tx: bridgeMetrics.stdoutWrite,
+    calls: bridgeMetrics.stdinReadCalls,
+    a2s: bridge ? summarizeQueue(bridge.agentToScdaemon) : null,
+    s2a: bridge ? summarizeQueue(bridge.scdaemonToAgent) : null,
+    stack: new Error().stack?.split('\n').slice(0, 5).join(' | '),
+  });
+
+  // Flush any trailing stderr
+  if (stderrLineBuffer.length > 0) {
     const tailLine = String.fromCharCode(...stderrLineBuffer).trim();
     stderrLineBuffer = [];
-    if (tailLine) {
+    if (tailLine && stderrLoggedLines < 80) {
       stderrLoggedLines += 1;
       postDebug('stderr.line', { line: tailLine });
     }
   }
 
-  if (bridge) {
-    queueClose(bridge.agentToScdaemon);
-    queueClose(bridge.scdaemonToAgent);
-  }
-
   const stderrText = new TextDecoder().decode(new Uint8Array(stderrBuffer));
-  postDebug('finish', {
-    exitCode: Number.isFinite(exitCode) ? exitCode : 1,
-    errorMessage: errorMessage ? String(errorMessage) : '',
-    bridgeMetrics: { ...bridgeMetrics },
-    agentToScdaemon: bridge ? summarizeQueue(bridge.agentToScdaemon) : null,
-    scdaemonToAgent: bridge ? summarizeQueue(bridge.scdaemonToAgent) : null,
-  });
 
+  // Post result BEFORE closing queues so agent sees our messages first
   postMessage({
     type: 'result',
     exitCode: Number.isFinite(exitCode) ? exitCode : 1,
@@ -454,9 +537,12 @@ function finish(exitCode, errorMessage) {
     stderr: stderrText,
   });
 
-  setTimeout(() => {
-    self.close();
-  }, 0);
+  if (bridge) {
+    queueClose(bridge.agentToScdaemon);
+    queueClose(bridge.scdaemonToAgent);
+  }
+
+  setTimeout(() => { self.close(); }, 50);
 }
 
 async function handleStart(message) {
@@ -477,10 +563,6 @@ async function handleStart(message) {
   const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(message.usbAuthorizedDevices);
 
   self.__gnupgAuthorizedUsbDevices = usbAuthorizedDevices;
-  postDebug('usb.authorized-devices', {
-    buildTag: DEBUG_BUILD_TAG,
-    count: usbAuthorizedDevices.length,
-  });
 
   if (!scdaemonScriptUrl) {
     finish(2, 'missing scdaemonScriptUrl');
@@ -496,6 +578,10 @@ async function handleStart(message) {
     scdaemonToAgent: createSharedQueue(message.bridge.scdaemonToAgent),
   };
 
+  const diagBuf = message.diagBuf
+    ? new Int32Array(message.diagBuf)
+    : null;
+
   const finalArgs = [
     '--server',
     '--verbose',
@@ -504,9 +590,26 @@ async function handleStart(message) {
 
   installWorkerScriptUrlShim();
 
+  // Heartbeat: post a message every 500ms to prove the worker is alive.
+  // If the agent stops seeing heartbeats, the worker died silently.
+  let heartbeatSeq = 0;
+  heartbeatId = setInterval(() => {
+    heartbeatSeq += 1;
+    if (heartbeatSeq <= 40) { // stop after 20s to avoid noise
+      postDebug('heartbeat', {
+        seq: heartbeatSeq,
+        rx: bridgeMetrics.stdinRead,
+        tx: bridgeMetrics.stdoutWrite,
+        calls: bridgeMetrics.stdinReadCalls,
+        finished,
+      });
+    }
+  }, 500);
+
   self.Module = {
     arguments: finalArgs,
     noInitialRun: true,
+    noExitRuntime: true,
     mainScriptUrlOrBlob: scdaemonScriptUrl,
     locateFile: (fileName, scriptDirectory) => {
       if (scdaemonWasmUrl && fileName.endsWith('.wasm')) {
@@ -519,6 +622,16 @@ async function handleStart(message) {
         const FS = self.FS || (self.Module && self.Module.FS);
         if (!FS || typeof FS.init !== 'function') {
           throw new Error('FS is not initialized in scdaemon worker');
+        }
+
+        // Intercept Emscripten's quit_ function to call finish() before throwing.
+        // quit_ is a top-level var in scdaemon.js that throws ExitStatus.
+        // If main() returns, callMain → exitJS → _proc_exit → quit_ throws.
+        // We need finish() to run before the throw so the agent gets our messages.
+        if (typeof self.quit_ === 'undefined') {
+          // quit_ might not be on self — it's a local var in the script scope.
+          // Try to find it via _proc_exit patching instead.
+          postDebug('quit_.notfound', {});
         }
 
         const envObj = (() => {
@@ -542,33 +655,72 @@ async function handleStart(message) {
           /* Best effort only. */
         }
 
-        const rxTracer = createLineTracer('rx');
-        const txTracer = createLineTracer('tx');
+        const rxTracer = { push() {} };
+        const txTracer = { push() {} };
+        const stdoutLineBuffer = [];
+
+        // Track whether we have delivered at least one byte in the current
+        // Emscripten read() call.  Emscripten calls input() in a tight loop
+        // up to `length` times.  We must BLOCK on the very first byte (so the
+        // C code sleeps until data arrives instead of getting EAGAIN/EOF), but
+        // return undefined for subsequent bytes when the queue is empty so
+        // that the read loop breaks and returns the partial line to the C
+        // caller (assuan reads one line at a time).
+        let stdinDeliveredInRead = 0;
+        let stdinReadSeq = 0;
 
         FS.init(
           () => {
             bridgeMetrics.stdinReadCalls += 1;
-            const waitStartedAt = Date.now();
-            const value = queuePopByte(bridge.agentToScdaemon, true);
-            const waitMs = Date.now() - waitStartedAt;
-            if (waitMs >= 400) {
-              postDebug('wait', {
-                ms: waitMs,
-                calls: bridgeMetrics.stdinReadCalls,
-                rxBytes: bridgeMetrics.stdinRead,
-                txBytes: bridgeMetrics.stdoutWrite,
-              });
+            if (diagBuf) Atomics.add(diagBuf, 4, 1);
+
+            const shouldBlock = stdinDeliveredInRead === 0;
+            const callNum = bridgeMetrics.stdinReadCalls;
+
+            // console.error bypasses postMessage — survives worker death
+            if (shouldBlock || callNum <= 5 || callNum % 50 === 0) {
+              console.error('[scd-stdin]', 'call=' + callNum,
+                'delivered=' + stdinDeliveredInRead,
+                'block=' + shouldBlock,
+                'seq=' + stdinReadSeq,
+                'a2s=' + JSON.stringify(summarizeQueue(bridge.agentToScdaemon)));
             }
+
+            let value;
+            try {
+              value = queuePopByte(bridge.agentToScdaemon, shouldBlock);
+            } catch (popErr) {
+              console.error('[scd-stdin] queuePopByte THREW:', popErr);
+              throw popErr;
+            }
+
             if (value !== null && value !== undefined) {
+              stdinDeliveredInRead += 1;
               bridgeMetrics.stdinRead += 1;
+              if (diagBuf) Atomics.add(diagBuf, 5, 1);
               rxTracer.push(value);
-              if (bridgeMetrics.stdinPreview.length < 32) {
-                bridgeMetrics.stdinPreview.push(Number(value) & 0xff);
+              // Log the byte on blocking reads (first byte of each read() call)
+              if (shouldBlock) {
+                console.error('[scd-stdin]', 'GOT first byte=' + value,
+                  '(' + String.fromCharCode(value > 31 && value < 127 ? value : 46) + ')',
+                  'call=' + callNum, 'totalRx=' + bridgeMetrics.stdinRead);
               }
-              if ((bridgeMetrics.stdinRead % 256) === 0) {
-                postDebug('rx.total', {
-                  bytes: bridgeMetrics.stdinRead,
-                  calls: bridgeMetrics.stdinReadCalls,
+            } else {
+              const wasNull = value === null;
+              console.error('[scd-stdin]', wasNull ? 'EOF(null)' : 'EMPTY(undef)',
+                'call=' + callNum, 'delivered=' + stdinDeliveredInRead,
+                'block=' + shouldBlock, 'seq=' + stdinReadSeq,
+                'a2s=' + JSON.stringify(summarizeQueue(bridge.agentToScdaemon)));
+              stdinDeliveredInRead = 0;
+              stdinReadSeq += 1;
+              // Only log EOF (queue closed) — this is the critical event
+              if (wasNull) {
+                postDebug('stdin.eof', {
+                  n: bridgeMetrics.stdinReadCalls,
+                  seq: stdinReadSeq,
+                  rx: bridgeMetrics.stdinRead,
+                  tx: bridgeMetrics.stdoutWrite,
+                  a2s: summarizeQueue(bridge.agentToScdaemon),
                 });
               }
             }
@@ -580,17 +732,20 @@ async function handleStart(message) {
             }
             bridgeMetrics.stdoutWriteCalls += 1;
             bridgeMetrics.stdoutWrite += 1;
+            if (diagBuf) { Atomics.add(diagBuf, 6, 1); Atomics.add(diagBuf, 7, 1); }
             txTracer.push(ch);
-            if (bridgeMetrics.stdoutPreview.length < 32) {
-              bridgeMetrics.stdoutPreview.push(Number(ch) & 0xff);
-            }
-            if ((bridgeMetrics.stdoutWrite % 256) === 0) {
-              postDebug('tx.total', {
-                bytes: bridgeMetrics.stdoutWrite,
-                calls: bridgeMetrics.stdoutWriteCalls,
-              });
-            }
             queuePushByte(bridge.scdaemonToAgent, ch, true);
+
+            const value = Number(ch) & 0xff;
+            if (value === 13 || value === 10) {
+              if (stdoutLineBuffer.length > 0) {
+                const line = String.fromCharCode(...stdoutLineBuffer);
+                stdoutLineBuffer.length = 0;
+                console.error('[scd-stdout]', line);
+              }
+            } else if (stdoutLineBuffer.length < 512) {
+              stdoutLineBuffer.push(value >= 32 && value <= 126 ? value : 46);
+            }
           },
           (ch) => {
             writeStderrByte(ch);
@@ -600,28 +755,112 @@ async function handleStart(message) {
     ],
     onRuntimeInitialized: () => {
       postMessage({ type: 'ready' });
+      postDebug('runtime.ready', {
+        hasCallMain: typeof self.callMain === 'function',
+        hasModuleCallMain: Boolean(self.Module && typeof self.Module.callMain === 'function'),
+        noExitRuntime: Boolean(self.Module && self.Module.noExitRuntime),
+      });
+      console.error('[scd-callMain] BEFORE callMainWith', JSON.stringify(finalArgs));
       try {
+        postDebug('callMain.enter', { args: finalArgs });
         const rc = callMainWith(finalArgs.slice());
+        const asyncify = getAsyncifySnapshot();
+        console.error('[scd-callMain] AFTER callMainWith rc=' + rc,
+          'rx=' + bridgeMetrics.stdinRead, 'tx=' + bridgeMetrics.stdoutWrite,
+          'calls=' + bridgeMetrics.stdinReadCalls,
+          'async=' + JSON.stringify(asyncify));
+
+        if (asyncify.pending && asyncify.hasWhenDone && self.Asyncify) {
+          console.error('[scd-callMain] ASYNCIFY pending, waiting for whenDone()');
+          postDebug('callMain.async.pending', {
+            rc,
+            asyncify,
+            rx: bridgeMetrics.stdinRead,
+            tx: bridgeMetrics.stdoutWrite,
+            calls: bridgeMetrics.stdinReadCalls,
+          });
+
+          self.Asyncify.whenDone().then((finalRc) => {
+            console.error('[scd-callMain] ASYNCIFY done finalRc=' + finalRc,
+              'rx=' + bridgeMetrics.stdinRead,
+              'tx=' + bridgeMetrics.stdoutWrite,
+              'calls=' + bridgeMetrics.stdinReadCalls);
+            postDebug('callMain.async.done', {
+              finalRc,
+              rx: bridgeMetrics.stdinRead,
+              tx: bridgeMetrics.stdoutWrite,
+              calls: bridgeMetrics.stdinReadCalls,
+              a2s: bridge ? summarizeQueue(bridge.agentToScdaemon) : null,
+              s2a: bridge ? summarizeQueue(bridge.scdaemonToAgent) : null,
+            });
+            finish(Number.isFinite(finalRc) ? finalRc : 0, 'callMain async done');
+          }).catch((asyncErr) => {
+            console.error('[scd-callMain] ASYNCIFY failed:', asyncErr);
+            postDebug('callMain.async.error', {
+              error: formatError(asyncErr),
+              name: asyncErr && asyncErr.name ? String(asyncErr.name) : '',
+              status: asyncErr && typeof asyncErr === 'object' ? asyncErr.status : undefined,
+              rx: bridgeMetrics.stdinRead,
+              tx: bridgeMetrics.stdoutWrite,
+            });
+            if (asyncErr && typeof asyncErr === 'object' && Number.isFinite(asyncErr.status)) {
+              finish(Number(asyncErr.status), `Asyncify ExitStatus=${asyncErr.status}`);
+              return;
+            }
+            finish(1, formatError(asyncErr));
+          });
+          return;
+        }
+
+        postDebug('callMain.exit', {
+          rc,
+          rx: bridgeMetrics.stdinRead,
+          tx: bridgeMetrics.stdoutWrite,
+          calls: bridgeMetrics.stdinReadCalls,
+          a2s: bridge ? summarizeQueue(bridge.agentToScdaemon) : null,
+          s2a: bridge ? summarizeQueue(bridge.scdaemonToAgent) : null,
+        });
         finish(Number.isFinite(rc) ? rc : 0, 'callMain returned');
       } catch (error) {
+        console.error('[scd-callMain] CATCH error:', error,
+          'name=' + (error && error.name),
+          'status=' + (error && error.status),
+          'isExitStatus=' + Boolean(error && error.name === 'ExitStatus'));
+        postDebug('callMain.error', {
+          error: formatError(error),
+          name: error && error.name ? String(error.name) : '',
+          status: error && typeof error === 'object' ? error.status : undefined,
+          isExitStatus: Boolean(error && error.name === 'ExitStatus'),
+          rx: bridgeMetrics.stdinRead,
+          tx: bridgeMetrics.stdoutWrite,
+          stack: error && error.stack ? error.stack.split('\n').slice(0, 6).join(' | ') : '',
+        });
         if (error && typeof error === 'object' && Number.isFinite(error.status)) {
-          finish(Number(error.status), 'callMain exit status');
+          finish(Number(error.status), `ExitStatus=${error.status}`);
           return;
         }
         finish(1, formatError(error));
       }
     },
     onExit: (code) => {
+      postDebug('onExit', { code });
       finish(code, 'onExit');
     },
     onAbort: (why) => {
+      postDebug('onAbort', { why: formatError(why) });
       finish(1, `abort: ${formatError(why)}`);
     },
   };
 
   try {
+    postDebug('import.start', { url: scdaemonScriptUrl.slice(-60) });
     await importLauncherScript(scdaemonScriptUrl);
+    postDebug('import.done', {
+      hasCallMain: typeof self.callMain === 'function',
+      finished,
+    });
   } catch (error) {
+    postDebug('import.error', { error: formatError(error) });
     finish(1, formatError(error));
   }
 }

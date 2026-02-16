@@ -69,12 +69,15 @@ readline (assuan_context_t ctx, char *buf, size_t buflen,
 {
   size_t nleft = buflen;
   char *p;
+  int iter = 0;
 
   *r_eof = 0;
   *r_nread = 0;
   while (nleft > 0)
     {
-      ssize_t n = ctx->engine.readfnc (ctx, buf, nleft);
+      ssize_t n;
+      iter++;
+      n = ctx->engine.readfnc (ctx, buf, nleft);
 
       if (n < 0)
         {
@@ -286,7 +289,7 @@ _assuan_write_line (assuan_context_t ctx, const char *prefix,
                                    NULL, 0, NULL, 0);
       if (prefixlen > 5)
         prefixlen = 5;
-      if (len > ASSUAN_LINELENGTH - prefixlen - 2)
+      if (len > ASSUAN_LINELENGTH - prefixlen - 2 - 1)
         len = ASSUAN_LINELENGTH - prefixlen - 2 - 1;
     }
 

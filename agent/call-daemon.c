@@ -410,14 +410,21 @@ daemon_start (enum daemon_type type, ctrl_t ctrl, int require_socket)
     {
       int have_wasm_scd_env = 0;
 
+      if (wasm_trace_enabled ())
+        log_info ("[wasm-trace] scdaemon: about to call"
+                  " wasm_connect_preopened_scdaemon ctx=%p\n", ctx);
+
       rc = wasm_connect_preopened_scdaemon (ctx, &have_wasm_scd_env);
 #ifdef __EMSCRIPTEN__
       if (wasm_trace_enabled ())
         log_info ("[wasm-trace] scdaemon: preopened connect result"
-                  " rc=%d have_env=%d\n", rc, have_wasm_scd_env);
+                  " rc=%d have_env=%d ctx=%p\n", rc, have_wasm_scd_env, ctx);
 #endif
       if (!rc)
         {
+          if (wasm_trace_enabled ())
+            log_info ("[wasm-trace] scdaemon: preopened connect SUCCESS"
+                      " ctx=%p\n", ctx);
           if (opt.verbose)
             log_info ("new connection to %s daemon established"
                       " (wasm pre-opened fd)\n", name);

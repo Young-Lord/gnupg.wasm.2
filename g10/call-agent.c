@@ -51,6 +51,23 @@ static assuan_context_t agent_ctx = NULL;
 static int did_early_card_test;
 #ifdef __EMSCRIPTEN__
 static unsigned long cached_agent_s2k_count;
+
+static int
+wasm_trace_enabled_g10 (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_TRACE");
+      enabled = (s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
 #endif
 
 struct confirm_parm_s
@@ -808,15 +825,33 @@ agent_scd_learn (struct agent_card_info_s *info, int force)
   memset (info, 0, sizeof *info);
   memset (&parm, 0, sizeof parm);
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_g10 ())
+    log_info ("[wasm-trace] agent_scd_learn: enter force=%d\n", force);
+#endif
+
   rc = start_agent (NULL, 1);
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_g10 ())
+    log_info ("[wasm-trace] agent_scd_learn: start_agent rc=%d\n", rc);
+#endif
   if (rc)
     return rc;
 
   parm.ctx = agent_ctx;
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_g10 ())
+    log_info ("[wasm-trace] agent_scd_learn: sending LEARN --sendinfo"
+              " force=%d\n", force);
+#endif
   rc = assuan_transact (agent_ctx,
                         force ? "LEARN --sendinfo --force" : "LEARN --sendinfo",
                         dummy_data_cb, NULL, default_inq_cb, &parm,
                         learn_status_cb, info);
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_g10 ())
+    log_info ("[wasm-trace] agent_scd_learn: assuan_transact rc=%d\n", rc);
+#endif
   /* Also try to get the key attributes.  */
   if (!rc)
     agent_scd_getattr ("KEY-ATTR", info);

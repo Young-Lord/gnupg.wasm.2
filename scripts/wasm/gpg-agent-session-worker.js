@@ -18,7 +18,7 @@ const runtimeState = {
 };
 
 let bridgeMetrics = createBridgeMetrics();
-const DEBUG_BUILD_TAG = '2026-02-13-log-v2';
+const DEBUG_BUILD_TAG = '2026-02-13-log-v3';
 
 let workerUrlPolicy = undefined;
 
@@ -491,9 +491,16 @@ function ensurePersistentScdaemonFd(FS, envObj) {
     ? Number(errnoCodes.EAGAIN)
     : 6;
 
+  let scdDevReadCalls = 0;
+  let scdDevReadBytes = 0;
+  let scdDevWriteCalls = 0;
+  let scdDevWriteBytes = 0;
+
   FS.registerDevice(dev, {
     read(stream, buffer, offset, length) {
+      scdDevReadCalls += 1;
       if (!activeScdaemonBridge) {
+        postDebug('session.scd.read.no-bridge', { calls: scdDevReadCalls });
         throw new FS.ErrnoError(EAGAIN);
       }
       if (length <= 0) {
@@ -502,6 +509,7 @@ function ensurePersistentScdaemonFd(FS, envObj) {
       let count = 0;
       const firstByte = activeScdaemonBridge.readByte(true);
       if (firstByte === null) {
+        postDebug('session.scd.read.eof', { calls: scdDevReadCalls, totalBytes: scdDevReadBytes });
         return 0;
       }
       buffer[offset + count] = firstByte;
@@ -515,16 +523,46 @@ function ensurePersistentScdaemonFd(FS, envObj) {
         buffer[offset + count] = byteValue;
         count += 1;
       }
+      scdDevReadBytes += count;
+      if (scdDevReadCalls <= 24 || (scdDevReadCalls % 50) === 0) {
+        const chunk = [];
+        for (let i = 0; i < Math.min(count, 64); i++) {
+          const v = buffer[offset + i];
+          chunk.push((v >= 32 && v <= 126) ? String.fromCharCode(v) : '.');
+        }
+        postDebug('session.scd.rx', {
+          calls: scdDevReadCalls,
+          count,
+          totalBytes: scdDevReadBytes,
+          ascii: chunk.join(''),
+        });
+      }
       return count;
     },
     write(stream, buffer, offset, length) {
+      scdDevWriteCalls += 1;
       if (!activeScdaemonBridge) {
+        postDebug('session.scd.write.no-bridge', { calls: scdDevWriteCalls });
         throw new FS.ErrnoError(EAGAIN);
       }
       let count = 0;
       while (count < length) {
         activeScdaemonBridge.writeByte(buffer[offset + count]);
         count += 1;
+      }
+      scdDevWriteBytes += count;
+      if (scdDevWriteCalls <= 24 || (scdDevWriteCalls % 50) === 0) {
+        const chunk = [];
+        for (let i = 0; i < Math.min(count, 64); i++) {
+          const v = buffer[offset + i];
+          chunk.push((v >= 32 && v <= 126) ? String.fromCharCode(v) : '.');
+        }
+        postDebug('session.scd.tx', {
+          calls: scdDevWriteCalls,
+          count,
+          totalBytes: scdDevWriteBytes,
+          ascii: chunk.join(''),
+        });
       }
       return count;
     },
@@ -679,6 +717,53 @@ async function ensureRuntime(gpgAgentScriptUrl, gpgAgentWasmUrl) {
           })();
 
           let stdinDeliveredInRead = 0;
+          let stdinReadSeq = 0;
+          const ipcRxTracer = (() => {
+            const bytes = [];
+            let lineCount = 0;
+            return {
+              push(v) {
+                if (v === null || v === undefined) return;
+                const b = Number(v) & 0xff;
+                if (b === 13) return;
+                if (b === 10) {
+                  if (bytes.length > 0 && lineCount < 120) {
+                    lineCount += 1;
+                    postDebug('session.ipc.rx', {
+                      n: lineCount,
+                      line: bytes.map(c => (c >= 32 && c <= 126) ? String.fromCharCode(c) : '.').join(''),
+                    });
+                  }
+                  bytes.length = 0;
+                  return;
+                }
+                if (bytes.length < 220) bytes.push(b);
+              },
+            };
+          })();
+          const ipcTxTracer = (() => {
+            const bytes = [];
+            let lineCount = 0;
+            return {
+              push(v) {
+                if (v === null || v === undefined) return;
+                const b = Number(v) & 0xff;
+                if (b === 13) return;
+                if (b === 10) {
+                  if (bytes.length > 0 && lineCount < 120) {
+                    lineCount += 1;
+                    postDebug('session.ipc.tx', {
+                      n: lineCount,
+                      line: bytes.map(c => (c >= 32 && c <= 126) ? String.fromCharCode(c) : '.').join(''),
+                    });
+                  }
+                  bytes.length = 0;
+                  return;
+                }
+                if (bytes.length < 220) bytes.push(b);
+              },
+            };
+          })();
 
           FS.init(
             () => {
@@ -687,15 +772,32 @@ async function ensureRuntime(gpgAgentScriptUrl, gpgAgentWasmUrl) {
                 return undefined;
               }
               const shouldBlock = stdinDeliveredInRead === 0;
+              if (shouldBlock && bridgeMetrics.stdinReadCalls <= 200) {
+                postDebug('session.stdin.blocking', {
+                  seq: stdinReadSeq,
+                  n: bridgeMetrics.stdinReadCalls,
+                  queue: summarizeQueue(activeBridge.gpgToAgent),
+                });
+              }
               const value = queuePopByte(activeBridge.gpgToAgent, shouldBlock);
               if (value !== null && value !== undefined) {
                 stdinDeliveredInRead += 1;
                 bridgeMetrics.stdinRead += 1;
+                ipcRxTracer.push(value);
                 if (bridgeMetrics.stdinPreview.length < 32) {
                   bridgeMetrics.stdinPreview.push(Number(value) & 0xff);
                 }
               } else {
+                if (value === null) {
+                  postDebug('session.stdin.eof', {
+                    seq: stdinReadSeq,
+                    n: bridgeMetrics.stdinReadCalls,
+                    delivered: stdinDeliveredInRead,
+                    queue: summarizeQueue(activeBridge.gpgToAgent),
+                  });
+                }
                 stdinDeliveredInRead = 0;
+                stdinReadSeq += 1;
               }
               return value;
             },
@@ -705,6 +807,7 @@ async function ensureRuntime(gpgAgentScriptUrl, gpgAgentWasmUrl) {
               }
               bridgeMetrics.stdoutWriteCalls += 1;
               bridgeMetrics.stdoutWrite += 1;
+              ipcTxTracer.push(ch);
               if (bridgeMetrics.stdoutPreview.length < 32) {
                 bridgeMetrics.stdoutPreview.push(Number(ch) & 0xff);
               }
@@ -1218,9 +1321,12 @@ async function handleRunSession(message) {
   }
 
   try {
+    postDebug('session.callMain.enter', { args: finalArgs, sessionId });
     const rc = callMainWith(finalArgs.slice());
+    postDebug('session.callMain.exit', { rc, sessionId, stdinReadCalls: bridgeMetrics.stdinReadCalls, stdinRead: bridgeMetrics.stdinRead });
     finishSession(sessionId, Number.isFinite(rc) ? rc : 0, 'callMain returned');
   } catch (error) {
+    postDebug('session.callMain.error', { error: formatError(error), sessionId, stdinReadCalls: bridgeMetrics.stdinReadCalls });
     if (error && typeof error === 'object' && Number.isFinite(error.status)) {
       finishSession(sessionId, Number(error.status), 'callMain exit status');
       return;

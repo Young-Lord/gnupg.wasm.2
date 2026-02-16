@@ -1069,6 +1069,20 @@ make_reader_id (libusb_device_handle *idev,
   char prefix[20];
 
   sprintf (prefix, "%04X:%04X:", (vendor & 0xffff), (product & 0xffff));
+
+#ifdef __EMSCRIPTEN__
+  /* On WebUSB the serial string-descriptor query may block before the
+     interface is claimed.  Use a stable fallback reader id and continue.  */
+  (void)idev;
+  (void)serialno_index;
+  rid = malloc (strlen (prefix) + 3 + 1);
+  if (!rid)
+    return NULL;
+  strcpy (rid, prefix);
+  strcat (rid, "X:0");
+  return rid;
+#endif
+
   rid = get_escaped_usb_string (idev, serialno_index, prefix, ":0");
   if (!rid)
     {
@@ -1389,18 +1403,39 @@ ccid_dev_scan (int *idx_max_p, void **t_p)
   *idx_max_p = 0;
   *t_p = NULL;
 
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] ccid_dev_scan: enter initialized_usb=%d\n",
+            initialized_usb);
+#endif
+
   if (!initialized_usb)
     {
       int rc;
+#ifdef __EMSCRIPTEN__
+      log_info ("[wasm-trace] ccid_dev_scan: calling libusb_init\n");
+#endif
       if ((rc = libusb_init (NULL)))
         {
           DEBUGOUT_1 ("usb_init failed: %s.\n", libusb_error_name (rc));
+#ifdef __EMSCRIPTEN__
+          log_info ("[wasm-trace] ccid_dev_scan: libusb_init failed rc=%d\n",
+                    rc);
+#endif
           return gpg_error (GPG_ERR_ENODEV);
         }
       initialized_usb = 1;
+#ifdef __EMSCRIPTEN__
+      log_info ("[wasm-trace] ccid_dev_scan: libusb_init ok\n");
+#endif
     }
 
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] ccid_dev_scan: calling libusb_get_device_list\n");
+#endif
   n = libusb_get_device_list (NULL, &ccid_usb_dev_list);
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] ccid_dev_scan: libusb_get_device_list n=%zd\n", n);
+#endif
   for (i = 0; i < n; i++)
     {
       struct libusb_config_descriptor *config;
@@ -1472,6 +1507,11 @@ ccid_dev_scan (int *idx_max_p, void **t_p)
     }
 
  scan_finish:
+
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] ccid_dev_scan: scan_finish err=%d idx=%d\n",
+            err, idx);
+#endif
 
   if (err)
     {
@@ -1699,7 +1739,15 @@ ccid_open_usb_reader (const char *spec_reader_name,
   addr = libusb_get_device_address (dev);
   bai = (bus << 16) | (addr << 8) | ifc_no;
 
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] ccid_open_usb_reader: idx=%d bus=%d addr=%d"
+            " ifc=%d\n", idx, bus, addr, ifc_no);
+#endif
+
   rc = libusb_open (dev, &idev);
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] ccid_open_usb_reader: libusb_open rc=%d\n", rc);
+#endif
   if (rc)
     {
       DEBUGOUT_1 ("usb_open failed: %s\n", libusb_error_name (rc));
@@ -1708,6 +1756,7 @@ ccid_open_usb_reader (const char *spec_reader_name,
       return map_libusb_error (rc);
     }
 
+#ifndef __EMSCRIPTEN__
   if (ccid_usb_thread_is_alive++ == 0)
     {
       npth_t thread;
@@ -1736,6 +1785,7 @@ ccid_open_usb_reader (const char *spec_reader_name,
 
       npth_attr_destroy (&tattr);
     }
+#endif
 
   rc = libusb_get_device_descriptor (dev, &desc);
   if (rc)
@@ -1789,6 +1839,14 @@ ccid_open_usb_reader (const char *spec_reader_name,
         }
     }
   rc = libusb_claim_interface (idev, ifc_no);
+#ifdef __EMSCRIPTEN__
+  {
+    my_npth_protect ();
+    log_info ("[wasm-trace] ccid_open_usb_reader: libusb_claim_interface"
+              " rc=%d ifc=%d\n", rc, ifc_no);
+    my_npth_unprotect ();
+  }
+#endif
   if (rc)
     {
       my_npth_protect ();
@@ -1816,9 +1874,15 @@ ccid_open_usb_reader (const char *spec_reader_name,
   rc = ccid_vendor_specific_init (*handle);
 
  leave:
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] ccid_open_usb_reader: leave rc=%d handle=%p\n",
+            rc, (void *)(*handle));
+#endif
   if (rc)
     {
+#ifndef __EMSCRIPTEN__
       --ccid_usb_thread_is_alive;
+#endif
       free (rid);
       libusb_release_interface (idev, ifc_no);
       libusb_close (idev);
@@ -1958,7 +2022,9 @@ do_close_reader (ccid_driver_t handle)
 
   DEBUGOUT ("libusb_release_interface and libusb_close\n");
   libusb_release_interface (handle->idev, handle->ifc_no);
+#ifndef __EMSCRIPTEN__
   --ccid_usb_thread_is_alive;
+#endif
   libusb_close (handle->idev);
   handle->idev = NULL;
 }
@@ -2022,6 +2088,13 @@ bulk_out (ccid_driver_t handle, unsigned char *msg, size_t msglen,
   int rc;
   int transferred;
 
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] bulk_out: ep=0x%02x len=%u type=0x%02x\n",
+            handle ? handle->ep_bulk_out : -1,
+            (unsigned int)msglen,
+            msglen ? msg[0] : 0);
+#endif
+
   /* No need to continue and clutter the log with USB write error
      messages after we got the first ENODEV.  */
   if (handle->enodev_seen)
@@ -2084,6 +2157,9 @@ bulk_out (ccid_driver_t handle, unsigned char *msg, size_t msglen,
                              msg, msglen, &transferred,
                              5000 /* ms timeout */);
   my_npth_protect ();
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] bulk_out: rc=%d transferred=%d\n", rc, transferred);
+#endif
   if (rc == 0 && transferred == msglen)
     return 0;
 
@@ -2123,10 +2199,23 @@ bulk_in (ccid_driver_t handle, unsigned char *buffer, size_t length,
   memset (buffer, 0, length);
  retry:
 
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] bulk_in: ep=0x%02x len=%u expect=0x%02x seq=%d timeout=%d bwi=%d\n",
+            handle ? handle->ep_bulk_in : -1,
+            (unsigned int)length,
+            expected_type,
+            seqno,
+            timeout,
+            bwi);
+#endif
+
   my_npth_unprotect ();
   rc = libusb_bulk_transfer (handle->idev, handle->ep_bulk_in,
                              buffer, length, &msglen, bwi*timeout);
   my_npth_protect ();
+#ifdef __EMSCRIPTEN__
+  log_info ("[wasm-trace] bulk_in: rc=%d msglen=%d\n", rc, msglen);
+#endif
   if (rc)
     {
       DEBUGOUT_1 ("usb_bulk_read error: %s\n", libusb_error_name (rc));

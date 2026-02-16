@@ -34,6 +34,11 @@
 #include <fcntl.h>
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include <stdio.h>
+#include <string.h>
+#endif
+
 #include "assuan-defs.h"
 #include "debug.h"
 
@@ -251,7 +256,7 @@ _assuan_read (assuan_context_t ctx, assuan_fd_t fd, void *buffer, size_t size)
 }
 
 
-
+
 ssize_t
 _assuan_write (assuan_context_t ctx, assuan_fd_t fd, const void *buffer,
 	       size_t size)

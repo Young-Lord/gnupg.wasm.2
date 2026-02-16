@@ -868,29 +868,18 @@ process_request (assuan_context_t ctx)
   if (ctx->flags.in_inquire)
     return _assuan_error (ctx, GPG_ERR_ASS_NESTED_COMMANDS);
 
-  fprintf(stderr, "[wasm-trace] process_request: reading line (eof=%d, attic=%d)\n",
-          ctx->inbound.eof, ctx->inbound.attic.linelen);
   do
     {
       rc = _assuan_read_line (ctx);
     }
   while (_assuan_error_is_eagain (ctx, rc));
-  fprintf(stderr, "[wasm-trace] process_request: read_line rc=%d (0x%x) eof=%d complete=%d line='%.40s' linelen=%d\n",
-          (int)rc, (unsigned int)rc, ctx->inbound.eof,
-          ctx->flags.process_complete,
-          ctx->inbound.linelen ? ctx->inbound.line : "(empty)",
-          ctx->inbound.linelen);
   if (gpg_err_code (rc) == GPG_ERR_EOF)
     {
       ctx->flags.process_complete = 1;
-      fprintf(stderr, "[wasm-trace] process_request: EOF -> process_complete\n");
       return 0;
     }
   if (rc)
-    {
-      fprintf(stderr, "[wasm-trace] process_request: error rc=%d\n", (int)rc);
-      return rc;
-    }
+    return rc;
   if (*ctx->inbound.line == '#' || !ctx->inbound.linelen)
     return 0; /* comment line - ignore */
 
@@ -900,8 +889,6 @@ process_request (assuan_context_t ctx)
   /* dispatch command and return reply */
   rc = dispatch_command (ctx, ctx->inbound.line, ctx->inbound.linelen);
 
-  fprintf(stderr, "[wasm-trace] process_request: dispatch rc=%d (0x%x)\n",
-          (int)rc, (unsigned int)rc);
   return assuan_process_done (ctx, rc);
 }
 
@@ -926,11 +913,8 @@ assuan_process (assuan_context_t ctx)
   do {
     iter++;
     rc = process_request (ctx);
-    fprintf(stderr, "[wasm-trace] assuan_process: iter=%d rc=%d complete=%d\n",
-            iter, (int)rc, ctx->flags.process_complete);
   } while (!rc && !ctx->flags.process_complete);
 
-  fprintf(stderr, "[wasm-trace] assuan_process: done iter=%d rc=%d\n", iter, (int)rc);
   return rc;
 }
 

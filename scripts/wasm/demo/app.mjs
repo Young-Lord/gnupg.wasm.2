@@ -1306,7 +1306,7 @@ async function handleCardStatus() {
   if (!ensureUsbDeviceSelectedForCardOps()) {
     return;
   }
-  await runGpg(['--card-status']);
+  await runGpg(['--card-status'], {}, { debug: true, runTimeoutMs: 60000 });
 }
 
 async function handleEditCard() {

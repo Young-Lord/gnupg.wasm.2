@@ -2012,6 +2012,16 @@ async function handleRun(message) {
                 bridgeReadCalls += 1;
                 let count = 0;
                 const firstBytes = [];
+
+                if (debugEnabled) {
+                  postDebug('run.agent.rx.enter', {
+                    call: bridgeReadCalls,
+                    length,
+                    hasData: agentBridge.hasReadableData(),
+                    isClosed: agentBridge.isReadableClosed(),
+                  });
+                }
+
                 while (count < length) {
                   // Block on first byte (Atomics.wait), non-blocking for rest.
                   // This mirrors the agent-side hybrid blocking stdin pattern
@@ -2026,6 +2036,13 @@ async function handleRun(message) {
                     break;
                   }
                   if (byteValue === null) {
+                    if (debugEnabled) {
+                      postDebug('run.agent.rx.null', {
+                        call: bridgeReadCalls,
+                        count,
+                        shouldBlock,
+                      });
+                    }
                     break;
                   }
                   buffer[offset + count] = byteValue;
@@ -2043,19 +2060,17 @@ async function handleRun(message) {
                 // No EAGAIN needed — first byte blocks until data or close.
                 if (debugEnabled && count > 0) {
                   const ascii = String.fromCharCode(...firstBytes.map((v) => (v >= 32 && v <= 126 ? v : 46)));
-                  if (bridgeReadLoggedCalls < 16) {
-                    bridgeReadLoggedCalls += 1;
-                    postDebug('run.agent.rx', {
-                      call: bridgeReadCalls,
-                      bytes: count,
-                      ascii,
-                    });
-                  }
+                  postDebug('run.agent.rx', {
+                    call: bridgeReadCalls,
+                    bytes: count,
+                    ascii,
+                  });
                   const now = Date.now();
                   if (now - bridgeLastReadLogAt > 1500) {
                     bridgeLastReadLogAt = now;
                     emitStderrAndStatus(`[agent-bridge] read bytes=${count} calls=${bridgeReadCalls} ascii=${ascii}`);
                   }
+                  bridgeReadLoggedCalls += 1;
                 }
                 return count;
               },
@@ -2071,8 +2086,7 @@ async function handleRun(message) {
                   agentBridge.writeByte(byteValue);
                   count += 1;
                 }
-                if (debugEnabled && bridgeWriteLoggedCalls < 12) {
-                  bridgeWriteLoggedCalls += 1;
+                if (debugEnabled) {
                   const hasLf = firstBytes.includes(10);
                   const ascii = String.fromCharCode(...firstBytes.map((v) => (v >= 32 && v <= 126 ? v : 46)));
                   postDebug('run.agent.tx', {
@@ -2081,6 +2095,7 @@ async function handleRun(message) {
                     hasLf,
                     ascii,
                   });
+                  bridgeWriteLoggedCalls += 1;
                 }
                 if (debugEnabled) {
                   const now = Date.now();

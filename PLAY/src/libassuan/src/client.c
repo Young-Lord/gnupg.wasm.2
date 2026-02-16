@@ -24,6 +24,10 @@
 #endif
 
 #include <stdlib.h>
+#ifdef __EMSCRIPTEN__
+#include <stdio.h>
+#include <string.h>
+#endif
 
 #include "assuan-defs.h"
 #include "debug.h"

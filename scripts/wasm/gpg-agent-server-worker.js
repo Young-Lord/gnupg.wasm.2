@@ -25,12 +25,40 @@ const SUPPRESSED_DEBUG_STEPS = new Set([
   'bridge.stdin.call',
   'bridge.stdin.byte',
   'bridge.stdin',
+  'bridge.stdin.blocking',
+  'bridge.stdin.empty',
   'bridge.stdout.byte',
   'bridge.stdout',
+  'ipc.rx',
+  'ipc.tx',
+  'scd.tx',
+  'scd.rx',
+  'scd.rx.chunk',
+  'scd.tx.chunk',
+  'scd.wait',
+  'scd.read.enter',
+  'scd.read.firstByte',
+  'watch',
+  'prerun.env',
+  'prerun.fs-init',
+  'prerun.scdaemon-fd',
+  'runtime-initialized',
+  'callMain.enter',
+  'quick-random',
+  'import-launcher.start',
+  'import-launcher.done',
+  'start',
+  'scdaemon.ready',
+  'scdaemon.heartbeat',
+  'scdaemon.quit_.notfound',
+  'scdaemon.import.start',
+  'scdaemon.import.done',
+  'scdaemon.stderr.line',
+  'stderr.line',
 ]);
 
 let workerUrlPolicy = undefined;
-const DEBUG_BUILD_TAG = '2026-02-13-log-v2';
+const DEBUG_BUILD_TAG = '2026-02-15-log-v8';
 
 function getWorkerUrlPolicy() {
   if (workerUrlPolicy !== undefined) {
@@ -535,7 +563,19 @@ function writeStderrByte(ch) {
     try {
       const line = new TextDecoder().decode(new Uint8Array(stderrLineBuffer)).trimEnd();
       if (line) {
-        postDebug('stderr.line', { line });
+        // Filter noisy per-byte wasm-trace lines from agent's own stderr
+        const isNoise = line.includes('[wasm-trace]') && (
+          line.includes('_assuan_read:') ||
+          line.includes('_assuan_write:') ||
+          line.includes('writen:') ||
+          line.includes('readline: calling readfnc') ||
+          line.includes('readline: readfnc returned') ||
+          line.includes('readline: enter') ||
+          line.includes('readline: done')
+        );
+        if (!isNoise) {
+          postDebug('stderr.line', { line });
+        }
       }
     } catch {
       /* Ignore stderr decoding issues in debug path. */
@@ -696,6 +736,9 @@ async function handleStart(message) {
     const scd = scdaemonBridge && typeof scdaemonBridge.getStats === 'function'
       ? scdaemonBridge.getStats()
       : null;
+    const diag = scdaemonBridge && typeof scdaemonBridge.getDiag === 'function'
+      ? scdaemonBridge.getDiag()
+      : null;
     const envObj = self.ENV || (self.Module && self.Module.ENV);
     postDebug('watch', {
       g2a: gpgToAgent.used,
@@ -708,6 +751,7 @@ async function handleStart(message) {
       scdaemonFdEnv: envObj && envObj.GNUPG_WASM_SCDAEMON_FD
         ? String(envObj.GNUPG_WASM_SCDAEMON_FD)
         : '',
+      diag: diag || null,
     });
   }, 2000);
 
@@ -741,6 +785,13 @@ async function handleStart(message) {
     const scdaemonToAgentDesc = createSharedQueueDescriptor();
     const agentToScdaemon = createSharedQueue(agentToScdaemonDesc);
     const scdaemonToAgent = createSharedQueue(scdaemonToAgentDesc);
+    /* Shared diagnostic buffer (Int32Array, 16 slots):
+     *  [0] agent device read calls   [1] agent device read bytes
+     *  [2] agent device write calls   [3] agent device write bytes
+     *  [4] scd stdin read calls       [5] scd stdin read bytes
+     *  [6] scd stdout write calls     [7] scd stdout write bytes
+     *  [8..15] reserved */
+    const diagBuf = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 16));
     const readableHandlers = [];
     let readableWatcherId = null;
     let lastReadableState = false;
@@ -831,11 +882,22 @@ async function handleStart(message) {
         agentToScdaemon: agentToScdaemonDesc,
         scdaemonToAgent: scdaemonToAgentDesc,
       },
+      diagBuf: diagBuf.buffer,
     });
 
     return {
       readByte(shouldBlock = true) {
-        return queuePopByte(scdaemonToAgent, shouldBlock);
+        const value = queuePopByte(scdaemonToAgent, shouldBlock);
+        if (value === null && shouldBlock) {
+          // The scdaemonToAgent queue is closed — scdaemon exited.
+          // Log the daemon's exit state for diagnostics.
+          postDebug('scd.bridge.readByte.eof', {
+            daemonDone,
+            a2s: summarizeQueue(agentToScdaemon),
+            s2a: summarizeQueue(scdaemonToAgent),
+          });
+        }
+        return value;
       },
       readAvailableByte() {
         return queuePopByte(scdaemonToAgent, false);
@@ -866,6 +928,24 @@ async function handleStart(message) {
           daemonDone,
         };
       },
+      summarizeReadQueue() {
+        return summarizeQueue(scdaemonToAgent);
+      },
+      getDiag() {
+        return {
+          agentDevReadCalls: Atomics.load(diagBuf, 0),
+          agentDevReadBytes: Atomics.load(diagBuf, 1),
+          agentDevWriteCalls: Atomics.load(diagBuf, 2),
+          agentDevWriteBytes: Atomics.load(diagBuf, 3),
+          scdStdinCalls: Atomics.load(diagBuf, 4),
+          scdStdinBytes: Atomics.load(diagBuf, 5),
+          scdStdoutCalls: Atomics.load(diagBuf, 6),
+          scdStdoutBytes: Atomics.load(diagBuf, 7),
+          a2s: summarizeQueue(agentToScdaemon),
+          s2a: summarizeQueue(scdaemonToAgent),
+        };
+      },
+      diagBuf,
       async awaitReady(timeoutMs) {
         let timeoutId = null;
         const timeoutPromise = new Promise((resolve) => {
@@ -1133,6 +1213,7 @@ async function handleStart(message) {
             FS.registerDevice(dev, {
               read(stream, buffer, offset, length) {
                 scdaemonReadCalls += 1;
+                Atomics.add(scdaemonBridge.diagBuf, 0, 1);
                 let count = 0;
                 const firstBytes = [];
 
@@ -1140,16 +1221,35 @@ async function handleStart(message) {
                   return 0;
                 }
 
+                postDebug('scd.read.enter', {
+                  calls: scdaemonReadCalls,
+                  length,
+                  readBytes: scdaemonReadBytes,
+                  writeBytes: scdaemonWriteBytes,
+                  queue: scdaemonBridge.summarizeReadQueue(),
+                  hasData: scdaemonBridge.hasReadableData(),
+                  isClosed: scdaemonBridge.isReadableClosed(),
+                });
+
                 const waitStartedAt = Date.now();
                 const firstByte = scdaemonBridge.readByte(true);
                 const waitMs = Date.now() - waitStartedAt;
+
+                postDebug('scd.read.firstByte', {
+                  calls: scdaemonReadCalls,
+                  waitMs,
+                  firstByte: firstByte !== null ? (Number(firstByte) & 0xff) : null,
+                  isNull: firstByte === null,
+                  queue: scdaemonBridge.summarizeReadQueue(),
+                });
+
                 if (waitMs >= 400) {
                   postDebug('scd.wait', {
                     ms: waitMs,
                     calls: scdaemonReadCalls,
                     readBytes: scdaemonReadBytes,
                     writeBytes: scdaemonWriteBytes,
-                    queue: summarizeQueue(scdaemonToAgent),
+                    queue: scdaemonBridge.summarizeReadQueue(),
                   });
                 }
                 if (firstByte === null) {
@@ -1182,26 +1282,22 @@ async function handleStart(message) {
 
                 if (count > 0) {
                   scdaemonReadBytes += count;
-                  const now = Date.now();
-                  if (scdaemonReadCalls <= 24 || (now - scdaemonLastReadLogAt > 1200)) {
-                    scdaemonLastReadLogAt = now;
-                    const ascii = String.fromCharCode(...firstBytes.map((v) => (v >= 32 && v <= 126 ? v : 46)));
-                    const payload = {
-                      calls: scdaemonReadCalls,
-                      count,
-                      totalBytes: scdaemonReadBytes,
-                    };
-                    if (scdaemonReadLoggedCalls < 12) {
-                      scdaemonReadLoggedCalls += 1;
-                      payload.ascii = ascii;
-                    }
-                    postDebug('scd.rx.chunk', payload);
-                  }
+                  Atomics.add(scdaemonBridge.diagBuf, 1, count);
+                  const ascii = String.fromCharCode(...firstBytes.map((v) => (v >= 32 && v <= 126 ? v : 46)));
+                  postDebug('scd.rx.chunk', {
+                    calls: scdaemonReadCalls,
+                    count,
+                    totalBytes: scdaemonReadBytes,
+                    ascii,
+                  });
+                  scdaemonLastReadLogAt = Date.now();
+                  scdaemonReadLoggedCalls += 1;
                 }
                 return count;
               },
               write(stream, buffer, offset, length) {
                 scdaemonWriteCalls += 1;
+                Atomics.add(scdaemonBridge.diagBuf, 2, 1);
                 let count = 0;
                 const firstBytes = [];
                 while (count < length) {
@@ -1214,24 +1310,21 @@ async function handleStart(message) {
                   count += 1;
                 }
                 scdaemonWriteBytes += count;
-                if (scdaemonWriteLoggedCalls < 12) {
-                  scdaemonWriteLoggedCalls += 1;
-                  const ascii = String.fromCharCode(...firstBytes.map((v) => (v >= 32 && v <= 126 ? v : 46)));
-                  postDebug('scd.tx.chunk', {
-                    calls: scdaemonWriteCalls,
-                    count,
-                    totalBytes: scdaemonWriteBytes,
-                    ascii,
-                  });
-                }
-                const now = Date.now();
-                if (now - scdaemonLastWriteLogAt > 1200) {
-                  scdaemonLastWriteLogAt = now;
-                  postDebug('scd.tx.total', {
-                    calls: scdaemonWriteCalls,
-                    totalBytes: scdaemonWriteBytes,
-                  });
-                }
+                Atomics.add(scdaemonBridge.diagBuf, 3, count);
+                const ascii = String.fromCharCode(...firstBytes.map((v) => (v >= 32 && v <= 126 ? v : 46)));
+                postDebug('scd.tx.chunk', {
+                  calls: scdaemonWriteCalls,
+                  count,
+                  totalBytes: scdaemonWriteBytes,
+                  ascii,
+                  a2sQueue: {
+                    head: Atomics.load(scdaemonBridge.diagBuf, 0),
+                    agentDevReadCalls: Atomics.load(scdaemonBridge.diagBuf, 0),
+                    agentDevWriteCalls: Atomics.load(scdaemonBridge.diagBuf, 2),
+                  },
+                });
+                scdaemonLastWriteLogAt = Date.now();
+                scdaemonWriteLoggedCalls += 1;
                 return count;
               },
               poll(stream, timeout, notifyCallback) {

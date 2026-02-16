@@ -64,6 +64,25 @@
 
 #define IS_LOCKED(c) (locked_session && locked_session != (c)->server_local)
 
+#ifdef __EMSCRIPTEN__
+static int
+wasm_trace_enabled_scd (void)
+{
+  static int initialized;
+  static int enabled;
+  const char *s;
+
+  if (!initialized)
+    {
+      s = getenv ("GNUPG_WASM_TRACE");
+      enabled = (s && *s && strcmp (s, "0"));
+      initialized = 1;
+    }
+
+  return enabled;
+}
+#endif
+
 
 /* Data used to associate an Assuan context with local server data.
    This object describes the local properties of one session.  */
@@ -335,6 +354,11 @@ cmd_serialno (assuan_context_t ctx, char *line)
   card_t card = NULL;
   int thisslot;
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_scd ())
+    log_info ("[wasm-trace] scd cmd_serialno: enter opt_all=%d\n", opt_all);
+#endif
+
   if ( IS_LOCKED (ctrl) )
     return gpg_error (GPG_ERR_LOCKED);
 
@@ -356,6 +380,11 @@ cmd_serialno (assuan_context_t ctx, char *line)
   /* Clear the remove flag so that the open_card is able to reread it.  */
   ctrl->server_local->card_removed = 0;
   err = open_card_with_request (&card, ctrl, *line? line:NULL, demand, opt_all);
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_scd ())
+    log_info ("[wasm-trace] scd cmd_serialno: open_card_with_request err=%d"
+              " card=%p\n", err, (void *)card);
+#endif
   /* Now clear or set the card_removed flag for all sessions using the
    * current slot.  In the error case make sure that the flag is set
    * for the current session. */
@@ -557,6 +586,12 @@ cmd_learn (assuan_context_t ctx, char *line)
   card_t card;
   const char *keygrip = NULL;
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_scd ())
+    log_info ("[wasm-trace] scd cmd_learn: enter force=%d keypairinfo=%d\n",
+              opt_force, only_keypairinfo);
+#endif
+
   opt_demand = has_option_name (line, "--demand");
   if (opt_demand)
     {
@@ -574,7 +609,13 @@ cmd_learn (assuan_context_t ctx, char *line)
     keygrip = line;
 
   if ((rc = open_card (ctrl)))
-    return rc;
+    {
+#ifdef __EMSCRIPTEN__
+      if (wasm_trace_enabled_scd ())
+        log_info ("[wasm-trace] scd cmd_learn: open_card failed rc=%d\n", rc);
+#endif
+      return rc;
+    }
 
   if (opt_demand)
     {
@@ -585,7 +626,18 @@ cmd_learn (assuan_context_t ctx, char *line)
 
   card = card_get (ctrl, keygrip);
   if (!card)
-    return gpg_error (GPG_ERR_CARD_NOT_PRESENT);
+    {
+#ifdef __EMSCRIPTEN__
+      if (wasm_trace_enabled_scd ())
+        log_info ("[wasm-trace] scd cmd_learn: card_get returned NULL\n");
+#endif
+      return gpg_error (GPG_ERR_CARD_NOT_PRESENT);
+    }
+
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_scd ())
+    log_info ("[wasm-trace] scd cmd_learn: card_get ok slot=%d\n", card->slot);
+#endif
 
   /* Unless the force option is used we try a shortcut by identifying
      the card using a serial number and inquiring the client with
@@ -659,6 +711,11 @@ cmd_learn (assuan_context_t ctx, char *line)
 
   if (!rc)
     rc = app_write_learn_status (card, ctrl, flags);
+
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_scd ())
+    log_info ("[wasm-trace] scd cmd_learn: app_write_learn_status rc=%d\n", rc);
+#endif
 
   card_put (card);
   return rc;

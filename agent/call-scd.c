@@ -288,7 +288,17 @@ agent_card_learn (ctrl_t ctrl,
   struct learn_parm_s parm;
   char line[ASSUAN_LINELENGTH];
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_local ())
+    log_info ("[wasm-trace] agent_card_learn: enter demand_sn=%s\n",
+              demand_sn ? demand_sn : "(null)");
+#endif
+
   rc = start_scd (ctrl);
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_local ())
+    log_info ("[wasm-trace] agent_card_learn: start_scd rc=%d\n", rc);
+#endif
   if (rc)
     return rc;
 
@@ -305,9 +315,18 @@ agent_card_learn (ctrl_t ctrl,
   else
     snprintf (line, sizeof line, "LEARN --force");
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_local ())
+    log_info ("[wasm-trace] agent_card_learn: sending '%s' to scdaemon\n", line);
+#endif
+
   rc = assuan_transact (daemon_ctx (ctrl), line,
                         NULL, NULL, NULL, NULL,
                         learn_status_cb, &parm);
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_local ())
+    log_info ("[wasm-trace] agent_card_learn: assuan_transact rc=%d\n", rc);
+#endif
   if (rc)
     return unlock_scd (ctrl, rc);
 
@@ -1311,6 +1330,16 @@ agent_card_scd (ctrl_t ctrl, const char *cmdline,
   if (rc)
     return rc;
 
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_local ())
+    {
+      assuan_context_t scd_ctx = daemon_ctx (ctrl);
+      log_info ("[wasm-trace] scd-cmd: agent_card_scd sending cmd='%s'"
+                " ctx=%p\n",
+                cmdline, scd_ctx);
+    }
+#endif
+
   inqparm.ctx = daemon_ctx (ctrl);
   inqparm.getpin_cb = getpin_cb;
   inqparm.getpin_cb_arg = getpin_cb_arg;
@@ -1321,6 +1350,11 @@ agent_card_scd (ctrl_t ctrl, const char *cmdline,
 
   saveflag = assuan_get_flag (daemon_ctx (ctrl), ASSUAN_CONVEY_COMMENTS);
   assuan_set_flag (daemon_ctx (ctrl), ASSUAN_CONVEY_COMMENTS, 1);
+#ifdef __EMSCRIPTEN__
+  if (wasm_trace_enabled_local ())
+    log_info ("[wasm-trace] scd-cmd: calling assuan_transact cmd='%s'\n",
+              cmdline);
+#endif
   rc = assuan_transact (daemon_ctx (ctrl), cmdline,
                         pass_data_thru, assuan_context,
                         inq_needpin, &inqparm,
