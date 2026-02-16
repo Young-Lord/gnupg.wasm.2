@@ -209,6 +209,28 @@ function parsePromptHint(prompt) {
   };
 }
 
+const KEYWORD_PROMPT_MAP = {
+  'cardedit.prompt': 'gpg/card> ',
+  'keyedit.prompt': 'gpg> ',
+  'keygen.algo': 'Your selection? ',
+  'keygen.size': 'What keysize do you want? ',
+  'keygen.valid': 'Key is valid for? ',
+  'keygen.name': 'Real name: ',
+  'keygen.email': 'Email address: ',
+  'keygen.comment': 'Comment: ',
+  'edit_ownertrust.value': 'Your decision? ',
+  'edit_ownertrust.set_ultimate.okay': 'Do you really want to set this key to ultimate trust? (y/N) ',
+  'keyedit.save.okay': 'Save changes? (y/N) ',
+  'sign_uid.okay': 'Really sign? (y/N) ',
+  'delkey.okay': 'Do you really want to delete this key? (y/N) ',
+  'delete_key.okay': 'Delete this key from the keyring? (y/N) ',
+  'delete_key.secret.okay': 'Delete this secret key? (y/N) ',
+};
+
+function keywordToPrompt(keyword) {
+  return KEYWORD_PROMPT_MAP[keyword] || '';
+}
+
 function safeInvoke(handler, payload) {
   if (typeof handler !== 'function') {
     return;
@@ -1071,7 +1093,9 @@ export class WasmGpgBrowserClient {
             };
 
             const promptInfo = parsePromptHint(request.prompt);
+            const displayPrompt = keywordToPrompt(promptInfo.keyword);
             if (promptInfo.statusKeyword === 'GET_HIDDEN' && typeof onPinentry === 'function') {
+              if (displayPrompt) safeInvoke(onStdout, displayPrompt);
               handlePinentryViaStdinRequest(request, promptInfo);
               return;
             }
@@ -1091,6 +1115,8 @@ export class WasmGpgBrowserClient {
               return;
             }
 
+            if (displayPrompt) safeInvoke(onStdout, displayPrompt);
+
             Promise.resolve(callbacks.onInputRequest(request))
               .then((reply) => {
                 const normalized = normalizeStdinReply(reply);
@@ -1099,6 +1125,12 @@ export class WasmGpgBrowserClient {
                   return;
                 }
                 if (normalized.text) {
+                  const echo = normalized.text.endsWith('\n')
+                    ? normalized.text.slice(0, -1)
+                    : normalized.text;
+                  if (echo && promptInfo.statusKeyword !== 'GET_HIDDEN') {
+                    safeInvoke(onStdout, echo);
+                  }
                   queuePushText(stdinQueue, normalized.text);
                 }
               })

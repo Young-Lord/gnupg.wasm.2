@@ -59,10 +59,10 @@ const el = {
   btnClearConsole: document.querySelector('#btnClearConsole'),
 
   pinentryDialog: document.querySelector('#pinentryDialog'),
+  pinentryForm: document.querySelector('#pinentryForm'),
   pinentryMeta: document.querySelector('#pinentryMeta'),
   pinentryInput: document.querySelector('#pinentryInput'),
   pinentryCancel: document.querySelector('#pinentryCancel'),
-  pinentrySubmit: document.querySelector('#pinentrySubmit'),
 
   stdinDialog: document.querySelector('#stdinDialog'),
   stdinMeta: document.querySelector('#stdinMeta'),
@@ -749,9 +749,6 @@ function promptStdinText(request) {
 
     stdinResolver = resolve;
     const details = [];
-    if (request && typeof request.id === 'string' && request.id) {
-      details.push(`id=${request.id}`);
-    }
     if (request && typeof request.prompt === 'string' && request.prompt) {
       details.push(request.prompt);
     }
@@ -761,11 +758,9 @@ function promptStdinText(request) {
     el.stdinMeta.textContent = details.join(' | ');
     el.stdinInput.value = '';
 
-    if (!el.stdinDialog.open) {
-      el.stdinDialog.showModal();
-    }
+    el.stdinDialog.hidden = false;
 
-    appendConsole('note', '[stdin] waiting for manual input in dialog');
+    appendConsole('note', '[stdin] waiting for manual input');
     el.stdinInput.focus();
     el.stdinInput.select();
   });
@@ -773,9 +768,7 @@ function promptStdinText(request) {
 
 function settleStdin(ok) {
   if (!stdinResolver) {
-    if (el.stdinDialog.open) {
-      el.stdinDialog.close();
-    }
+    el.stdinDialog.hidden = true;
     return;
   }
 
@@ -784,9 +777,7 @@ function settleStdin(ok) {
 
   if (!ok) {
     appendConsole('note', '[stdin] user sent EOF');
-    if (el.stdinDialog.open) {
-      el.stdinDialog.close();
-    }
+    el.stdinDialog.hidden = true;
     resolve({ eof: true });
     return;
   }
@@ -794,9 +785,7 @@ function settleStdin(ok) {
   const raw = el.stdinInput.value;
   const line = raw.endsWith('\n') ? raw : `${raw}\n`;
   appendConsole('note', `[stdin] user input submitted (${line.length} chars)`);
-  if (el.stdinDialog.open) {
-    el.stdinDialog.close();
-  }
+  el.stdinDialog.hidden = true;
   resolve(line);
 }
 
@@ -1479,7 +1468,8 @@ function bindEvents() {
     });
   }
 
-  el.pinentrySubmit.addEventListener('click', () => {
+  el.pinentryForm.addEventListener('submit', (event) => {
+    event.preventDefault();
     settlePinentry(true);
   });
 
@@ -1505,11 +1495,6 @@ function bindEvents() {
       event.preventDefault();
       settleStdin(true);
     }
-  });
-
-  el.stdinDialog.addEventListener('cancel', (event) => {
-    event.preventDefault();
-    settleStdin(false);
   });
 }
 

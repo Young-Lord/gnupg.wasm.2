@@ -343,6 +343,64 @@ button:disabled {
   color: #b6d6e0;
 }
 
+.stdin-panel {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: 900;
+  width: min(340px, 90vw);
+  border: 1px solid rgba(14, 110, 128, 0.35);
+  border-radius: 10px;
+  padding: 0.75rem 1rem;
+  background: #fffef9;
+  box-shadow: 0 4px 20px -6px rgba(5, 25, 34, 0.35);
+  display: grid;
+  gap: 0.5rem;
+}
+
+.stdin-panel[hidden] {
+  display: none;
+}
+
+.stdin-panel h3 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.stdin-panel p {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #556;
+  word-break: break-all;
+}
+
+.stdin-panel label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.82rem;
+}
+
+.stdin-panel input {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #bcc;
+  border-radius: 5px;
+  font-family: inherit;
+  font-size: 0.85rem;
+}
+
+.stdin-panel .row {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.stdin-panel button {
+  padding: 0.3rem 0.8rem;
+  border-radius: 5px;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
 .pinentry-dialog {
   border: 1px solid rgba(14, 110, 128, 0.24);
   border-radius: 14px;

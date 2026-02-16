@@ -470,7 +470,7 @@ function shouldForceBatchMode(args) {
 }
 
 function shouldUseCommandFd(args, hasStdinQueue) {
-  return hasStdinQueue === true && operationLikelyNeedsPinentry(args);
+  return hasStdinQueue === true;
 }
 
 function emitStderrAndStatus(line) {
