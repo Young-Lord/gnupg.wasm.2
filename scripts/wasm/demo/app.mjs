@@ -922,7 +922,7 @@ function createClient(homedir, persistRoots) {
     gpgAgentWasmUrl,
     homedir,
     persistRoots,
-    persistentAgentRuntime: false,
+    persistentAgentRuntime: true,
   });
 }
 

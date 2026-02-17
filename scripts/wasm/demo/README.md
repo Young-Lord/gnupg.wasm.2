@@ -17,6 +17,64 @@ Interactive browser demo for the wasm gpg build.
 - Experimental browser agent bridge via side Worker (`gpg-agent --server`)
 - Browser keyserver bridge via fetch-backed dirmngr shim Worker
 
+## Agent runtime mode in demo
+
+The demo now uses external/persistent agent runtime mode
+(`persistentAgentRuntime: true`).
+
+- A dedicated `gpg-agent-session-worker` runtime stays alive across commands.
+- Each gpg command still uses a fresh bridge session, but reuses the same
+  agent wasm runtime.
+- This reduces repeated agent cold-start overhead and startup log noise.
+
+Reference behavior difference:
+
+- `persistentAgentRuntime: false` (spawn mode): starts `gpg-agent-server-worker`
+  on every command.
+- `persistentAgentRuntime: true` (external/persistent): reuses one
+  `gpg-agent-session-worker` runtime across commands.
+
+### Startup path details (A vs B)
+
+Path A: spawn mode (`persistentAgentRuntime: false`)
+
+1. UI calls `runGpg(...)`.
+2. Client creates a fresh `gpg-browser-worker` for this command.
+3. `gpg-browser-worker` spawns `gpg-agent-server-worker`.
+4. `gpg-agent-server-worker` boots wasm runtime for this run and serves the
+   agent bridge (`GNUPG_WASM_AGENT_FD`).
+5. Command finishes; browser worker and agent worker are torn down.
+6. Next command repeats full startup from scratch.
+
+Path B: external/persistent mode (`persistentAgentRuntime: true`, demo default)
+
+1. UI calls `runGpg(...)`.
+2. Client keeps one long-lived `gpg-agent-session-worker` runtime.
+3. For each command, client opens a fresh shared-memory bridge session to that
+   runtime.
+4. `gpg-browser-worker` runs gpg and binds to the provided external bridge
+   (no per-command agent runtime boot).
+5. Command finishes; per-command bridge is closed, but session worker stays
+   alive.
+6. Next command reuses the same agent runtime and repeats only the bridge setup.
+
+Trade-offs
+
+- Spawn mode (A):
+  - Pros: strongest per-command isolation, clean state each run.
+  - Cons: repeated startup overhead, repeated startup logs/noise.
+- External/persistent mode (B):
+  - Pros: lower latency for multi-command sessions, less startup noise.
+  - Cons: stateful runtime across commands; when runtime gets into a bad state,
+    you may need a client/session reset.
+
+Scope note
+
+- This A/B difference applies to `gpg-agent` bridge behavior.
+- `gpg` execution itself remains one-shot per command in both modes.
+- `dirmngr` and `scdaemon` bridges are still created per command/session and
+  are not globally persistent yet.
+
 ## Debug and perf modes
 
 - `debug` mode: enables verbose runtime traces (`[debug:...]`) for bridge/runtime troubleshooting.

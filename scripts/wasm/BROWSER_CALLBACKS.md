@@ -42,6 +42,39 @@ COOP/COEP headers (`Cross-Origin-Opener-Policy: same-origin`,
   - each gpg command gets a fresh bridge session while reusing one agent wasm runtime
   - avoids losing in-memory agent runtime cache variables between commands
 
+## Agent startup modes (behavior differences)
+
+There are two execution paths for the agent bridge. Only one is used per run.
+
+- Spawn mode (`persistentAgentRuntime: false`)
+  - `gpg-browser-worker` starts `gpg-agent-server-worker` for each gpg run.
+  - simple lifecycle, but agent startup work repeats every command.
+  - startup logs (for example calibration/info lines) are more likely to repeat.
+
+- External/persistent mode (`persistentAgentRuntime: true`)
+  - `WasmGpgBrowserClient` keeps one `gpg-agent-session-worker` runtime alive.
+  - each gpg run uses a fresh shared-memory bridge session to that runtime.
+  - less repeated startup overhead/noise, and better continuity for agent runtime state.
+
+Behavior details
+
+- Spawn mode flow:
+  1. per `run()`, `gpg-browser-worker` starts `gpg-agent-server-worker`
+  2. agent runtime initializes for that run
+  3. run ends and both workers are torn down
+- External/persistent flow:
+  1. client keeps one `gpg-agent-session-worker` alive
+  2. per `run()`, client opens a fresh bridge session to that worker
+  3. `gpg-browser-worker` binds `sharedAgentBridge` and skips per-run agent spawn
+  4. run ends, bridge closes, session worker remains alive
+
+Operational trade-offs
+
+- Spawn mode: better hard isolation per command, higher startup cost/noise.
+- External/persistent mode: better throughput and UX for repeated commands,
+  but retains runtime state across commands and may require explicit reset after
+  runtime faults.
+
 ## Pinentry callback protocol
 
 - Worker emits `stdin-request` with prompt hint from status lines (for example

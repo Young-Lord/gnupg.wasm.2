@@ -1032,7 +1032,6 @@ async function handleStart(message) {
   const disableScdaemon = !scdaemonBridge;
   const finalArgs = [
     '--server',
-    '--verbose',
     '--homedir', homedir,
   ];
   if (disableScdaemon) {
