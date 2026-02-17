@@ -1,3 +1,12 @@
+For WASM / IWA:
+
+bash scripts/wasm/build-gnupg-browser.sh --force && bash scripts/wasm/build-iwa.sh
+
+Remember to stop pcscd.service before testing smartcard feature.
+
+
+
+
                        The GNU Privacy Guard
                       =======================
                            Version 2.5
