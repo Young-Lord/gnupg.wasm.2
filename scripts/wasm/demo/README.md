@@ -367,11 +367,10 @@ Trusted Types, WebUSB permissions).
    - command output stays in `Console`
    - status events stay in `Status`
 
-5. (Optional) USB/card checks:
+5. USB/card checks:
 
    - Click `Select USB Smartcard Device` and authorize a device.
    - Run `card-status`.
-   - If it hangs, treat this as expected for current known issue below.
 
 Important runtime note:
 
@@ -386,14 +385,6 @@ Important runtime note:
 - `gpg --list-secret-keys` — lists generated keys
 - Symmetric encrypt/decrypt, sign/verify
 - Raw command runner
-
-### Known issues
-
-- **USB/smartcard (`gpg --card-status`)**: scdaemon bridge is integrated but
-  WebUSB device selection currently hangs. The CCID+libusb path needs further
-  work to surface the browser USB permission prompt correctly.
-- IWA windows cannot be opened in regular browser tabs; they require the
-  standalone app window launched by `--install-isolated-web-app-from-file`.
 
 ### Build notes
 
