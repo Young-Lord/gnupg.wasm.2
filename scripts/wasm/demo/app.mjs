@@ -295,20 +295,6 @@ function ensureUsbDeviceSelectedForCardOps() {
   return false;
 }
 
-function isLikelyKeygenArgs(args) {
-  if (!Array.isArray(args)) {
-    return false;
-  }
-  return args.some((arg) => {
-    const text = String(arg);
-    return text === '--quick-generate-key'
-      || text === '--quick-gen-key'
-      || text === '--generate-key'
-      || text === '--gen-key'
-      || text === '--full-generate-key';
-  });
-}
-
 function parentPath(pathValue) {
   const idx = pathValue.lastIndexOf('/');
   if (idx <= 0) {
@@ -982,21 +968,11 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
   try {
     const client = await getClient(homedir, persistRoots);
     perf.mark('client-created');
-    const defaultRunTimeoutMs = isLikelyKeygenArgs(args) ? 600000 : 90000;
-    const runTimeoutMs = Number.isFinite(options.runTimeoutMs)
-      ? Number(options.runTimeoutMs)
-      : defaultRunTimeoutMs;
-
-    if (!Number.isFinite(options.runTimeoutMs) && defaultRunTimeoutMs > 90000) {
-      appendConsole('note', `detected key generation command; using extended timeout ${Math.round(defaultRunTimeoutMs / 1000)}s`);
-    }
-
-    const result = await client.run(args, {
+    const callbacks = {
       fsState,
       persistRoots,
       emitStatus: true,
       debug: options.debug === true,
-      runTimeoutMs,
       usbAuthorizedDevices: getAuthorizedUsbDevicesForRun(),
       onInputRequest: (request) => {
         const preset = readStdinPresetText();
@@ -1025,7 +1001,12 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
         : undefined,
       onPinentry: promptPinentry,
       pinentryRequest,
-    });
+    };
+    if (Number.isFinite(options.runTimeoutMs)) {
+      callbacks.runTimeoutMs = Number(options.runTimeoutMs);
+    }
+
+    const result = await client.run(args, callbacks);
 
     if (result.fsState) {
       fsState = result.fsState;
@@ -1044,7 +1025,7 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
       }
     }
 
-    if (result.callbackCounts && typeof result.callbackCounts === 'object') {
+    if (options.perfEnabled === true && result.callbackCounts && typeof result.callbackCounts === 'object') {
       appendConsole(
         'note',
         `callback counters client stdout/stderr/status=${result.callbackCounts.stdout}/${result.callbackCounts.stderr}/${result.callbackCounts.status}`
@@ -1086,12 +1067,10 @@ async function handleGenerateKey() {
     return;
   }
 
-  appendConsole('note', 'generate-key may take longer in wasm; using extended timeout');
   const uid = `${name} <${email}>`;
   const result = await runGpg(
     ['--quick-generate-key', uid, 'future-default', 'default', expire],
-    { op: 'generate-key', uidHint: uid, keyHint: uid },
-    { runTimeoutMs: 300000 }
+    { op: 'generate-key', uidHint: uid, keyHint: uid }
   );
 
   if (result.exitCode === 0 && !el.exportSelector.value.trim()) {

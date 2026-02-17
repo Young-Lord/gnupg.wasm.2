@@ -17,6 +17,28 @@ Interactive browser demo for the wasm gpg build.
 - Experimental browser agent bridge via side Worker (`gpg-agent --server`)
 - Browser keyserver bridge via fetch-backed dirmngr shim Worker
 
+## Debug and perf modes
+
+- `debug` mode: enables verbose runtime traces (`[debug:...]`) for bridge/runtime troubleshooting.
+- `perf` mode: enables timing/performance summary lines (`[perf:...]`) for a run.
+
+In demo code, these are per-run options passed to `runGpg(args, pinentryRequest, options)`:
+
+```js
+await runGpg(args, {}, {
+  debug: true,
+  perfEnabled: true,
+  perfLabel: 'my-run',
+  perfInputPath: '/work/input.txt',
+  perfOutputPath: '/work/output.asc',
+});
+```
+
+Notes:
+
+- `perfEnabled: true` is currently used by the demo symmetric-encrypt flow.
+- `callback counters client stdout/stderr/status=...` is shown only when `perfEnabled` is true.
+
 Notes for keyserver in browser:
 
 - Browser demo routes keyserver commands through `scripts/wasm/gpg-dirmngr-fetch-worker.js`
@@ -143,4 +165,3 @@ bash scripts/wasm/run-iwa.sh --build
 
 - IWA bundle output: `PLAY/iwa/gnupg-wasm-demo.swbn`
 - Bundle ID: derived from the Ed25519 key in `PLAY/iwa-keys/private-key.pem`
-

@@ -1281,17 +1281,22 @@ async function handleRunSession(message) {
   postMessage({ type: 'session-ready', sessionId });
 
   const useQuickRandom = message.quickRandom !== false;
+  const disableScdaemon = !activeScdaemonBridge;
   const finalArgs = [
     '--server',
     '--verbose',
     '--homedir', homedir,
   ];
+  if (disableScdaemon) {
+    finalArgs.push('--disable-scdaemon');
+  }
   if (useQuickRandom) {
     finalArgs.push('--debug-quick-random');
   }
   postDebug('session.quick-random', {
     sessionId,
     enabled: useQuickRandom,
+    disableScdaemon,
   });
 
   try {

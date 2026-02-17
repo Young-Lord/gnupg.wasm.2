@@ -14,6 +14,7 @@ function toUrlString(value, baseUrl) {
 }
 
 let workerUrlPolicy = undefined;
+const DEFAULT_RUN_TIMEOUT_MS = 90000;
 
 function getWorkerUrlPolicy() {
   if (workerUrlPolicy !== undefined) {
@@ -766,12 +767,14 @@ export class WasmGpgBrowserClient {
         if (!stdinQueueDesc) {
           return;
         }
-        safeInvoke(onDebug, {
-          step: 'client.stdin.close',
-          data: {
-            reason: String(reason || 'unspecified'),
-          },
-        });
+        if (reason && reason !== 'finishResolve') {
+          safeInvoke(onDebug, {
+            step: 'client.stdin.close',
+            data: {
+              reason: String(reason || 'unspecified'),
+            },
+          });
+        }
         queueCloseDescriptor(stdinQueueDesc);
       };
       if (stdinQueue && stdinText) {
@@ -783,7 +786,7 @@ export class WasmGpgBrowserClient {
         : this.emitStatusByDefault;
       const runTimeoutMs = Number.isFinite(callbacks.runTimeoutMs)
         ? Number(callbacks.runTimeoutMs)
-        : 30000;
+        : DEFAULT_RUN_TIMEOUT_MS;
       const debugEnabled = callbacks.debug === true;
 
       const fsState = callbacks.fsState && typeof callbacks.fsState === 'object'
@@ -1261,9 +1264,7 @@ export class WasmGpgBrowserClient {
             debug: debugEnabled,
             enableAgentBridge,
             sharedAgentBridge: persistentAgentSession ? persistentAgentSession.bridge : null,
-            runTimeoutMs: Number.isFinite(callbacks.runTimeoutMs)
-              ? Number(callbacks.runTimeoutMs)
-              : undefined,
+            runTimeoutMs,
             pinentry: typeof onPinentry === 'function'
               ? {
                   enabled: true,

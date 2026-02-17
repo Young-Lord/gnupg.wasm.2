@@ -1,6 +1,19 @@
 For WASM / IWA:
 
+Path: scripts/wasm/
+
+```shell
 bash scripts/wasm/build-gnupg-browser.sh --force && bash scripts/wasm/build-iwa.sh
+pkill -f "chromium.*chromium-iwa-test" || true
+rm -rf /tmp/chromium-iwa-test
+chromium \
+  --user-data-dir=/tmp/chromium-iwa-test \
+  --no-first-run \
+  --enable-features=IsolatedWebApps,IsolatedWebAppDevMode \
+  --install-isolated-web-app-from-file=/gnupg-w32/gnupg/PLAY/iwa/gnupg-wasm-demo.swbn
+```
+
+Go to `isolated-app://r2m3p4dvre3uofxuq3qdhj3mhv5rb5nmtandzekfbdajgviaorjaaaic/scripts/wasm/demo/demo.html`
 
 Remember to stop pcscd.service before testing smartcard feature.
 

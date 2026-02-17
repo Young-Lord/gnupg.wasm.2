@@ -27,6 +27,7 @@ const SUPPRESSED_DEBUG_STEPS = new Set([
   'bridge.stdin',
   'bridge.stdin.blocking',
   'bridge.stdin.empty',
+  'bridge.stdin.queue-closed-eof',
   'bridge.stdout.byte',
   'bridge.stdout',
   'ipc.rx',
@@ -44,6 +45,7 @@ const SUPPRESSED_DEBUG_STEPS = new Set([
   'prerun.scdaemon-fd',
   'runtime-initialized',
   'callMain.enter',
+  'callMain.exit',
   'quick-random',
   'import-launcher.start',
   'import-launcher.done',
@@ -1033,16 +1035,21 @@ async function handleStart(message) {
   }
 
   const useQuickRandom = message.quickRandom !== false;
+  const disableScdaemon = !scdaemonBridge;
   const finalArgs = [
     '--server',
     '--verbose',
     '--homedir', homedir,
   ];
+  if (disableScdaemon) {
+    finalArgs.push('--disable-scdaemon');
+  }
   if (useQuickRandom) {
     finalArgs.push('--debug-quick-random');
   }
   postDebug('quick-random', {
     enabled: useQuickRandom,
+    disableScdaemon,
   });
 
   self.Module = {
@@ -1385,18 +1392,18 @@ async function handleStart(message) {
         postDebug('callMain.enter', { args: finalArgs });
         const rc = callMainWith(finalArgs.slice());
         postDebug('callMain.exit', { rc, stdinReadCalls: bridgeMetrics.stdinReadCalls, stdinRead: bridgeMetrics.stdinRead });
-        finish(Number.isFinite(rc) ? rc : 0, 'callMain returned');
+        finish(Number.isFinite(rc) ? rc : 0, '');
       } catch (error) {
         postDebug('callMain.error', { error: formatError(error), stdinReadCalls: bridgeMetrics.stdinReadCalls, stdinRead: bridgeMetrics.stdinRead });
         if (error && typeof error === 'object' && Number.isFinite(error.status)) {
-          finish(Number(error.status), 'callMain exit status');
+          finish(Number(error.status), '');
           return;
         }
         finish(1, formatError(error));
       }
     },
     onExit: (code) => {
-      finish(code, 'onExit');
+      finish(code, '');
     },
     onAbort: (why) => {
       finish(1, `abort: ${formatError(why)}`);

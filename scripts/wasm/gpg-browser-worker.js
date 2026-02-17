@@ -1,9 +1,10 @@
 /* eslint-env worker */
 
 const STATUS_PREFIX = '[GNUPG:]';
+const DEFAULT_RUN_TIMEOUT_MS = 90000;
 let runInProgress = false;
 let stdinPromptHint = '';
-const DEBUG_BUILD_TAG = '2026-02-13-log-v2';
+const DEBUG_BUILD_TAG = '2026-02-17-log-v3';
 const SUPPRESSED_DEBUG_STEPS = new Set([
   'run.finish',
   'run.callMain.return',
@@ -15,7 +16,32 @@ const SUPPRESSED_DEBUG_STEPS = new Set([
   'agent.bridge.stdout.byte',
   'agent.scdaemon.bridge.stdin.byte',
   'agent.scdaemon.bridge.stdout.byte',
+  'run.agent.rx.enter',
+  'run.agent.rx',
+  'run.agent.rx.null',
+  'run.agent.tx',
+  'run.agent.heartbeat',
+  'run.agent.shutdown.finalize',
+  'run.preRun.fs-init',
+  'agent.callMain.exit',
+  'agent.bridge.stdin.queue-closed-eof',
 ]);
+const WASM_TRACE_SUPPRESSED_BUCKETS = new Set([
+  'scd-cmd',
+  'agent_card_learn',
+  'agent_scd_learn',
+]);
+const WASM_TRACE_THROTTLED_BUCKET_LIMITS = new Map([
+  ['scdaemon', 0],
+  ['select_application', 2],
+  ['scd cmd_serialno', 2],
+  ['scd cmd_learn', 2],
+  ['ccid_dev_scan', 2],
+  ['ccid_open_usb_reader', 2],
+  ['bulk_in', 0],
+  ['bulk_out', 0],
+]);
+const wasmTraceBucketCounts = new Map();
 
 let workerUrlPolicy = undefined;
 
@@ -82,6 +108,100 @@ function postDebug(step, data) {
     step,
     data: data && typeof data === 'object' ? data : { value: data },
   });
+}
+
+function isBenignAgentResultError(text) {
+  const normalized = String(text || '').trim();
+  return normalized === 'callMain returned'
+    || normalized === 'callMain exit status'
+    || normalized === 'onExit';
+}
+
+function extractResultField(text, key) {
+  const source = String(text || '');
+  const pattern = key === 'rc' ? /\brc=(-?\d+)\b/i : /\berr=(-?\d+)\b/i;
+  const match = source.match(pattern);
+  if (!match) {
+    return null;
+  }
+  const value = Number.parseInt(match[1], 10);
+  return Number.isFinite(value) ? value : null;
+}
+
+function isImportantWasmTraceLine(text) {
+  const source = String(text || '');
+  if (/\b(error|failed|failure|timeout|aborted?|denied|unavailable)\b/i.test(source)) {
+    return true;
+  }
+  const rc = extractResultField(source, 'rc');
+  if (rc !== null && rc !== 0) {
+    return true;
+  }
+  const err = extractResultField(source, 'err');
+  if (err !== null && err !== 0) {
+    return true;
+  }
+  return false;
+}
+
+function getWasmTraceBucket(text) {
+  const source = String(text || '');
+  const marker = '[wasm-trace]';
+  const markerIdx = source.indexOf(marker);
+  if (markerIdx === -1) {
+    return '';
+  }
+  const tail = source.slice(markerIdx + marker.length).trimStart();
+  if (!tail) {
+    return '';
+  }
+  const colonIdx = tail.indexOf(':');
+  const raw = colonIdx === -1 ? tail.split(/\s+/)[0] : tail.slice(0, colonIdx);
+  return raw.trim().toLowerCase();
+}
+
+function shouldSuppressWasmTraceLine(text) {
+  const source = String(text || '');
+  if (!source.includes('[wasm-trace]')) {
+    return false;
+  }
+  if (isImportantWasmTraceLine(source)) {
+    return false;
+  }
+  const bucket = getWasmTraceBucket(source);
+  if (!bucket) {
+    return true;
+  }
+  if (WASM_TRACE_SUPPRESSED_BUCKETS.has(bucket)) {
+    return true;
+  }
+  const limit = WASM_TRACE_THROTTLED_BUCKET_LIMITS.get(bucket);
+  if (!Number.isFinite(limit)) {
+    return false;
+  }
+  const seen = (wasmTraceBucketCounts.get(bucket) || 0) + 1;
+  wasmTraceBucketCounts.set(bucket, seen);
+  return seen > limit;
+}
+
+function shouldSuppressStderrLine(text) {
+  const source = String(text || '');
+  if (!source) {
+    return false;
+  }
+  if (source.startsWith('[dirmngr-trace]')) {
+    return !(source.includes('.error')
+      || source.includes('bridge.fatal')
+      || source.includes('assuan.command-error'));
+  }
+  if (source.startsWith('[agent]')
+      && isBenignAgentResultError(source.slice('[agent]'.length).trimStart())) {
+    return true;
+  }
+  if (shouldSuppressWasmTraceLine(source)) {
+    return true;
+  }
+  return false;
 }
 
 function postError(message) {
@@ -475,6 +595,9 @@ function shouldUseCommandFd(args, hasStdinQueue) {
 
 function emitStderrAndStatus(line) {
   const text = String(line ?? '');
+  if (shouldSuppressStderrLine(text)) {
+    return;
+  }
   if (self.__gnupg_stream_capture) {
     self.__gnupg_stream_capture.stderr.push(text);
     self.__gnupg_stream_capture.metrics.stderrLivePosted += 1;
@@ -1479,7 +1602,10 @@ async function handleRun(message) {
           ? messageData.data
           : null;
         postDebug(`dirmngr.${step}`, data);
-        if (debugEnabled) {
+        const shouldMirrorToStderr = step === 'bridge.fatal'
+          || step === 'assuan.command-error'
+          || step.endsWith('.error');
+        if (debugEnabled && shouldMirrorToStderr) {
           let text = '';
           try {
             text = data ? JSON.stringify(data) : '';
@@ -1676,7 +1802,7 @@ async function handleRun(message) {
   postDebug('run.final-args', { finalArgs });
   const runTimeoutMs = Number.isFinite(message.runTimeoutMs)
     ? Number(message.runTimeoutMs)
-    : 120000;
+    : DEFAULT_RUN_TIMEOUT_MS;
 
   let didFinish = false;
   let resolveRunCompletion;
@@ -1772,7 +1898,9 @@ async function handleRun(message) {
           }
           if (typeof agentResult.error === 'string' && agentResult.error) {
             agentInfo.error = agentResult.error;
-            emitStderrAndStatus(`[agent] ${agentResult.error}`);
+            if (!isBenignAgentResultError(agentResult.error)) {
+              emitStderrAndStatus(`[agent] ${agentResult.error}`);
+            }
           }
           if (typeof agentResult.stderr === 'string' && agentResult.stderr.trim()) {
             emitStderrAndStatus(`[agent] ${agentResult.stderr.trimEnd()}`);
