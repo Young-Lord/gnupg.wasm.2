@@ -265,8 +265,19 @@ function getAuthorizedUsbDevicesForRun() {
   }));
 }
 
+function getWebUsbSupportHint() {
+  if (typeof navigator !== 'object' || !navigator) {
+    return false;
+  }
+  const usb = navigator.usb;
+  if (!usb || typeof usb !== 'object') {
+    return false;
+  }
+  return typeof usb.requestDevice === 'function' || typeof usb.getDevices === 'function';
+}
+
 async function requestUsbDeviceAuthorization() {
-  if (!navigator.usb || typeof navigator.usb.requestDevice !== 'function') {
+  if (!getWebUsbSupportHint() || !navigator.usb || typeof navigator.usb.requestDevice !== 'function') {
     appendConsole('error', 'WebUSB requestDevice is not available in this environment');
     return;
   }
@@ -1011,6 +1022,7 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
       emitStatus: true,
       debug: options.debug === true,
       usbAuthorizedDevices: getAuthorizedUsbDevicesForRun(),
+      webUsbSupported: getWebUsbSupportHint(),
       onInputRequest: (request) => {
         const preset = readStdinPresetText();
         if (preset) {

@@ -150,48 +150,234 @@ linked with `--sENVIRONMENT=node` and will fail in browsers (for example
 If you see `DataCloneError: WebAssembly.Memory object cannot be serialized`,
 your server is missing COOP/COEP headers; use `serve.py` above.
 
+### Test in local HTTP server mode
+
+This path is best for fast iteration while editing JS/UI files.
+
+1. Start the local server in terminal A:
+
+   ```bash
+   python3 scripts/wasm/demo/serve.py --port 8080
+   ```
+
+2. Open `http://localhost:8080/scripts/wasm/demo/index.html` in your browser.
+
+3. In the UI, set:
+
+   - `Default passphrase` (for example `demo-passphrase`)
+   - keep `Auto-answer pinentry with default passphrase` enabled
+
+4. Run this smoke checklist:
+
+   - Click `Run --version` -> expect exit code `0` and gpg version lines in
+     Console.
+   - Click `Generate Key` -> expect success (pinentry auto-answer via default
+     passphrase).
+   - Click `List Secret Keys` and `List Public Keys` -> expect the generated key
+     appears.
+   - Put plaintext in editor, click `Symmetric Encrypt`, then `Decrypt` ->
+     expect decrypted text matches original input.
+   - Run raw command `--list-keys --keyid-format long` -> expect key listing in
+     Console and status events in the `Status` panel.
+
+5. Validate state reset behavior:
+
+   - Click `Reset Session State`.
+   - Run `List Secret Keys` again -> expect empty keyring (session is in-memory).
+
+Notes:
+
+- Keep the server terminal running while testing.
+- If output looks noisy, use `Clear Console` and `Clear Status` before each case.
+
 ## Run as Isolated Web App (IWA)
 
 IWA mode packages the demo into a signed web bundle (`.swbn`) that runs in
 its own Chromium app window with full cross-origin isolation, Trusted Types,
 and WebUSB access — no dev-server needed.
 
-### Quick start
+### One-shot build + launch
 
 ```bash
-# One-shot: build everything and launch
+# Build browser wasm, package IWA, then launch Chromium
 bash scripts/wasm/run-iwa.sh --build
 ```
 
-### Step by step
+### Full build guide (starting from this git repository)
 
-1. Build dependencies (first time only):
+Assume you already cloned this repository and your shell is in the repository
+root (the directory that contains `scripts/`, `PLAY/`, and `configure`).
+
+1. Verify required host tools:
+
+   ```bash
+   command -v bash python3 node npm npx openssl chromium
+   ```
+
+   If any command is missing, install it first.
+
+2. Ensure Emscripten SDK is available.
+
+   By default, wasm scripts look for `../emsdk/emsdk_env.sh`.
+   If your emsdk is somewhere else, set `GNUPG_WASM_EMSDK` first:
+
+   ```bash
+   export GNUPG_WASM_EMSDK=/absolute/path/to/emsdk
+   test -f "$GNUPG_WASM_EMSDK/emsdk_env.sh"
+   ```
+
+3. Ensure libusb source exists at the expected external path:
+
+   ```bash
+   test -x ../libusb-1.0.29/configure
+   ```
+
+   `scripts/wasm/build-deps.sh` builds libusb from `../libusb-1.0.29`.
+
+4. Build wasm dependencies (first run, or when dependency sources changed):
 
    ```bash
    bash scripts/wasm/build-deps.sh
    ```
 
-2. Build browser wasm:
+5. Build browser-target GnuPG wasm:
 
    ```bash
    bash scripts/wasm/build-gnupg-browser.sh --force
    ```
 
-3. Package into signed IWA bundle:
+6. Package demo files and wasm runtimes into a signed IWA bundle:
 
    ```bash
    bash scripts/wasm/build-iwa.sh
    ```
 
-4. Launch Chromium with the IWA:
+   This step also:
+
+   - creates/reuses signing key `PLAY/iwa-keys/private-key.pem`
+   - derives a stable bundle id from that key
+   - writes signed bundle to `PLAY/iwa/gnupg-wasm-demo.swbn`
+
+7. Launch Chromium and install the IWA from the built bundle:
 
    ```bash
    bash scripts/wasm/run-iwa.sh
    ```
 
    Chromium opens with the IWA installed. The app appears as a standalone
-   window (not a regular tab). If it doesn't auto-open, find "GnuPG WASM"
-   in your system app launcher or go to `chrome://apps` in Chromium.
+   window (not a regular tab). If it does not auto-open, find "GnuPG WASM"
+   in your system app launcher or open `chrome://apps` in Chromium.
+
+### What each build command is for
+
+- `build-deps.sh`: builds wasm dependency stack into `PLAY/wasm-prefix/`
+  (`libusb`, `libgpg-error`, `npth`, `libgcrypt`, `libassuan`, `libksba`).
+- `build-gnupg-browser.sh`: builds browser-target wasm binaries into
+  `PLAY/wasm-prefix-browser/bin/` (`gpg.js/.wasm`, `gpg-agent.js/.wasm`,
+  `scdaemon.js/.wasm`) and prepares browser assets.
+- `build-iwa.sh`: stages demo assets and produces signed web bundle artifacts
+  in `PLAY/iwa/`.
+- `run-iwa.sh`: launches Chromium with temporary profile and installs the
+  bundle via `--install-isolated-web-app-from-file`.
+
+### Rebuild matrix (fast path)
+
+- JS/UI-only changes (`scripts/wasm/*.js`, `scripts/wasm/demo/*`):
+
+  ```bash
+  bash scripts/wasm/build-iwa.sh
+  ```
+
+- GnuPG C/C++ changes in this repo:
+
+  ```bash
+  bash scripts/wasm/build-gnupg-browser.sh --force
+  bash scripts/wasm/build-iwa.sh
+  ```
+
+- Dependency changes (for example libusb/libgcrypt/libassuan):
+
+  ```bash
+  bash scripts/wasm/build-deps.sh --force
+  bash scripts/wasm/build-gnupg-browser.sh --force
+  bash scripts/wasm/build-iwa.sh
+  ```
+
+### Common build controls
+
+- Override app version in manifest:
+
+  ```bash
+  IWA_APP_VERSION=0.2.0 bash scripts/wasm/build-iwa.sh
+  ```
+
+- Override seed base URL used for the initial id-derivation bundle:
+
+  ```bash
+  IWA_SEED_BASE_URL=https://gnupg-wasm.local/ bash scripts/wasm/build-iwa.sh
+  ```
+
+- Force clean rebuild of browser wasm:
+
+  ```bash
+  bash scripts/wasm/build-gnupg-browser.sh --clean --force --reconfigure
+  ```
+
+### Troubleshooting
+
+- `Missing emsdk_env.sh ...`: set `GNUPG_WASM_EMSDK` to your emsdk directory.
+- `Missing libusb source directory .../../libusb-1.0.29`: place libusb source at
+  `../libusb-1.0.29` or adjust your local layout accordingly.
+- `chromium: command not found`: install Chromium or launch manually with your
+  local Chromium binary and `--install-isolated-web-app-from-file=...`.
+- App not visible after install: open `chrome://apps` and start "GnuPG WASM".
+- When in doubt, delete transient staging/output and rebuild:
+
+  ```bash
+  rm -rf PLAY/iwa-stage PLAY/iwa
+  bash scripts/wasm/build-iwa.sh
+  ```
+
+### Test in IWA mode
+
+This path is closest to production constraints (IWA window, isolated storage,
+Trusted Types, WebUSB permissions).
+
+1. Build and launch IWA:
+
+   ```bash
+   bash scripts/wasm/run-iwa.sh --build
+   ```
+
+2. Confirm the app is running as IWA:
+
+   - Opened from app launcher or `chrome://apps`, not a normal tab.
+   - In DevTools Console, `location.href` starts with `isolated-app://`.
+
+3. Run the same functional smoke checklist used for local HTTP mode:
+
+   - `Run --version`
+   - `Generate Key`
+   - `List Secret Keys` / `List Public Keys`
+   - `Symmetric Encrypt` + `Decrypt`
+   - Raw command `--list-keys --keyid-format long`
+
+4. Verify UI channel split:
+
+   - command output stays in `Console`
+   - status events stay in `Status`
+
+5. (Optional) USB/card checks:
+
+   - Click `Select USB Smartcard Device` and authorize a device.
+   - Run `card-status`.
+   - If it hangs, treat this as expected for current known issue below.
+
+Important runtime note:
+
+- `scripts/wasm/run-iwa.sh` uses a temporary Chromium profile under `/tmp` and
+  removes it on exit. After closing Chromium, rerun `run-iwa.sh` to install and
+  launch the app again in a fresh profile.
 
 ### What works in IWA
 

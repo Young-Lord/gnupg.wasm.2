@@ -29,6 +29,16 @@ function normalizeStatusLineText(line) {
   return text;
 }
 
+function normalizeWebUsbSupportHint(value) {
+  if (value === true) {
+    return true;
+  }
+  if (value === false) {
+    return false;
+  }
+  return null;
+}
+
 function getWorkerUrlPolicy() {
   if (workerUrlPolicy !== undefined) {
     return workerUrlPolicy;
@@ -647,7 +657,13 @@ export class WasmGpgBrowserClient {
     return worker;
   }
 
-  async _startPersistentAgentSession(fsState, persistRoots, usbAuthorizedDevices, debugEnabled = false) {
+  async _startPersistentAgentSession(
+    fsState,
+    persistRoots,
+    usbAuthorizedDevices,
+    debugEnabled = false,
+    webUsbSupportedHint = null,
+  ) {
     const worker = this._ensureAgentSessionWorker(
       this._agentSessionCallbacks.onDebug,
       this._agentSessionCallbacks.onStderr,
@@ -696,6 +712,7 @@ export class WasmGpgBrowserClient {
         homedir: this.homedir,
         fsState,
         persistRoots,
+        webUsbSupported: webUsbSupportedHint,
         usbAuthorizedDevices,
         bridge,
       });
@@ -810,6 +827,7 @@ export class WasmGpgBrowserClient {
         ? callbacks.persistRoots.map((item) => String(item))
         : this.persistRoots;
       const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(callbacks.usbAuthorizedDevices);
+      const webUsbSupportedHint = normalizeWebUsbSupportHint(callbacks.webUsbSupported);
 
       this._agentSessionCallbacks = {
         onDebug: typeof onDebug === 'function' ? onDebug : null,
@@ -824,6 +842,7 @@ export class WasmGpgBrowserClient {
           persistRoots,
           usbAuthorizedDevices,
           debugEnabled,
+          webUsbSupportedHint,
         );
       }
 
@@ -1278,6 +1297,7 @@ export class WasmGpgBrowserClient {
             enableAgentBridge,
             sharedAgentBridge: persistentAgentSession ? persistentAgentSession.bridge : null,
             runTimeoutMs,
+            webUsbSupported: webUsbSupportedHint,
             pinentry: typeof onPinentry === 'function'
               ? {
                   enabled: true,

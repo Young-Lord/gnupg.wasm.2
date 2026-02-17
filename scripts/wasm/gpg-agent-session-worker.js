@@ -1002,6 +1002,11 @@ async function handleRunSession(message) {
     ? message.fsState
     : null;
   const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(message.usbAuthorizedDevices);
+  const webUsbSupportedHint = message.webUsbSupported === false
+    ? false
+    : message.webUsbSupported === true
+      ? true
+      : null;
 
   if (!gpgScdaemonScriptUrl && message.gpgAgentScriptUrl) {
     gpgScdaemonScriptUrl = String(message.gpgAgentScriptUrl)
@@ -1028,12 +1033,14 @@ async function handleRunSession(message) {
     homedir,
     persistRoots: activePersistRoots,
     usbAuthorizedDeviceCount: usbAuthorizedDevices.length,
+    webUsbSupportedHint,
     hasIncomingFsState: Boolean(incomingFsState),
   });
 
   const createScdaemonBridge = () => {
     const worker = new Worker(asWorkerScriptUrl(gpgScdaemonWorkerUrl));
     let daemonDone = false;
+    let bridgeClosed = false;
     let resolveResult;
     let rejectResult;
     const resultPromise = new Promise((resolve, reject) => {
@@ -1046,6 +1053,15 @@ async function handleRunSession(message) {
       resolveReady = resolve;
       rejectReady = reject;
     });
+
+    const closeBridgeQueues = () => {
+      if (bridgeClosed) {
+        return;
+      }
+      bridgeClosed = true;
+      queueClose(agentToScdaemon);
+      queueClose(scdaemonToAgent);
+    };
 
     const agentToScdaemonDesc = createSharedQueueDescriptor();
     const scdaemonToAgentDesc = createSharedQueueDescriptor();
@@ -1110,11 +1126,20 @@ async function handleRunSession(message) {
       }
       if (messageData.type === 'error') {
         postDebug('scdaemon.error', { message: String(messageData.message || 'unknown worker error') });
+        daemonDone = true;
+        closeBridgeQueues();
         resolveReady(false);
+        resolveResult({
+          type: 'result',
+          exitCode: 1,
+          error: String(messageData.message || 'unknown worker error'),
+          stderr: '',
+        });
         return;
       }
       if (messageData.type === 'result') {
         daemonDone = true;
+        closeBridgeQueues();
         postDebug('scdaemon.exit', {
           sessionId,
           exitCode: Number.isFinite(messageData.exitCode) ? Number(messageData.exitCode) : null,
@@ -1127,6 +1152,8 @@ async function handleRunSession(message) {
 
     worker.addEventListener('error', (event) => {
       const text = event && event.message ? event.message : 'scdaemon worker failed';
+      daemonDone = true;
+      closeBridgeQueues();
       rejectReady(new Error(text));
       rejectResult(new Error(text));
     });
@@ -1137,6 +1164,7 @@ async function handleRunSession(message) {
       scdaemonScriptUrl: gpgScdaemonScriptUrl,
       scdaemonWasmUrl: gpgScdaemonWasmUrl,
       homedir,
+      webUsbSupported: webUsbSupportedHint,
       usbAuthorizedDevices,
       bridge: {
         agentToScdaemon: agentToScdaemonDesc,
@@ -1144,12 +1172,48 @@ async function handleRunSession(message) {
       },
     });
 
+    const SCD_READ_BLOCK_TIMEOUT_MS = 12000;
+    const popScdaemonByte = (shouldBlock = true) => {
+      if (!shouldBlock) {
+        return queuePopByte(scdaemonToAgent, false);
+      }
+
+      const startedAt = Date.now();
+      while (true) {
+        const value = queuePopByte(scdaemonToAgent, false);
+        if (value !== undefined) {
+          return value;
+        }
+
+        if (Atomics.load(scdaemonToAgent.ctrl, 2) !== 0) {
+          return null;
+        }
+
+        const waitedMs = Date.now() - startedAt;
+        if (waitedMs >= SCD_READ_BLOCK_TIMEOUT_MS) {
+          postDebug('scd.bridge.readByte.timeout', {
+            sessionId,
+            waitedMs,
+            daemonDone,
+            a2s: summarizeQueue(agentToScdaemon),
+            s2a: summarizeQueue(scdaemonToAgent),
+          });
+          daemonDone = true;
+          closeBridgeQueues();
+          return null;
+        }
+
+        const stamp = Atomics.load(scdaemonToAgent.ctrl, 3);
+        Atomics.wait(scdaemonToAgent.ctrl, 3, stamp, 25);
+      }
+    };
+
     return {
       readByte(shouldBlock = true) {
-        return queuePopByte(scdaemonToAgent, shouldBlock);
+        return popScdaemonByte(shouldBlock);
       },
       readAvailableByte() {
-        return queuePopByte(scdaemonToAgent, false);
+        return popScdaemonByte(false);
       },
       hasReadableData() {
         return queueHasData(scdaemonToAgent);
@@ -1194,7 +1258,7 @@ async function handleRunSession(message) {
             queuePushByte(agentToScdaemon, byteValue, false);
           }
         }
-        queueClose(agentToScdaemon);
+        closeBridgeQueues();
 
         let timeoutId = null;
         const timeoutPromise = new Promise((resolve) => {
@@ -1208,27 +1272,50 @@ async function handleRunSession(message) {
           clearInterval(readableWatcherId);
           readableWatcherId = null;
         }
-        queueClose(scdaemonToAgent);
+        closeBridgeQueues();
         worker.terminate();
         return result;
       },
     };
   };
 
-  try {
-    activeScdaemonBridge = createScdaemonBridge();
-    const scdReady = await activeScdaemonBridge.awaitReady(12000);
-    postDebug('scdaemon.ready', {
+  if (webUsbSupportedHint === false) {
+    postDebug('scdaemon.unavailable', {
       sessionId,
-      scdReady,
+      reason: 'webusb unsupported in host environment',
       gpgScdaemonWorkerUrl,
       gpgScdaemonScriptUrl,
       gpgScdaemonWasmUrl,
     });
-    if (!scdReady) {
+  } else {
+    try {
+      activeScdaemonBridge = createScdaemonBridge();
+      const scdReady = await activeScdaemonBridge.awaitReady(12000);
+      postDebug('scdaemon.ready', {
+        sessionId,
+        scdReady,
+        gpgScdaemonWorkerUrl,
+        gpgScdaemonScriptUrl,
+        gpgScdaemonWasmUrl,
+      });
+      if (!scdReady) {
+        postDebug('scdaemon.unavailable', {
+          sessionId,
+          reason: 'worker did not report ready within timeout',
+          gpgScdaemonWorkerUrl,
+          gpgScdaemonScriptUrl,
+          gpgScdaemonWasmUrl,
+        });
+        if (activeScdaemonBridge) {
+          await activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
+          activeScdaemonBridge = null;
+        }
+      }
+    } catch (error) {
       postDebug('scdaemon.unavailable', {
         sessionId,
-        reason: 'worker did not report ready within timeout',
+        reason: 'failed to create scdaemon bridge',
+        errorMessage: formatError(error),
         gpgScdaemonWorkerUrl,
         gpgScdaemonScriptUrl,
         gpgScdaemonWasmUrl,
@@ -1237,19 +1324,6 @@ async function handleRunSession(message) {
         await activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
         activeScdaemonBridge = null;
       }
-    }
-  } catch (error) {
-    postDebug('scdaemon.unavailable', {
-      sessionId,
-      reason: 'failed to create scdaemon bridge',
-      errorMessage: formatError(error),
-      gpgScdaemonWorkerUrl,
-      gpgScdaemonScriptUrl,
-      gpgScdaemonWasmUrl,
-    });
-    if (activeScdaemonBridge) {
-      await activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
-      activeScdaemonBridge = null;
     }
   }
 

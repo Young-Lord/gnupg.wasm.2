@@ -8,6 +8,7 @@ let stderrLineBuffer = [];
 let stderrLoggedLines = 0;
 let debugEnabled = false;
 let heartbeatId = null;
+let restoreConsoleFilter = () => {};
 
 const bridgeMetrics = {
   stdinReadCalls: 0,
@@ -27,7 +28,7 @@ const DEBUG_BUILD_TAG = '2026-02-15-console-trace-v9';
 // Global error handlers — catch anything that kills the worker silently
 self.onerror = (message, source, lineno, colno, error) => {
   try {
-    console.error('[scd-onerror]', message, source, lineno, colno, error);
+    logScdTrace('[scd-onerror]', message, source, lineno, colno, error);
     postDebug('global.onerror', {
       message: String(message || ''),
       source: String(source || '').slice(-80),
@@ -38,15 +39,58 @@ self.onerror = (message, source, lineno, colno, error) => {
     finish(1, `global error: ${message}`);
   } catch { /* last resort */ }
 };
+
+function formatUnhandledReason(reason) {
+  if (!reason) {
+    return 'unknown';
+  }
+  if (typeof reason === 'string') {
+    return reason;
+  }
+  if (reason && typeof reason === 'object') {
+    const name = typeof reason.name === 'string' ? reason.name : '';
+    const message = typeof reason.message === 'string'
+      ? reason.message
+      : formatError(reason);
+    return [name, message].filter(Boolean).join(' ');
+  }
+  return String(reason);
+}
+
+function isFatalWebUsbRejection(reason) {
+  const text = formatUnhandledReason(reason).toLowerCase();
+  if (!text) {
+    return false;
+  }
+  if (text.includes("failed to execute 'claiminterface'")) {
+    return true;
+  }
+  if (text.includes("failed to execute 'selectalternateinterface'")) {
+    return true;
+  }
+  if (text.includes('protected interface') || text.includes('protected class')) {
+    return true;
+  }
+  if (text.includes('webusb') && (text.includes('securityerror') || text.includes('invalidstateerror'))) {
+    return true;
+  }
+  return false;
+}
+
 self.onunhandledrejection = (event) => {
   try {
     const reason = event && event.reason;
-    console.error('[scd-unhandledrejection]', reason);
+    const reasonText = formatUnhandledReason(reason);
+    logScdTrace('[scd-unhandledrejection]', reason);
     postDebug('global.unhandledrejection', {
-      reason: reason ? formatError(reason) : 'unknown',
+      reason: reasonText,
     });
-    // Don't call finish() for unhandled rejections from pthread workers —
-    // they may be non-fatal.
+    if (started && !finished && isFatalWebUsbRejection(reason)) {
+      if (event && typeof event.preventDefault === 'function') {
+        event.preventDefault();
+      }
+      finish(2, `webusb rejection: ${reasonText}`);
+    }
   } catch { /* last resort */ }
 };
 
@@ -160,6 +204,57 @@ function postDebug(step, data) {
     step,
     data: data && typeof data === 'object' ? data : { value: data },
   });
+}
+
+function logScdTrace(...parts) {
+  if (!debugEnabled) {
+    return;
+  }
+  if (typeof console === 'object' && console && typeof console.error === 'function') {
+    console.error(...parts);
+  }
+}
+
+function normalizeWebUsbSupportHint(value) {
+  if (value === true) {
+    return true;
+  }
+  if (value === false) {
+    return false;
+  }
+  return null;
+}
+
+function installConsoleNoiseFilter() {
+  if (typeof console !== 'object' || !console || typeof console.error !== 'function') {
+    return () => {};
+  }
+
+  const originalError = console.error.bind(console);
+  let finishRequested = false;
+  console.error = (...parts) => {
+    const text = parts.map((part) => String(part ?? '')).join(' ');
+    if (!finishRequested && started && !finished && isFatalWebUsbRejection(text)) {
+      finishRequested = true;
+      const detail = text.length > 220 ? `${text.slice(0, 220)}...` : text;
+      setTimeout(() => {
+        finish(2, `webusb rejection: ${detail}`);
+      }, 0);
+      return;
+    }
+    if (!debugEnabled && (text.includes('[libusb-webusb-trace]') || text.includes('[libusb-webusb]'))) {
+      return;
+    }
+    originalError(...parts);
+  };
+
+  return () => {
+    try {
+      console.error = originalError;
+    } catch {
+      /* Ignore restore failures. */
+    }
+  };
 }
 
 function formatError(error) {
@@ -398,7 +493,7 @@ function writeStderrByte(ch) {
       const line = String.fromCharCode(...stderrLineBuffer).trim();
       stderrLineBuffer = [];
       if (line) {
-        console.error('[scd-stderr]', line);
+        logScdTrace('[scd-stderr]', line);
       }
       if (line && stderrLoggedLines < 120) {
         // Filter out noisy per-byte/per-call wasm-trace lines
@@ -491,12 +586,19 @@ async function importLauncherScript(scriptUrl) {
 }
 
 function finish(exitCode, errorMessage) {
-  console.error('[scd-finish] exitCode=' + exitCode, 'error=' + (errorMessage || ''),
+  try {
+    restoreConsoleFilter();
+  } catch {
+    /* Ignore restore failures. */
+  }
+  restoreConsoleFilter = () => {};
+
+  logScdTrace('[scd-finish] exitCode=' + exitCode, 'error=' + (errorMessage || ''),
     'rx=' + bridgeMetrics.stdinRead, 'tx=' + bridgeMetrics.stdoutWrite,
     'calls=' + bridgeMetrics.stdinReadCalls,
     'stack=' + new Error().stack?.split('\n').slice(1, 4).join(' | '));
   if (finished) {
-    console.error('[scd-finish] ALREADY FINISHED, skipping');
+    logScdTrace('[scd-finish] ALREADY FINISHED, skipping');
     return;
   }
   finished = true;
@@ -552,6 +654,7 @@ async function handleStart(message) {
   }
   started = true;
   debugEnabled = Boolean(message && message.debug === true);
+  restoreConsoleFilter = installConsoleNoiseFilter();
 
   const scdaemonScriptUrl = typeof message.scdaemonScriptUrl === 'string'
     ? message.scdaemonScriptUrl
@@ -560,6 +663,7 @@ async function handleStart(message) {
     ? message.scdaemonWasmUrl
     : '';
   const homedir = normalizePath(message.homedir, '/gnupg');
+  const webUsbSupported = normalizeWebUsbSupportHint(message.webUsbSupported);
   const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(message.usbAuthorizedDevices);
 
   self.__gnupgAuthorizedUsbDevices = usbAuthorizedDevices;
@@ -570,6 +674,13 @@ async function handleStart(message) {
   }
   if (!message.bridge || typeof message.bridge !== 'object') {
     finish(2, 'missing shared-memory bridge');
+    return;
+  }
+
+  if (webUsbSupported === false) {
+    const reason = 'WebUSB is not available in this environment';
+    postMessage({ type: 'error', message: reason });
+    finish(2, reason);
     return;
   }
 
@@ -677,9 +788,9 @@ async function handleStart(message) {
             const shouldBlock = stdinDeliveredInRead === 0;
             const callNum = bridgeMetrics.stdinReadCalls;
 
-            // console.error bypasses postMessage — survives worker death
+            // Logged only when debug mode is enabled.
             if (shouldBlock || callNum <= 5 || callNum % 50 === 0) {
-              console.error('[scd-stdin]', 'call=' + callNum,
+              logScdTrace('[scd-stdin]', 'call=' + callNum,
                 'delivered=' + stdinDeliveredInRead,
                 'block=' + shouldBlock,
                 'seq=' + stdinReadSeq,
@@ -690,7 +801,7 @@ async function handleStart(message) {
             try {
               value = queuePopByte(bridge.agentToScdaemon, shouldBlock);
             } catch (popErr) {
-              console.error('[scd-stdin] queuePopByte THREW:', popErr);
+              logScdTrace('[scd-stdin] queuePopByte THREW:', popErr);
               throw popErr;
             }
 
@@ -701,13 +812,13 @@ async function handleStart(message) {
               rxTracer.push(value);
               // Log the byte on blocking reads (first byte of each read() call)
               if (shouldBlock) {
-                console.error('[scd-stdin]', 'GOT first byte=' + value,
+                logScdTrace('[scd-stdin]', 'GOT first byte=' + value,
                   '(' + String.fromCharCode(value > 31 && value < 127 ? value : 46) + ')',
                   'call=' + callNum, 'totalRx=' + bridgeMetrics.stdinRead);
               }
             } else {
               const wasNull = value === null;
-              console.error('[scd-stdin]', wasNull ? 'EOF(null)' : 'EMPTY(undef)',
+              logScdTrace('[scd-stdin]', wasNull ? 'EOF(null)' : 'EMPTY(undef)',
                 'call=' + callNum, 'delivered=' + stdinDeliveredInRead,
                 'block=' + shouldBlock, 'seq=' + stdinReadSeq,
                 'a2s=' + JSON.stringify(summarizeQueue(bridge.agentToScdaemon)));
@@ -741,7 +852,7 @@ async function handleStart(message) {
               if (stdoutLineBuffer.length > 0) {
                 const line = String.fromCharCode(...stdoutLineBuffer);
                 stdoutLineBuffer.length = 0;
-                console.error('[scd-stdout]', line);
+                logScdTrace('[scd-stdout]', line);
               }
             } else if (stdoutLineBuffer.length < 512) {
               stdoutLineBuffer.push(value >= 32 && value <= 126 ? value : 46);
@@ -760,18 +871,18 @@ async function handleStart(message) {
         hasModuleCallMain: Boolean(self.Module && typeof self.Module.callMain === 'function'),
         noExitRuntime: Boolean(self.Module && self.Module.noExitRuntime),
       });
-      console.error('[scd-callMain] BEFORE callMainWith', JSON.stringify(finalArgs));
+      logScdTrace('[scd-callMain] BEFORE callMainWith', JSON.stringify(finalArgs));
       try {
         postDebug('callMain.enter', { args: finalArgs });
         const rc = callMainWith(finalArgs.slice());
         const asyncify = getAsyncifySnapshot();
-        console.error('[scd-callMain] AFTER callMainWith rc=' + rc,
+        logScdTrace('[scd-callMain] AFTER callMainWith rc=' + rc,
           'rx=' + bridgeMetrics.stdinRead, 'tx=' + bridgeMetrics.stdoutWrite,
           'calls=' + bridgeMetrics.stdinReadCalls,
           'async=' + JSON.stringify(asyncify));
 
         if (asyncify.pending && asyncify.hasWhenDone && self.Asyncify) {
-          console.error('[scd-callMain] ASYNCIFY pending, waiting for whenDone()');
+          logScdTrace('[scd-callMain] ASYNCIFY pending, waiting for whenDone()');
           postDebug('callMain.async.pending', {
             rc,
             asyncify,
@@ -781,7 +892,7 @@ async function handleStart(message) {
           });
 
           self.Asyncify.whenDone().then((finalRc) => {
-            console.error('[scd-callMain] ASYNCIFY done finalRc=' + finalRc,
+            logScdTrace('[scd-callMain] ASYNCIFY done finalRc=' + finalRc,
               'rx=' + bridgeMetrics.stdinRead,
               'tx=' + bridgeMetrics.stdoutWrite,
               'calls=' + bridgeMetrics.stdinReadCalls);
@@ -795,7 +906,7 @@ async function handleStart(message) {
             });
             finish(Number.isFinite(finalRc) ? finalRc : 0, 'callMain async done');
           }).catch((asyncErr) => {
-            console.error('[scd-callMain] ASYNCIFY failed:', asyncErr);
+            logScdTrace('[scd-callMain] ASYNCIFY failed:', asyncErr);
             postDebug('callMain.async.error', {
               error: formatError(asyncErr),
               name: asyncErr && asyncErr.name ? String(asyncErr.name) : '',
@@ -822,7 +933,7 @@ async function handleStart(message) {
         });
         finish(Number.isFinite(rc) ? rc : 0, 'callMain returned');
       } catch (error) {
-        console.error('[scd-callMain] CATCH error:', error,
+        logScdTrace('[scd-callMain] CATCH error:', error,
           'name=' + (error && error.name),
           'status=' + (error && error.status),
           'isExitStatus=' + Boolean(error && error.name === 'ExitStatus'));

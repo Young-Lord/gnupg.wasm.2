@@ -1001,6 +1001,11 @@ async function handleRun(message) {
     gpgScdaemonWasmUrl = gpgWasmUrl.replace(/gpg\.wasm(?=(?:[?#].*)?$)/, 'scdaemon.wasm');
   }
   const usbAuthorizedDevices = normalizeUsbAuthorizedDevices(message.usbAuthorizedDevices);
+  const webUsbSupportedHint = message.webUsbSupported === false
+    ? false
+    : message.webUsbSupported === true
+      ? true
+      : null;
 
   const debugEnabled = message.debug === true;
   self.__gnupg_debug_enabled = debugEnabled;
@@ -1071,6 +1076,7 @@ async function handleRun(message) {
     gpgScdaemonScriptUrl,
     gpgScdaemonWasmUrl,
     usbAuthorizedDeviceCount: usbAuthorizedDevices.length,
+    webUsbSupportedHint,
     crossOriginIsolated: Boolean(self.crossOriginIsolated),
     hasSharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
   });
@@ -1297,6 +1303,7 @@ async function handleRun(message) {
       gpgScdaemonScriptUrl,
       gpgScdaemonWasmUrl,
       homedir,
+      webUsbSupported: webUsbSupportedHint,
       fsState: incomingFsState,
       persistRoots,
       usbAuthorizedDevices,

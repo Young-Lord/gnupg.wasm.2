@@ -125,6 +125,70 @@ raise SystemExit(1)
 PY
 }
 
+patch_webusb_trace_promise_rejections() {
+  local target="$1"
+  if [[ ! -f "$target" ]]; then
+    return 0
+  fi
+
+  python3 - "$target" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+data = path.read_text(encoding='utf-8', errors='ignore')
+
+pattern = re.compile(
+  r"(const raced = Promise\.race\(\[ op, timeout \]\);\n\s*raced\.then\([\s\S]*?console\.error\(\"\[libusb-webusb-trace\]\"[\s\S]*?\n\s*\})\);"
+)
+
+updated, count = pattern.subn(r"\1).catch(() => {});", data)
+if count == 0:
+  print(f"[wasm] {path.name} webusb promise patch: not needed")
+  raise SystemExit(0)
+
+path.write_text(updated, encoding='utf-8')
+print(f"[wasm] {path.name} webusb promise patch: applied ({count})")
+PY
+}
+
+patch_webusb_op_unhandled_guard() {
+  local target="$1"
+  if [[ ! -f "$target" ]]; then
+    return 0
+  fi
+
+  python3 - "$target" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+data = path.read_text(encoding='utf-8', errors='ignore')
+
+pattern = re.compile(
+  r"(const op = [^;]+;\n)(\s*const timeout = new Promise\()"
+)
+
+replacement = (
+  r"\1"
+  r"  if (op && typeof op.catch === \"function\") {\n"
+  r"    op.catch(() => {});\n"
+  r"  }\n"
+  r"\2"
+)
+
+updated, count = pattern.subn(replacement, data)
+if count == 0:
+  print(f"[wasm] {path.name} webusb op-guard patch: not needed")
+  raise SystemExit(0)
+
+path.write_text(updated, encoding='utf-8')
+print(f"[wasm] {path.name} webusb op-guard patch: applied ({count})")
+PY
+}
+
 if [[ ! -f "$SRC_GPG" ]]; then
   wasm_die "Missing wasm launcher: $SRC_GPG"
 fi
@@ -134,6 +198,8 @@ chmod +x "$DST_GPG_JS" || true
 
 if [[ -f "$SRC_GPG_AGENT" ]]; then
   cp -f "$SRC_GPG_AGENT" "$DST_GPG_AGENT_JS"
+  patch_webusb_op_unhandled_guard "$DST_GPG_AGENT_JS"
+  patch_webusb_trace_promise_rejections "$DST_GPG_AGENT_JS"
   chmod +x "$DST_GPG_AGENT_JS" || true
   wasm_info "Prepared browser asset: $DST_GPG_AGENT_JS"
 else
@@ -142,6 +208,8 @@ fi
 
 if [[ -f "$SRC_SCDAEMON" ]]; then
   cp -f "$SRC_SCDAEMON" "$DST_SCDAEMON_JS"
+  patch_webusb_op_unhandled_guard "$DST_SCDAEMON_JS"
+  patch_webusb_trace_promise_rejections "$DST_SCDAEMON_JS"
   patch_scdaemon_eval_invoker "$DST_SCDAEMON_JS"
   patch_scdaemon_poll_proxy_async "$DST_SCDAEMON_JS"
   chmod +x "$DST_SCDAEMON_JS" || true
