@@ -2,6 +2,7 @@
 
 const STATUS_PREFIX = '[GNUPG:]';
 const DEFAULT_RUN_TIMEOUT_MS = 90000;
+const DEDICATED_STATUS_FD = 3;
 let runInProgress = false;
 let stdinPromptHint = '';
 const DEBUG_BUILD_TAG = '2026-02-17-log-v3';
@@ -184,10 +185,23 @@ function shouldSuppressWasmTraceLine(text) {
   return seen > limit;
 }
 
-function shouldSuppressStderrLine(text) {
+function shouldSuppressStderrLine(text, hasStatusLine = false) {
   const source = String(text || '');
   if (!source) {
     return false;
+  }
+  const trimmed = source.trim();
+  if (hasStatusLine) {
+    return true;
+  }
+  if (/^gpg:\s+WARNING:\s+program may create a core file!?$/i.test(trimmed)) {
+    return true;
+  }
+  if (source.includes('new connection to ') && source.includes('(wasm pre-opened fd)')) {
+    return true;
+  }
+  if (/gpg-agent\[\d+\]:\s+card has S\/N:/i.test(source)) {
+    return true;
   }
   if (source.startsWith('[dirmngr-trace]')) {
     return !(source.includes('.error')
@@ -556,6 +570,7 @@ function buildFinalArgs(inputArgs, options) {
   base = removeOption(base, '--homedir', true);
   if (options.emitStatus) {
     base = removeOption(base, '--status-fd', true);
+    base = removeOption(base, '--status-file', true);
   }
   if (options.commandFdStdin) {
     base = removeOption(base, '--command-fd', true);
@@ -573,7 +588,7 @@ function buildFinalArgs(inputArgs, options) {
   enforced.push('--pinentry-mode', 'loopback', '--no-autostart');
 
   if (options.emitStatus) {
-    enforced.push('--status-fd', '2');
+    enforced.push('--status-fd', String(Number.isFinite(options.statusFd) ? Number(options.statusFd) : DEDICATED_STATUS_FD));
   }
   if (options.commandFdStdin) {
     enforced.push('--command-fd', '0');
@@ -593,22 +608,23 @@ function shouldUseCommandFd(args, hasStdinQueue) {
   return hasStdinQueue === true;
 }
 
-function emitStderrAndStatus(line) {
-  const text = String(line ?? '');
-  if (shouldSuppressStderrLine(text)) {
-    return;
+function normalizeStatusLine(statusLineRaw) {
+  let text = String(statusLineRaw ?? '').trimStart();
+  if (!text) {
+    return '';
   }
-  if (self.__gnupg_stream_capture) {
-    self.__gnupg_stream_capture.stderr.push(text);
-    self.__gnupg_stream_capture.metrics.stderrLivePosted += 1;
-  }
-  postMessage({ type: 'stderr', data: text });
-
   const idx = text.indexOf(STATUS_PREFIX);
-  if (idx === -1) {
+  if (idx !== -1) {
+    text = text.slice(idx + STATUS_PREFIX.length).trimStart();
+  }
+  return text;
+}
+
+function handleStatusLine(statusLineRaw) {
+  const statusLine = normalizeStatusLine(statusLineRaw);
+  if (!statusLine) {
     return;
   }
-  const statusLine = text.slice(idx + STATUS_PREFIX.length).trimStart();
   const firstSpaceIdx = statusLine.indexOf(' ');
   const statusKeyword = firstSpaceIdx === -1 ? statusLine : statusLine.slice(0, firstSpaceIdx);
   if (statusKeyword === 'GET_HIDDEN' || statusKeyword === 'GET_LINE' || statusKeyword === 'GET_BOOL') {
@@ -630,6 +646,23 @@ function emitStderrAndStatus(line) {
     type: 'status',
     line: statusLine,
   });
+}
+
+function emitStderrAndStatus(line) {
+  const text = String(line ?? '');
+  const idx = text.indexOf(STATUS_PREFIX);
+  if (idx !== -1) {
+    handleStatusLine(text.slice(idx + STATUS_PREFIX.length));
+  }
+
+  if (shouldSuppressStderrLine(text, idx !== -1)) {
+    return;
+  }
+  if (self.__gnupg_stream_capture) {
+    self.__gnupg_stream_capture.stderr.push(text);
+    self.__gnupg_stream_capture.metrics.stderrLivePosted += 1;
+  }
+  postMessage({ type: 'stderr', data: text });
 }
 
 function makeFsLineWriter(onLine, charMetricKey, flushMetricKey) {
@@ -986,8 +1019,10 @@ async function handleRun(message) {
       statusLivePosted: 0,
       fsStdoutChars: 0,
       fsStderrChars: 0,
+      fsStatusChars: 0,
       fsStdoutFlushes: 0,
       fsStderrFlushes: 0,
+      fsStatusFlushes: 0,
     },
   };
   self.__gnupg_stream_capture = streamCapture;
@@ -1115,6 +1150,9 @@ async function handleRun(message) {
   const stderrWriter = makeFsLineWriter((line) => {
     emitStderrAndStatus(line);
   }, 'fsStderrChars', 'fsStderrFlushes');
+  const statusWriter = makeFsLineWriter((line) => {
+    handleStatusLine(line);
+  }, 'fsStatusChars', 'fsStatusFlushes');
 
   const enableAgentBridge = message.enableAgentBridge !== false;
   const dirmngrBridgePoolSize = Number.isFinite(message.dirmngrBridgePoolSize)
@@ -1796,6 +1834,7 @@ async function handleRun(message) {
   const finalArgs = buildFinalArgs(args, {
     homedir,
     emitStatus,
+    statusFd: DEDICATED_STATUS_FD,
     forceBatch: shouldForceBatchMode(args),
     commandFdStdin,
   });
@@ -1874,6 +1913,7 @@ async function handleRun(message) {
     }
     stdoutWriter.flush();
     stderrWriter.flush();
+    statusWriter.flush();
     didFinish = true;
 
     const postResult = async () => {
@@ -2107,6 +2147,55 @@ async function handleRun(message) {
         const envObj = self.ENV || (self.Module && self.Module.ENV);
         if (envObj && debugEnabled) {
           envObj.GNUPG_WASM_TRACE = '1';
+        }
+        if (emitStatus) {
+          try {
+            if (!FS.registerDevice || !FS.mkdev || !FS.makedev) {
+              throw new Error('FS device registration APIs are unavailable');
+            }
+
+            const devName = `gnupg-status-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+            const devPath = `/dev/${devName}`;
+            const major = 63;
+            const minor = (Date.now() % 200) + Math.floor(Math.random() * 50);
+            const dev = FS.makedev(major, minor);
+            const POLLOUT = 0x004;
+
+            FS.registerDevice(dev, {
+              read() {
+                return 0;
+              },
+              write(stream, buffer, offset, length) {
+                let count = 0;
+                while (count < length) {
+                  statusWriter.write(buffer[offset + count]);
+                  count += 1;
+                }
+                return count;
+              },
+              poll() {
+                return POLLOUT;
+              },
+              close() {
+                statusWriter.flush();
+              },
+            });
+
+            FS.mkdev(devPath, 0o600, dev);
+            const stream = FS.open(devPath, 'r+');
+            if (!stream || !Number.isFinite(stream.fd)) {
+              throw new Error('failed to allocate status fd stream');
+            }
+            if (stream.fd !== DEDICATED_STATUS_FD) {
+              throw new Error(`expected status fd ${DEDICATED_STATUS_FD}, got ${stream.fd}`);
+            }
+            postDebug('run.preRun.status-fd', {
+              devPath,
+              fd: stream.fd,
+            });
+          } catch (error) {
+            throw new Error(`failed to create dedicated status fd: ${formatError(error)}`);
+          }
         }
         if (agentBridge && envObj) {
           const devName = `gnupg-agent-bridge-${Date.now()}-${Math.floor(Math.random() * 100000)}`;

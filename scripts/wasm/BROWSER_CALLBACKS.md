@@ -25,7 +25,7 @@ COOP/COEP headers (`Cross-Origin-Opener-Policy: same-origin`,
 - Output callbacks:
   - `onStdout(data)`
   - `onStderr(data)`
-  - `onStatus(line)` (`[GNUPG:]` lines parsed from stderr)
+  - `onStatus(line)` (dedicated `--status-fd` channel, independent from stderr)
 - Launcher load fallback:
   - tries `importScripts(gpgScriptUrl)` first
   - if MIME/extension blocks import, falls back to fetch + Blob + `importScripts(blobUrl)`

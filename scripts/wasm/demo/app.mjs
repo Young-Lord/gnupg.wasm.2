@@ -29,6 +29,7 @@ const el = {
   rawCommand: document.querySelector('#rawCommand'),
   stdinPreset: document.querySelector('#stdinPreset'),
   console: document.querySelector('#console'),
+  statusConsole: document.querySelector('#statusConsole'),
 
   btnPing: document.querySelector('#btnPing'),
   btnResetSession: document.querySelector('#btnResetSession'),
@@ -57,6 +58,7 @@ const el = {
   usbDevices: document.querySelector('#usbDevices'),
   btnRunRaw: document.querySelector('#btnRunRaw'),
   btnClearConsole: document.querySelector('#btnClearConsole'),
+  btnClearStatus: document.querySelector('#btnClearStatus'),
 
   pinentryDialog: document.querySelector('#pinentryDialog'),
   pinentryForm: document.querySelector('#pinentryForm'),
@@ -80,6 +82,15 @@ let gpgClientKey = '';
 let authorizedUsbDevices = [];
 
 const USB_AUTH_STORAGE_KEY = 'gnupg-wasm-authorized-usb-devices-v1';
+const SUPPRESSED_STATUS_KEYWORDS = new Set([
+  'INQUIRE_MAXLEN',
+  'GET_HIDDEN',
+  'GET_LINE',
+  'GET_BOOL',
+  'GOT_IT',
+  'KEY_CONSIDERED',
+  'CARDCTRL',
+]);
 
 function nowLabel() {
   return new Date().toLocaleTimeString();
@@ -285,14 +296,6 @@ async function requestUsbDeviceAuthorization() {
     }
     appendConsole('error', `[usb] requestDevice failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-}
-
-function ensureUsbDeviceSelectedForCardOps() {
-  if (authorizedUsbDevices.length > 0) {
-    return true;
-  }
-  appendConsole('error', 'no USB smartcard device selected; click "Select USB Smartcard Device" first');
-  return false;
 }
 
 function parentPath(pathValue) {
@@ -542,6 +545,21 @@ function appendConsole(kind, text) {
   el.console.scrollTop = el.console.scrollHeight;
 }
 
+function appendStatus(text) {
+  if (!el.statusConsole) {
+    return;
+  }
+  const line = document.createElement('div');
+  line.className = 'status-line';
+  line.textContent = `${nowLabel()}  ${text}`;
+  el.statusConsole.append(line);
+
+  while (el.statusConsole.childElementCount > 1200) {
+    el.statusConsole.removeChild(el.statusConsole.firstChild);
+  }
+  el.statusConsole.scrollTop = el.statusConsole.scrollHeight;
+}
+
 function formatMs(value) {
   return `${Math.max(0, Math.round(value))}ms`;
 }
@@ -637,6 +655,16 @@ function formatDebugData(data) {
   } catch {
     return '[unserializable debug payload]';
   }
+}
+
+function shouldDisplayStatusLine(line) {
+  const text = String(line ?? '').trim();
+  if (!text) {
+    return false;
+  }
+  const firstSpaceIdx = text.indexOf(' ');
+  const keyword = firstSpaceIdx === -1 ? text : text.slice(0, firstSpaceIdx);
+  return !SUPPRESSED_STATUS_KEYWORDS.has(keyword);
 }
 
 function shellQuote(arg) {
@@ -963,6 +991,15 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
     enabled: options.perfEnabled === true,
     label: typeof options.perfLabel === 'string' && options.perfLabel ? options.perfLabel : 'run',
   });
+  const onStatusCallback = typeof options.onStatus === 'function'
+    ? options.onStatus
+    : (line) => {
+      const statusText = String(line ?? '');
+      if (!shouldDisplayStatusLine(statusText)) {
+        return;
+      }
+      appendStatus(statusText);
+    };
   perf.mark('command-dispatched');
 
   try {
@@ -989,7 +1026,7 @@ async function runGpg(args, pinentryRequest = {}, options = {}) {
         appendConsole('stderr', `[stderr] ${String(line ?? '')}`);
       },
       onStatus: (line) => {
-        appendConsole('status', `[status] ${String(line ?? '')}`);
+        onStatusCallback(line);
       },
       onDebug: options.debug === true
         ? (entry) => {
@@ -1190,11 +1227,6 @@ async function handleSymmetricEncrypt() {
   const result = await runGpg(args, {
     op: 'symmetric',
     keyHint: source,
-  }, {
-    perfEnabled: true,
-    perfLabel: 'symmetric-encrypt',
-    perfInputPath: source,
-    perfOutputPath: output,
   });
   if (result.exitCode === 0) {
     loadPathIntoEditor(output);
@@ -1271,16 +1303,10 @@ async function handleVerify() {
 }
 
 async function handleCardStatus() {
-  if (!ensureUsbDeviceSelectedForCardOps()) {
-    return;
-  }
-  await runGpg(['--card-status'], {}, { debug: true, runTimeoutMs: 60000 });
+  await runGpg(['--card-status'], {}, { runTimeoutMs: 60000 });
 }
 
 async function handleEditCard() {
-  if (!ensureUsbDeviceSelectedForCardOps()) {
-    return;
-  }
   appendConsole('note', 'card-edit may prompt for input; use stdin preset or dialog if needed');
   await runGpg(['--card-edit']);
 }
@@ -1436,6 +1462,12 @@ function bindEvents() {
 
   el.btnClearConsole.addEventListener('click', () => {
     el.console.textContent = '';
+  });
+
+  el.btnClearStatus.addEventListener('click', () => {
+    if (el.statusConsole) {
+      el.statusConsole.textContent = '';
+    }
   });
 
   for (const chip of document.querySelectorAll('.chip')) {

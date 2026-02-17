@@ -343,6 +343,25 @@ button:disabled {
   color: #b6d6e0;
 }
 
+.status-title {
+  margin-top: 0.9rem;
+  margin-bottom: 0.45rem;
+}
+
+.status-console {
+  min-height: 180px;
+  max-height: 320px;
+  background: linear-gradient(180deg, rgba(28, 36, 42, 0.94), rgba(36, 46, 54, 0.96));
+  color: #f0d68a;
+}
+
+.status-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  color: #f4d68f;
+}
+
 .stdin-panel {
   position: fixed;
   top: 1rem;

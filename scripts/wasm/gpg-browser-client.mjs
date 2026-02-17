@@ -15,6 +15,19 @@ function toUrlString(value, baseUrl) {
 
 let workerUrlPolicy = undefined;
 const DEFAULT_RUN_TIMEOUT_MS = 90000;
+const GNUPG_STATUS_PREFIX = '[GNUPG:]';
+
+function normalizeStatusLineText(line) {
+  let text = String(line ?? '').trim();
+  if (!text) {
+    return '';
+  }
+  const idx = text.indexOf(GNUPG_STATUS_PREFIX);
+  if (idx !== -1) {
+    text = text.slice(idx + GNUPG_STATUS_PREFIX.length).trimStart();
+  }
+  return text;
+}
 
 function getWorkerUrlPolicy() {
   if (workerUrlPolicy !== undefined) {
@@ -92,7 +105,7 @@ function normalizePinentryReply(reply) {
 }
 
 function parseStatusLine(line) {
-  const text = String(line ?? '').trim();
+  const text = normalizeStatusLineText(line);
   if (!text) {
     return {
       keyword: '',
@@ -187,7 +200,7 @@ function inferPinentryHints(args, pinentryRequest) {
 }
 
 function parsePromptHint(prompt) {
-  const text = String(prompt ?? '').trim();
+  const text = normalizeStatusLineText(prompt);
   if (!text) {
     return {
       statusKeyword: '',

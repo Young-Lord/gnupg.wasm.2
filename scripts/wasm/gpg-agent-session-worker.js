@@ -1215,35 +1215,20 @@ async function handleRunSession(message) {
     };
   };
 
-  if (usbAuthorizedDevices.length > 0) {
-    try {
-      activeScdaemonBridge = createScdaemonBridge();
-      const scdReady = await activeScdaemonBridge.awaitReady(12000);
-      postDebug('scdaemon.ready', {
-        sessionId,
-        scdReady,
-        gpgScdaemonWorkerUrl,
-        gpgScdaemonScriptUrl,
-        gpgScdaemonWasmUrl,
-      });
-      if (!scdReady) {
-        postDebug('scdaemon.unavailable', {
-          sessionId,
-          reason: 'worker did not report ready within timeout',
-          gpgScdaemonWorkerUrl,
-          gpgScdaemonScriptUrl,
-          gpgScdaemonWasmUrl,
-        });
-        if (activeScdaemonBridge) {
-          await activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
-          activeScdaemonBridge = null;
-        }
-      }
-    } catch (error) {
+  try {
+    activeScdaemonBridge = createScdaemonBridge();
+    const scdReady = await activeScdaemonBridge.awaitReady(12000);
+    postDebug('scdaemon.ready', {
+      sessionId,
+      scdReady,
+      gpgScdaemonWorkerUrl,
+      gpgScdaemonScriptUrl,
+      gpgScdaemonWasmUrl,
+    });
+    if (!scdReady) {
       postDebug('scdaemon.unavailable', {
         sessionId,
-        reason: 'failed to create scdaemon bridge',
-        errorMessage: formatError(error),
+        reason: 'worker did not report ready within timeout',
         gpgScdaemonWorkerUrl,
         gpgScdaemonScriptUrl,
         gpgScdaemonWasmUrl,
@@ -1253,11 +1238,19 @@ async function handleRunSession(message) {
         activeScdaemonBridge = null;
       }
     }
-  } else {
-    postDebug('scdaemon.skip', {
+  } catch (error) {
+    postDebug('scdaemon.unavailable', {
       sessionId,
-      reason: 'no authorized usb devices',
+      reason: 'failed to create scdaemon bridge',
+      errorMessage: formatError(error),
+      gpgScdaemonWorkerUrl,
+      gpgScdaemonScriptUrl,
+      gpgScdaemonWasmUrl,
     });
+    if (activeScdaemonBridge) {
+      await activeScdaemonBridge.shutdownAndWait(300).catch(() => null);
+      activeScdaemonBridge = null;
+    }
   }
 
   try {

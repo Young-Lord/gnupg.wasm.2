@@ -993,32 +993,18 @@ async function handleStart(message) {
     };
   };
 
-  if (usbAuthorizedDevices.length > 0) {
-    try {
-      scdaemonBridge = createScdaemonBridge();
-      const scdReady = await scdaemonBridge.awaitReady(12000);
-      postDebug('scdaemon.ready', {
-        scdReady,
-        gpgScdaemonWorkerUrl,
-        gpgScdaemonScriptUrl,
-        gpgScdaemonWasmUrl,
-      });
-      if (!scdReady) {
-        postDebug('scdaemon.unavailable', {
-          reason: 'worker did not report ready within timeout',
-          gpgScdaemonWorkerUrl,
-          gpgScdaemonScriptUrl,
-          gpgScdaemonWasmUrl,
-        });
-        if (scdaemonBridge) {
-          await scdaemonBridge.shutdownAndWait(300).catch(() => null);
-          scdaemonBridge = null;
-        }
-      }
-    } catch (error) {
+  try {
+    scdaemonBridge = createScdaemonBridge();
+    const scdReady = await scdaemonBridge.awaitReady(12000);
+    postDebug('scdaemon.ready', {
+      scdReady,
+      gpgScdaemonWorkerUrl,
+      gpgScdaemonScriptUrl,
+      gpgScdaemonWasmUrl,
+    });
+    if (!scdReady) {
       postDebug('scdaemon.unavailable', {
-        reason: 'failed to create scdaemon bridge',
-        errorMessage: formatError(error),
+        reason: 'worker did not report ready within timeout',
         gpgScdaemonWorkerUrl,
         gpgScdaemonScriptUrl,
         gpgScdaemonWasmUrl,
@@ -1028,10 +1014,18 @@ async function handleStart(message) {
         scdaemonBridge = null;
       }
     }
-  } else {
-    postDebug('scdaemon.skip', {
-      reason: 'no authorized usb devices',
+  } catch (error) {
+    postDebug('scdaemon.unavailable', {
+      reason: 'failed to create scdaemon bridge',
+      errorMessage: formatError(error),
+      gpgScdaemonWorkerUrl,
+      gpgScdaemonScriptUrl,
+      gpgScdaemonWasmUrl,
     });
+    if (scdaemonBridge) {
+      await scdaemonBridge.shutdownAndWait(300).catch(() => null);
+      scdaemonBridge = null;
+    }
   }
 
   const useQuickRandom = message.quickRandom !== false;

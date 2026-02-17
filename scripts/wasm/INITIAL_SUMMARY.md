@@ -61,7 +61,7 @@ Date: 2026-02-11
   - Keyserver receive (`--recv-keys`) via fetch-backed dirmngr shim
   - Browser worker callback path for:
     - stdout/stderr callback forwarding
-    - optional status callback (`[GNUPG:]` lines)
+    - optional status callback (dedicated `--status-fd` stream)
     - loopback pinentry callback injection (`--passphrase-file` in MEMFS)
     - in-memory multi-command persistence via `fsState` snapshot roundtrip
 
